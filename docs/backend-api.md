@@ -15,6 +15,8 @@ backend/
   admin/             product/inventory/order CRUD (Admins group only)
   webhooks-stripe/    Stripe webhook receiver
   webhooks-paypal/    PayPal webhook receiver
+    inventory-sync/     scheduled InvenTree stock/BOM synchronization
+    inventory-jobs/     durable, idempotent InvenTree stock movements
   shared/            common code (DynamoDB access helpers, claim helpers, response helpers) imported by the folders above
 ```
 
@@ -41,6 +43,12 @@ Use an HTTP API (not REST API) — cheaper and sufficient for this use case. One
 | POST | `/webhooks/paypal` | `webhooks-paypal` | PayPal signature (no Cognito authorizer) |
 
 Webhook routes must skip the Cognito authorizer entirely (the caller is Stripe/PayPal, not a logged-in user) and instead verify the provider's own signature inside the handler, per [Payment processing](payment-processing.md).
+
+## Private InvenTree Connectivity
+
+Only the inventory synchronization and stock-movement workers that call InvenTree should attach to the environment VPC. Place their Lambda ENIs in private application subnets and route requests to the internal InvenTree ALB using private DNS. Their security group may egress to the ALB security group on HTTPS and to only the VPC endpoints/services those functions require. The ALB must allow inbound HTTPS from that Lambda security group; its targets are EC2 instances in private application subnets. The EC2 security group accepts the target port only from the ALB security group.
+
+Do not place RDS in Lambda subnets or allow Lambda security groups direct database access. EC2 alone connects to RDS on PostgreSQL's port, and the RDS security group accepts that port only from the EC2 application security group. Do not give the InvenTree EC2 instances public IPs or inbound SSH; use SSM. Keep checkout/payment functions outside the VPC unless a documented dependency requires InvenTree access, since VPC attachment changes their internet-egress requirements. The VPC/subnet and operator-access design is specified in [InvenTree integration](inventree-integration.md).
 
 ## Handler conventions
 
@@ -78,6 +86,7 @@ One execution role per Lambda function, scoped to only what that function needs:
 - `checkout`: DynamoDB write (reserve inventory, create order) + read access to the Stripe/PayPal secrets.
 - `admin`: full DynamoDB read/write on the table.
 - `webhooks-stripe`/`webhooks-paypal`: DynamoDB write (mark order paid, write the idempotency marker) + read access to that provider's secret only.
+- `inventory-sync`/`inventory-jobs`: only the DynamoDB/SQS/secrets permissions required by their sync or movement workflow, plus VPC network access to the internal InvenTree ALB. Do not grant these functions RDS credentials or direct database access.
 
 Do not attach a single broad "DynamoDB full access" or "Secrets Manager full access" policy shared across every function.
 
