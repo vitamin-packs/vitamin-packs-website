@@ -73,7 +73,7 @@ NAT instance:
   - Calls `ec2:ReplaceRoute` to point `0.0.0.0/0` in the app a/b route tables at its own ENI.
   - Its IAM role is scoped to those route tables and to the instance itself.
 - Patched by monthly instance refresh.
-- If it fails, only egress stops: inventory sync and jobs, SSM access, ECR pulls, email, and certificate renewal. Checkout keeps working from the DynamoDB projection. An alarm fires when the NAT group is unhealthy.
+- If it fails, only egress stops: inventory sync and jobs, SSM access, ECR pulls, email, and certificate renewal. Checkout keeps working from the DynamoDB projection until parts exceed the [freshness limit](#sync-and-freshness) (20 minutes), then fails closed for those parts. An alarm fires when the NAT group is unhealthy.
 
 Egress controls:
 - Private security groups allow outbound traffic only on TCP 443, plus PostgreSQL to RDS from the host and the gateway-endpoint prefix lists.
@@ -251,7 +251,7 @@ Upgrade procedure (stage every upgrade in dev first):
 5. Smoke-test the UI, the API, the worker heartbeat, and an inventory-sync run.
 6. Check API compatibility for the inventory Lambdas before promoting to prod.
 
-The site is down for a few minutes during a refresh. That is acceptable because checkout reads the DynamoDB projection and never calls InvenTree synchronously.
+The site is down for a few minutes during a refresh. That is acceptable because checkout reads the DynamoDB projection and never calls InvenTree synchronously. The outage must stay inside the 20-minute [freshness limit](#sync-and-freshness).
 
 Roll back the application image only when the schema is still compatible. Otherwise use the [restore procedure](#rds-postgresql).
 
@@ -500,22 +500,139 @@ Implement the InvenTree client in `backend/shared` so inventory sync and stock-p
 
 Give the integration service account only the InvenTree permissions required for reads and stock movements. Use API behavior verified against the pinned InvenTree release's docs/schema; do not guess endpoint names, payloads, or reservation semantics. Keep API tokens server-side. Bound retries and make non-idempotent requests safe.
 
-Maintain an explicit SKU-to-part mapping with units of measure and kit BOM interpretation. Decide whether sellable stock is finished kits, components, or both; prevent double counting. Define eligible locations/states, excluding quarantined, damaged, or otherwise unavailable stock. Treat missing mappings, disabled parts, unexpected units, and insufficient stock as explicit errors, not zero stock or permission to substitute another part.
+Treat missing mappings, disabled parts, unexpected units, and insufficient stock as explicit errors, not zero stock or permission to substitute another part. An order may be `paid` while inventory posting is pending; fulfillment must remain blocked until the movement succeeds or an operator resolves the failure. Do not claim a distributed transaction across DynamoDB, providers, and InvenTree.
 
-Maintain the DynamoDB projection and reservations as follows:
+## Inventory Data Contract
 
-1. Synchronize eligible InvenTree quantities and BOM-derived availability into a versioned DynamoDB sellable-stock projection. A sync must not overwrite active checkout reservations. Compute availability from latest physical stock less active reservations, or use an equivalent atomic ledger preserving both. Record mapping, source revision/time, and last successful sync.
-2. At checkout, reject stale/missing projections according to a configured freshness limit. Use a conditional DynamoDB transaction to reserve required stock and create the pending order. For component-based kits, reserve every required component atomically. Never trust client quantities, prices, or stock counts.
-3. On verified payment, enqueue a durable InvenTree allocation/movement keyed idempotently by order and line item. After confirmed movement, retire that order's reservation exactly once as physical stock reduction enters the projection. Keep inventory-sync state separate from payment state; payment webhooks alone do not prove stock changed. Retry without duplicate movements, alert operators on unresolved failures, and reconcile.
-4. On cancellation, failed payment, reservation expiry, or refunds/returns per business policy, release the DynamoDB reservation exactly once. Reverse/adjust an InvenTree movement only if one occurred and through a separate idempotent operation. Do not silently restock shipped goods on refund.
+Proposed on 2026-09-28. InvenTree facts below were verified against the 1.5.6 source (tag `1.5.6`, API version 530). Keys, attributes, and transaction pseudocode are in [DynamoDB data model](dynamodb-data-model.md#inventory-projection-and-reservations). The order, payment, and inventory state table is in [Payment processing](payment-processing.md#order-payment-and-inventory-states). Owner questions are listed [below](#inventory-owner-decisions); defaults marked *(default)* apply until the owner decides.
 
-An order may be `paid` while inventory posting is pending; fulfillment must remain blocked until the movement succeeds or an operator resolves the failure. Test partial failure across order creation, provider requests, webhooks, stock movements, and reservation release. Do not claim a distributed transaction across DynamoDB, providers, and InvenTree.
+### Ownership
 
-Admin stock changes go through authorized backend operations that write physical stock in InvenTree. Each admin handler must enforce the `Admins` Cognito group. Do not expose a generic InvenTree proxy or directly edit the DynamoDB projection from an admin form. Audit actor, part, location, quantity, reason, and resulting movement, then reconcile the projection. Catalog reads use DynamoDB, not synchronous InvenTree calls.
+| Data | Authority | DynamoDB role |
+|---|---|---|
+| Physical quantity, locations, stock status, adjustments, BOM | InvenTree | Read-only projection (`observed_qty`) and display BOM |
+| Price, description, sellability, category | DynamoDB catalog | Authoritative |
+| SKU-to-part mapping (`fulfillment_mode`, `inventree_part_id`) | DynamoDB catalog, set only through `require_admin` handlers that validate the part in InvenTree | Authoritative |
+| Checkout holds and committed-but-unobserved movements | DynamoDB | Reservation ledger and `reserved_qty` |
+| Whether a physical movement happened | InvenTree stock tracking entries | Job records hold evidence (tracking IDs) only |
+
+### Eligible stock
+
+`observed_qty` for a part is the sum of `quantity - allocated` over stock items that meet every condition below. Use `GET /api/stock/` with explicit filters. Never use InvenTree's `in_stock` or `available` filters alone: in 1.5.6, `StockStatusGroups.AVAILABLE_CODES` includes `ATTENTION` (50), `DAMAGED` (55), and `RETURNED` (85), as well as `OK` (10) (`stock/status_codes.py`).
+
+- `status=10` (OK) only *(default)*. Quarantined (75), damaged, returned, attention, lost, destroyed, and rejected stock is never sellable.
+- `in_stock=true`: quantity above 0 and not assigned to a customer, a sales order, a parent item, a build, or consumption (`StockItem.IN_STOCK_FILTER`).
+- Location in an explicit allowlist of InvenTree location IDs, queried with `cascade=false`. The allowlist is a per-environment Terraform variable passed to the inventory Lambdas. Its hash is `eligibility_version`. Never include the `Web orders – committed` or `Returns – inspection` locations. Exclude `external` locations.
+- `expired=false`, when stock expiry is enabled.
+- Subtract `allocated`, the build, sales, and transfer-order allocations made inside InvenTree, so stock the owner earmarks there isn't sold on the web.
+
+The part must be `active`, not `virtual`, and not `trackable` *(default: serialized and trackable parts are rejected until serial selection is designed)*. `IPN` must equal the catalog SKU for STOCKED_PART mappings, as a cross-check *(default)*.
+
+### Kits, BOMs and units
+
+Every sellable SKU has exactly one `fulfillment_mode`:
+
+- **`STOCKED_PART`:** reserve `inventree_part_id`. This is a single component, or a *finished kit* built in InvenTree through a Build Order. Building a kit consumes its components in InvenTree, so finished-kit stock and component stock never overlap.
+- **`COMPONENTS`:** `inventree_part_id` is the kit's assembly part. Its BOM (`GET /api/bom/?part=<id>`, which includes inherited lines) becomes `stock_requirements`, and checkout reserves every component in one transaction. Finished stock of that assembly part is ignored. Sync warns if some exists, because it would be invisible to web sales.
+
+A SKU never falls back from one mode to the other at checkout. A DynamoDB transaction can't express "finished kit OR components". A fallback would need two attempts and two sets of physical-movement rules, so it is rejected for now.
+
+BOM validation happens in sync. The kit maps as `ERROR` (fail closed) unless all of these hold:
+
+- `bom_validated` is true on the assembly part, and `bom_checksum` feeds `mapping_version`.
+- Every line has `setup_quantity = 0`, `attrition = 0`, and no `rounding_multiple`. Those are build concepts with no per-sale meaning.
+- No line is `optional` *(default)*.
+- Every sub-part passes the part rules above.
+
+`consumable` lines are excluded from reservation *(default)*, matching InvenTree, which doesn't allocate them in builds. Substitutes and `allow_variants` are never used: only the exact `sub_part` is reserved. Parts listed in `external_links` are bought by the customer and are never reserved.
+
+Units: BOM `quantity` is stored in the sub-part's units, and InvenTree converts `raw_amount` on save. Stock quantities are in the part's units. The projection and `stock_requirements` keep InvenTree's decimal quantities, and checkout multiplies them by integer line quantities. If a part has no units or a count unit, its per-sale quantity must be an integer. A unit change on a part changes `mapping_version`, which invalidates carts priced against the old mapping.
+
+Double counting is prevented structurally:
+
+1. Projections are per part, so every SKU that uses a part shares one counter.
+2. Each SKU has one mode.
+3. InvenTree builds consume components.
+4. Committed stock moves to an ineligible location.
+
+### Sync and freshness
+
+- **Prod schedule:** EventBridge Scheduler runs `inventory-sync` every **5 minutes**, with reserved concurrency 1. The `sync_version` condition also discards any out-of-order run. Dev runs the sync manually, before checkout tests.
+- **Freshness limit:** checkout rejects a part whose `source_snapshot_at` is more than **20 minutes** old (four missed runs) with 503. Staleness is per part, so one failing part doesn't block unrelated SKUs.
+- **Alarms:** warn when the last full success is more than 10 minutes old, or when any mapping is `ERROR`. Page when the last success is more than 20 minutes old, or when any `available_qty` is below 0.
+- **Algorithm:** the pseudocode is in [DynamoDB data model](dynamodb-data-model.md#inventory-sync-pseudocode). Physical observations are applied as a delta. A sync never overwrites `reserved_qty`; it only retires `pending_retire` entries whose movements finished before the snapshot began, with `CLOCK_MARGIN_S` = 10 s.
+- **Outages:** InvenTree upgrades (a few minutes) and short NAT or host outages stay inside the 20-minute window. After it, checkout fails closed for the affected parts.
+
+### Physical movements
+
+Three job kinds, each a DynamoDB job item and an SQS message (standard queue with DLQ):
+
+| Job | When | InvenTree call | Projection effect |
+|---|---|---|---|
+| `COMMIT` | verified payment | `POST /api/stock/transfer/` from eligible locations to `Web orders – committed` | observed drops on the next sync, and the reservation retires in the same update |
+| `UNCOMMIT` | refund or cancel after COMMIT and before shipping | transfer back from `committed` to the part's default eligible location | observed rises on the next sync |
+| `SHIP` | admin marks the order shipped (only after COMMIT is `COMPLETED`) | `POST /api/stock/remove/` from `committed` | none (the location is ineligible) |
+
+Returns are recorded by staff in InvenTree into `Returns – inspection`, with status RETURNED (85, ineligible). Stock becomes sellable only when staff inspect it and move it to an eligible location with status OK. Nothing restocks automatically.
+
+InvenTree 1.5.6 has no idempotency key on stock adjustments. Its adjustment endpoints also **do not reject** a quantity larger than the item holds: `take_stock` clamps to the item's quantity, and `move` transfers the whole item (`stock/models.py`; `StockAdjustmentItemSerializer` has no upper bound). Each transfer or remove request runs in one `transaction.atomic()`. The worker therefore:
+
+1. **Claims the job.** Conditional update from `QUEUED`/`FAILED` to `IN_PROGRESS`, with `lease_owner` and a `lease_until` of 5 minutes.
+2. **Probes for a previous attempt.** Search `GET /api/stock/track/?search=<job_key>`; tracking `notes` are searchable. If entries exist, verify their `deltas` against `plan`. On a match, go to step 5. On a mismatch, set `NEEDS_ATTENTION` and alert. Never repeat the movement.
+3. **Plans from current stock.** Read eligible stock items and choose items FIFO by expiry, then creation. Require `quantity - allocated >= take` for every item chosen. A shortfall is a permanent `NEEDS_ATTENTION` failure, not a partial movement.
+4. **Posts one request.** Send one `transfer` or `remove` for all parts, with `notes = "<job_key> order <orderId>"`. On a timeout or 5xx the outcome is unknown, so set `FAILED` with `next_attempt_at` at least **3 minutes** later. That is longer than the 90-second gunicorn timeout (`contrib/container/gunicorn.conf.py`), so the next attempt's probe sees any request that did commit. Retry at most 5 times, then `NEEDS_ATTENTION`.
+5. **Completes.** Record the tracking IDs and run the completion transaction ([pseudocode](dynamodb-data-model.md#commit-job-completion-pseudocode)).
+
+A sweeper runs every 5 minutes. It re-enqueues `INVJOB#OPEN` jobs whose lease or `next_attempt_at` has passed, and alerts on jobs open longer than 30 minutes.
+
+**Assumption to verify in dev:** SHIP selects any stock of the part in the committed location, treating it as fungible. If the owner needs batch or serial traceability per order, SHIP must instead target the stock items created by the COMMIT split. The transfer response and tracking deltas must then be verified to return those item IDs.
+
+### Admin stock changes
+
+Admin stock changes go through authorized backend operations that write physical stock in InvenTree. Each admin handler must enforce the `Admins` Cognito group. Do not expose a generic InvenTree proxy or directly edit the DynamoDB projection from an admin form. Audit actor, part, location, quantity, reason, and resulting movement, then trigger a targeted sync of the affected parts. Catalog reads use DynamoDB, not synchronous InvenTree calls. Staff edits made directly in InvenTree through the jumpbox are equally valid, and the next sync picks them up.
 
 ## Reconciliation and Operations
 
-Run scheduled, environment-specific reconciliation comparing eligible InvenTree physical stock/BOM availability with the DynamoDB projection, active reservations, completed orders, and pending inventory jobs. Automatically repair only well-defined projection drift. Report unknown mappings, duplicate movements, negative availability, stale syncs, and failed jobs for operator review. Record last-success timestamps and alert on aging projections and integration failures. Redact customer data, API tokens, and database credentials from logs.
+Run reconciliation daily in prod, after every admin stock change, and after any InvenTree restore. It uses only index queries (no table scans):
+
+| Check | Source | Action |
+|---|---|---|
+| `reserved_qty` equals the sum over `HELD` (`INVHOLD`), `COMMITTING` (open COMMIT jobs), and `pending_retire` entries | GSI2 `INVHOLD`, `INVJOB#OPEN`, `INVSTOCK` | Auto-repair with a conditional update on the old `reserved_qty` and `available_qty`, then alert |
+| `available_qty = observed_qty - reserved_qty` | `INVSTOCK` | Auto-repair the same way, then alert |
+| `available_qty < 0` | `INVSTOCK` | Alert with the orders holding the part (possible oversell) |
+| `source_snapshot_at` older than the freshness limit | `INVSTOCK` | Alert |
+| `HELD` past `expires_at` + 10 min | `INVHOLD` | Alert (the expiry sweeper is failing) |
+| `pending_retire` entry older than 3 sync intervals | `INVSTOCK` | Alert (the movement is not observed: stock moved back, or the location is misconfigured) |
+| Job `FAILED` or `NEEDS_ATTENTION`, or open longer than 30 min | `INVJOB#OPEN` | Alert; blocks fulfillment |
+| InvenTree tracking notes matching `vp-<env>-` with no `COMPLETED` job, or a job `COMPLETED` whose tracking IDs are gone (for example after a PITR restore) | InvenTree `/api/stock/track/?search=vp-<env>-` | Alert; never auto-move stock |
+| Committed-location quantity per part does not equal committed-but-not-shipped orders | InvenTree plus `ORDER#` queries | Alert |
+| Mapping `ERROR`, or finished stock on a `COMPONENTS` kit | `INVMAP` | Alert |
+
+Only projection arithmetic (the first two rows) is auto-repaired. Physical stock is never auto-adjusted.
+
+- If reconciliation can't be trusted, disable checkout, keep all order and payment records, and reconcile before resuming.
+- Record last-success timestamps and alert on aging projections and integration failures.
+- Redact customer data, API tokens, and database credentials from logs.
+
+### Inventory Owner Decisions
+
+The defaults above let implementation proceed in dev. These need owner confirmation before prod:
+
+1. Fulfillment mode per kit: finished kits (`STOCKED_PART`) or component-derived (`COMPONENTS`).
+2. The eligible location IDs per environment, and whether any non-OK status (for example ATTENTION) is sellable. Default: OK only.
+3. Two-step movement (commit at payment, remove at shipping) versus removal at payment. Also the names and IDs of the committed and returns locations.
+4. Checkout hold duration. Default: a 30-minute Stripe session and a 35-minute reservation.
+5. Late payment after a hold was released: re-reserve, and if that fails, refund automatically, backorder, or leave it to the operator. Default: operator.
+6. Refund or cancel after commit: whether UNCOMMIT is automatic. Also the policy for inspecting and restocking returns.
+7. Policy for optional and consumable BOM lines. Defaults: optional lines are a mapping error; consumable lines are not reserved.
+8. Whether trackable, serialized, batch-traced, or expiring parts are sold. Default: trackable parts are rejected.
+9. Cart limits. Default: 10 lines and 75 distinct parts.
+10. SKU-to-part identity rule. Default: IPN equals SKU.
+11. Sync interval and freshness limit. Defaults: 5 and 20 minutes, with checkout blocked when stale.
+12. Whether InvenTree build, sales, or transfer allocations are subtracted from sellable stock. Default: yes.
+13. Partial refunds and chargebacks: whether they are money-only (default) or also affect stock.
+14. Any existing `inventory_count` values: discard them (default), or import them once as an audited InvenTree stock count.
+15. Whether the storefront shows exact counts or only in-stock/low/out, and the low-stock threshold.
 
 Stage InvenTree upgrades in dev, pin the image/release, take and verify backups, run the supported database migration, and check API compatibility and worker processing before production promotion. Roll back the application only when schema compatibility is confirmed; otherwise use the tested database/media restore plan. Document health checks, credential rotation, alert response, and on-call recovery before production use.
 
@@ -524,8 +641,8 @@ Stage InvenTree upgrades in dev, pin the image/release, take and verify backups,
 1. The hosting design above is resolved: InvenTree 1.5.6 process topology, PostgreSQL-backed django-q2 broker, S3 media, RDS PostgreSQL 17 with verified TLS, secret delivery, approved CIDRs, jumpbox access, and Lambda connectivity to the private HTTPS endpoint. Complete the [open owner actions](#open-owner-actions) before prod go-live.
 2. Build dev networking and service resources. Review security groups, route tables, public exposure, secret flow, and Terraform plans. Run format/validation; do not apply without operator authorization.
 3. Deploy the dev application and run the [acceptance tests](#acceptance-tests): private DNS/TLS, jumpbox access through SSM, SSM management without SSH ingress, private RDS connectivity, media persistence, worker processing, email, alarms, and backup/restore.
-4. Implement mappings, sync, reservation-aware projection, idempotent stock jobs, admin writes, and reconciliation. Update [Backend API](backend-api.md), [Payment processing](payment-processing.md), and the DynamoDB data model when contracts change.
-5. Test component and finished-kit stock without double counting, concurrent last-unit checkout, stale projection rejection, InvenTree downtime, failed/duplicate/out-of-order payment events, cancellation, retry after partial movement, and reconciliation after admin adjustment.
+4. Implement the [inventory data contract](#inventory-data-contract): mappings, sync, the reservation-aware projection, idempotent stock jobs, admin writes, and reconciliation. Update [Backend API](backend-api.md), [Payment processing](payment-processing.md), and [DynamoDB data model](dynamodb-data-model.md) when contracts change.
+5. Test component and finished-kit stock without double counting, concurrent last-unit checkout, stale projection rejection, InvenTree downtime, failed/duplicate/out-of-order payment events, cancellation, retry after partial movement, and reconciliation after admin adjustment. Run the [inventory contract acceptance tests](payment-processing.md#inventory-acceptance-tests).
 6. Validate the entire dev path from InvenTree stock to catalog availability, checkout reservation, verified payment, physical movement, reservation retirement, failure alerts, and restore. Promote only the reviewed equivalent to prod via [Infrastructure development workflow](infrastructure-development.md).
 
 Never use production inventory or credentials to validate dev.

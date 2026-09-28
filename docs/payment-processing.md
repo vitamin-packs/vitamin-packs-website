@@ -37,12 +37,45 @@ Order header items (see [DynamoDB data model](dynamodb-data-model.md)) carry a `
 ```
 pending      # created at checkout, payment not yet confirmed
 paid         # webhook confirmed payment
-fulfilled    # kit(s) shipped
-cancelled    # checkout abandoned or payment failed
+fulfilled    # kit(s) shipped (SHIP movement completed)
+cancelled    # checkout abandoned, payment failed, or hold expired
 refunded
 ```
 
-Only a webhook handler may move an order from `pending` to `paid`. Use a conditional update (`ConditionExpression="attribute_exists(PK) AND #status = :pending"`) so a duplicate or out-of-order webhook delivery can't re-apply the transition.
+They also carry a separate `inventory_state`, because payment state and inventory state are independent:
+
+```
+reserved | released | commit_pending | committed | ship_pending | shipped | uncommit_pending | restocked | needs_attention
+```
+
+Only a webhook handler may move an order from `pending` to `paid`. Use a conditional update (`ConditionExpression="attribute_exists(PK) AND #status = :pending"`) so a duplicate or out-of-order webhook delivery can't re-apply the transition. The one exception is a late payment on an order whose hold was released (`cancelled` with `release_reason = expired`). It is handled by the separate late-payment row below, never by the normal transition.
+
+## Order, Payment and Inventory States
+
+Reservation states are `HELD`, `COMMITTING`, `COMMITTED`, `RETIRED`, and `RELEASED`. Job states are `QUEUED`, `IN_PROGRESS`, `COMPLETED`, `FAILED`, `CANCELLED`, and `NEEDS_ATTENTION`. Keys, conditions, and pseudocode are in [DynamoDB data model](dynamodb-data-model.md#inventory-projection-and-reservations). Movement mechanics are in [InvenTree integration](inventree-integration.md#physical-movements).
+
+In the table, `q` is the part quantity the order reserved, and `obs`, `res`, and `avail` are the projection's `observed_qty`, `reserved_qty`, and `available_qty`.
+
+| # | Event | Guard | Order `status` / `inventory_state` | Reservation | Job / InvenTree | Projection |
+|---|---|---|---|---|---|---|
+| 1 | Checkout succeeds | the transaction's conditions (fresh, `avail ≥ q`, price, mapping, cart version) | — → `pending` / `reserved` | — → `HELD` | none | `res += q`, `avail -= q` |
+| 2 | Checkout rejected (insufficient, stale, missing, `ERROR`, changed cart) | transaction cancelled | no order written | none | none | none |
+| 3 | Provider session creation fails | reservation `HELD` | `pending` → `cancelled` / `released` | `HELD` → `RELEASED` (`session_failed`) | none | `res -= q`, `avail += q` |
+| 4 | Customer cancels, or a verified payment-failed event arrives | `HELD`, order `pending` | → `cancelled` / `released` | → `RELEASED` | none | release |
+| 5 | Hold expires (sweeper) | `HELD`, `expires_at < now`, provider session made unpayable first | → `cancelled` / `released` | → `RELEASED` (`expired`) | none | release |
+| 6 | Verified payment | order `pending`, reservation `HELD` | → `paid` / `commit_pending` | → `COMMITTING` | COMMIT `QUEUED` and message sent | none (still reserved) |
+| 7 | Verified payment after release (late) | order `cancelled`, reason `expired` | → `paid`, then re-reserve: success → `commit_pending` (row 6); failure → `needs_attention` | new `HELD`, then `COMMITTING`, or none | COMMIT or operator | re-reserve, or none |
+| 8 | COMMIT succeeds | job `IN_PROGRESS` with a matching lease; tracking evidence present | `paid` / `committed` | → `COMMITTED` | job → `COMPLETED`; transfer to the committed location | `pending_retire` entry added |
+| 9 | Sync observes the commit | entry `completed_at` before the snapshot started | unchanged | → `RETIRED` | none | `obs -= q`, `res -= q`, `avail` unchanged |
+| 10 | COMMIT fails permanently (shortfall, mapping error, mismatch) | retries exhausted or a discrepancy | `paid` / `needs_attention`; fulfillment blocked | stays `COMMITTING` (still counted) | `NEEDS_ATTENTION`; alert | none until the operator retries or cancels |
+| 11 | Refund or cancel after payment, COMMIT not started | job `QUEUED` | → `refunded` / `released` | `COMMITTING` → `RELEASED` (`refunded_before_commit`) | job → `CANCELLED` (same transaction) | release |
+| 12 | Refund or cancel after payment, COMMIT in progress | job `IN_PROGRESS` | wait for row 8 or 10, then row 13 | — | — | — |
+| 13 | Refund or cancel after commit, not shipped | `committed` | → `refunded` / `uncommit_pending`, then `restocked` | unchanged (`COMMITTED` or `RETIRED`) | UNCOMMIT: transfer back | `obs` rises on the next sync |
+| 14 | Admin ships | `inventory_state = committed` | → `ship_pending`, then `fulfilled` / `shipped` | unchanged | SHIP: remove from the committed location | none |
+| 15 | Refund or chargeback after shipping | `shipped` | → `refunded` / `shipped` | unchanged | none (no restock) | none |
+| 16 | Return received | staff record it in InvenTree | unchanged; the admin notes the return | unchanged | staff put it in `Returns – inspection`, status RETURNED | none until staff move it to an eligible location with status OK |
+
+Every row is one conditional DynamoDB transaction, or a sequence of them in which each step is independently retryable and guarded by the prior state. There is no cross-system atomicity. InvenTree effects happen only inside jobs, and a payment webhook never proves that stock changed.
 
 ## Idempotency
 
@@ -139,4 +172,39 @@ On a verified `PAYMENT.CAPTURE.COMPLETED` (or `CHECKOUT.ORDER.APPROVED`, dependi
 
 ## Inventory
 
-Reserve inventory (see [DynamoDB data model](dynamodb-data-model.md)'s conditional decrement example) when the order is placed at checkout, not when payment is confirmed — otherwise two customers could check out with the last unit before either pays. If payment fails or the order is cancelled, restore the reserved quantity.
+Reserve inventory in the checkout transaction ([Checkout reservation](dynamodb-data-model.md#checkout-reservation-pseudocode)) when the order is placed, not when payment is confirmed. Otherwise two customers could check out with the last unit before either pays. Everything after that follows the [state table](#order-payment-and-inventory-states).
+
+**Hold duration.** Create the Stripe Checkout Session with `expires_at` = now + 30 minutes. Stripe accepts 30 minutes to 24 hours and defaults to 24 hours ([Create a Checkout Session](https://docs.stripe.com/api/checkout/sessions/create)). The reservation's `expires_at` is now + 35 minutes. PayPal uses the same 35-minute hold. Prompt 4 confirms PayPal's order-approval lifetime.
+
+**Expiry never races a payment.** An expiry sweeper runs every 5 minutes. For each candidate `INVHOLD` reservation it first makes the provider session unpayable, and releases only after that:
+
+- **Stripe:** call `POST /v1/checkout/sessions/{id}/expire`, which works only while the session is `open` ([Expire a Checkout Session](https://docs.stripe.com/api/checkout/sessions/expire)). If Stripe reports the session is complete, don't release; wait for the webhook.
+- **PayPal:** capture is server-initiated. The capture route must first move the reservation conditionally from `HELD` to `COMMITTING` (or a capture claim), and must refuse to capture a `RELEASED` reservation.
+
+A late payment is still possible through asynchronous payment methods or provider edge cases. It is handled by row 7 of the state table.
+
+**Webhooks move the reservation in the same transaction as the order.** Row 6 is one `TransactWriteItems`:
+
+- order `pending` → `paid`
+- reservation `HELD` → `COMMITTING`, removing the `INVHOLD` keys
+- COMMIT job `Put` with `attribute_not_exists`, indexed under `INVJOB#OPEN`
+
+Send the SQS message after the transaction commits. If the send fails, the open-job sweeper re-enqueues the job.
+
+**Fulfillment gate.** The admin "ship" action requires the COMMIT job to be `COMPLETED` (`inventory_state = committed`). A `paid` order with `commit_pending` or `needs_attention` cannot ship until the job succeeds or an operator resolves it.
+
+## Inventory Acceptance Tests
+
+Run these in dev against sandbox providers and dev InvenTree:
+
+- Two concurrent checkouts for the last unit: exactly one order is created, and the other gets 409. Repeat with a kit and a separately sold component that share the last unit of one part.
+- A kit with N components where one is short: no order is written and no projection changes.
+- A stale projection (sync stopped for more than 20 minutes) returns 503, and a missing `STOCK#` item or mapping `ERROR` returns 503 or 409, never success.
+- A sync running concurrently with checkouts, releases, and commit completion keeps `available_qty = observed_qty - reserved_qty` after every step, with no negative `available_qty` in any sampled state.
+- Kill the COMMIT worker after the InvenTree request but before completion: the retry finds the tracking entry by `job_key` and never moves stock twice.
+- Request a movement larger than the stock held: the job reaches `NEEDS_ATTENTION`, and InvenTree never clamps it into a partial transfer.
+- A duplicate webhook, and a webhook arriving after expiry: payment transitions happen once, and the late payment follows row 7.
+- A refund before commit, after commit, and after shipping follows rows 11, 13, and 15. Shipped goods are never restocked.
+- A manual InvenTree adjustment and a quarantine status change are reflected on the next sync. Damaged, returned, and attention-status stock is excluded.
+- Reconciliation detects each seeded drift from its table, and auto-repairs only the projection arithmetic.
+- Prove the relative update `SET available_qty = available_qty + :adj` with conditions on `observed_qty` and `pending_retire` entries against the real dev table, not only DynamoDB Local.

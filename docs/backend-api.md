@@ -117,9 +117,10 @@ The backend, not the admin UI, is the security boundary. Prove it with tests tha
 One execution role per Lambda function, scoped to only what that function needs:
 
 - `catalog`, `cart`, `orders`: read (and, for `cart`, write) on the DynamoDB table.
-- `checkout`: DynamoDB write (reserve inventory, create order) + read access to the Stripe/PayPal secrets.
+- `checkout`: DynamoDB `TransactWriteItems` (reserve stock projections, create the order and reservation, guard the cart) + read access to the Stripe/PayPal secrets. See [DynamoDB data model](dynamodb-data-model.md#checkout-reservation-pseudocode).
 - `admin`: full DynamoDB read/write on the table, plus `cognito-idp:AdminGetUser` and `cognito-idp:AdminListGroupsForUser` on the **admin** user pool ARN only (for the live check in `require_admin`). No Cognito write actions.
-- `webhooks-stripe`/`webhooks-paypal`: DynamoDB write (mark order paid, write the idempotency marker) + read access to that provider's secret only.
+- `webhooks-stripe`/`webhooks-paypal`: DynamoDB write (mark order paid, move the reservation to `COMMITTING`, create the COMMIT job, write the idempotency marker), `sqs:SendMessage` on the inventory-jobs queue, and read access to that provider's secret only.
+- Reservation-expiry sweeper: DynamoDB read/write on reservations, orders, and projections, plus provider secrets to expire sessions. It calls provider APIs, so it runs outside the VPC. Its function placement is decided with the backend domain layout (resolution Prompt 3).
 - `inventory-sync`/`inventory-jobs`: only the DynamoDB/SQS/secrets permissions required by their sync or movement workflow, plus VPC network access to the private InvenTree HTTPS endpoint (`AWSLambdaVPCAccessExecutionRole` permissions). Do not grant these functions RDS credentials or direct database access.
 
 Do not attach a single broad "DynamoDB full access" or "Secrets Manager full access" policy shared across every function.
