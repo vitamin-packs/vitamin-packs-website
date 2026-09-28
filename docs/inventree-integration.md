@@ -2,78 +2,501 @@
 
 ## Goal and Boundaries
 
-Run InvenTree on Amazon EC2 with Amazon RDS for PostgreSQL, inside the same environment VPC as the backend inventory integration. This is the intended deployment architecture for both dev and prod. The storefront and admin applications continue to use API Gateway and Python Lambda; browsers must not call InvenTree or receive its API credentials.
+Run InvenTree on Amazon EC2 with Amazon RDS for PostgreSQL. Each environment has one VPC, shared only by InvenTree, its operator jumpbox and NAT instance, and the VPC-attached inventory Lambdas. This is the intended deployment architecture for both dev and prod. The storefront and admin applications continue to use API Gateway and Python Lambda; browsers must not call InvenTree or receive its API credentials.
 
 InvenTree owns physical stock, locations, stock adjustments, and the component/kit bill of materials (BOM). DynamoDB remains the order and checkout reservation store: its sellable-stock projection and atomic reservation guard are derived from InvenTree stock, with active reservations accounted for. Do not maintain independently editable physical quantities in both systems. Product descriptions, prices, and sellability remain in the catalog; map each sellable SKU and kit component to stable InvenTree part identifiers. Never infer a part from its display name.
 
 Follow [Application architecture](application-architecture.md), [Backend API](backend-api.md), [Payment processing](payment-processing.md), [Infrastructure development workflow](infrastructure-development.md), and [Terraform conventions](terraform-conventions.md). Build the service in `infra/dev` using reusable modules in `infra/modules`, then promote the reviewed configuration to `infra/prod`. Do not create a separate Terraform root outside the repository's environment structure.
 
-## Recommended VPC and Subnet Design
+The hosting design below was resolved on 2026-09-28 against InvenTree **1.5.6** source and current AWS documentation and pricing. It is proposed design: none of these resources exist until they are implemented in `infra/` and applied with explicit operator authorization.
 
-Use a dedicated VPC per environment in `us-west-2`. Select a CIDR that does not overlap existing VPCs, on-premises networks, VPN client pools, or peered networks. The following is an example address plan, not a fixed requirement:
-
-| Subnet tier | Example CIDRs | Route/access purpose |
-|---|---|---|
-| Public, one subnet per AZ | `10.40.0.0/24`, `10.40.1.0/24` | Internet-facing egress only for NAT Gateways; no EC2 or RDS instances. |
-| Private application, one subnet per AZ | `10.40.16.0/20`, `10.40.32.0/20` | EC2 application nodes, internal ALB nodes, and VPC-attached inventory Lambdas. Route outbound internet traffic through NAT when required. |
-| Isolated database, one subnet per AZ | `10.40.64.0/24`, `10.40.65.0/24` | RDS subnet group only. No route to an Internet Gateway or NAT Gateway. |
-
-Adjust CIDRs to fit the approved network plan. Keep at least two subnets in distinct Availability Zones for the RDS subnet group and load balancer. The database subnets must remain private even in dev.
-
-### Traffic Flow
+## Selected Architecture
 
 ```text
-Operator workstation
-  -> AWS Client VPN (or approved SSM port-forward workflow)
-  -> internal Application Load Balancer (HTTPS)
-  -> EC2 private application nodes (InvenTree web / workers)
-       -> RDS PostgreSQL in isolated database subnets
-       -> S3 through a VPC gateway endpoint for media/static files
-
-VPC-attached inventory Lambda security group
-  -> internal ALB security group (HTTPS only)
-  -> EC2 application security group (only the ALB target port)
-
-EC2 application security group
-  -> RDS security group (TCP 5432 only)
+Windows 11 laptop --aws sso login (Identity Center + MFA)--> SSM port-forward (no inbound ports)
+   --> mstsc localhost:13389 --> Windows jumpbox (private-app) -- Edge --+
+Inventory Lambdas (sync/jobs, private-app ENIs) ------------------------+
+                                                                        v  HTTPS 443, private DNS
+        inventree.vitamin-packs.com (prod) / inventree.dev.vitamin-packs.com (dev)
+        -> EC2 Auto Scaling group of one (private-app):
+           Caddy (Let's Encrypt via Route 53 DNS-01) -> gunicorn | django-q2 worker
+             |-- TCP 5432, TLS verify-full --> RDS PostgreSQL 17 (DB subnets, local-only route)
+             |-- S3 gateway endpoint --> media bucket, artifacts bucket, AL2023 repos, ECR layers
+             '-- TCP 443 via NAT instance (public subnet) --> SSM, Secrets Manager, ECR, Logs, SES, Route 53, ACME
 ```
 
-The ALB is internal: there is no public InvenTree hostname, public IP, or direct internet route to EC2/RDS. Provide staff access through AWS Client VPN with narrowly scoped authorization/routes and MFA through the chosen identity integration, or use SSM port forwarding for a very small operator group. Use private Route 53 DNS for the internal service name. Do not publish the InvenTree API to the storefront.
+The design is sized for one staff user, a prod hosting budget under $50/month, and a recovery time and recovery point measured in hours. It deliberately has no load balancer, no NAT gateway, no interface endpoints, and no Multi-AZ database. Revisit those choices only with an explicit budget or availability change (see [Scale-Out Path](#scale-out-path)).
 
-### Security Groups and Routes
+## VPC
 
-- **ALB security group:** allow HTTPS from the Client VPN client CIDR and the inventory-integration Lambda security group only. If operators use SSM port forwarding directly to EC2 instead of the VPN/ALB path, omit that operator ingress path and keep the ALB limited to integration traffic.
-- **EC2 security group:** allow the InvenTree reverse-proxy/application target port only from the ALB security group. Do not allow inbound SSH or public internet ingress. Manage instances with Systems Manager (SSM) Session Manager; use an instance profile with narrowly scoped SSM, logging, secret retrieval, and S3 access.
-- **RDS security group:** allow PostgreSQL TCP 5432 only from the EC2 application security group. Do not allow access from the VPC CIDR generally, public addresses, Lambda security groups, or operator networks. Use separate application DB credentials with only the permissions InvenTree requires; reserve the master user for controlled administration.
-- **Lambda security group:** allow egress to the internal ALB on HTTPS and to only required VPC endpoints/service destinations. Do not grant general inbound access to Lambda ENIs.
-- **Network ACLs:** retain the default stateless ACL unless a documented requirement justifies custom rules; security groups provide the primary workload-level policy.
-- **NAT and endpoints:** use NAT for required outbound access such as pulling pinned container images or reaching external update services. Production should use one NAT Gateway per AZ for resilience; a single NAT Gateway is a documented dev cost tradeoff. Add S3 gateway and appropriate interface endpoints (for example SSM, Secrets Manager, CloudWatch Logs, and SQS) where they reduce exposure/cost. Do not add an internet route to database subnets.
+Use one VPC per environment in `us-west-2`. It holds only the InvenTree host, the operator jumpbox, the NAT instance, RDS, and the inventory Lambdas that need InvenTree. The rest of the application (API Gateway, other Lambdas, DynamoDB, CloudFront) is serverless and stays outside any VPC, so there is no wider application VPC to share.
 
-## Compute, Database, and Persistent Services
+A single VPC keeps security-group references between the Lambdas, the jumpbox, and the host. It also avoids peering or Transit Gateway and leaves one owner for the route tables: the `network` module. Add future private workloads as subnets and security groups in this VPC. If a peered VPC is ever needed, same-Region peering still supports security-group references.
 
-- **EC2:** run a supported, pinned InvenTree release using its documented container/process topology. Keep the instance in private application subnets with no public IP and attach an instance profile instead of static AWS access keys. Use an internal ALB with TLS from operators/Lambdas; encrypt the ALB-to-target hop where supported by the selected proxy configuration. Install updates through reviewed deployment automation, not ad hoc public SSH.
-- **Dev size/availability:** a single EC2 instance and single-AZ RDS instance may be used to minimize cost, while retaining the private subnet/security-group boundaries. Document the resulting availability limits.
-- **Production availability:** place EC2 nodes across at least two application subnets behind the internal ALB. Use an Auto Scaling Group or equivalent managed replacement process. Use Multi-AZ RDS. Ensure the selected InvenTree release and worker topology support the deployment model; run only one Celery beat scheduler unless the release explicitly supports leader election. Use a resilient supported broker such as managed ElastiCache Redis/Valkey for multi-node production, isolated in private subnets. A Redis process local to one EC2 node is acceptable only for a documented single-node dev configuration.
-- **RDS PostgreSQL:** choose an engine version supported by the pinned InvenTree release. Place RDS in a DB subnet group spanning private database subnets, disable public accessibility, enforce TLS with certificate verification, enable encryption at rest and automated backups, and test point-in-time recovery/restore. Retrieve credentials from Secrets Manager; use managed master credentials where supported and a separate least-privilege application user. Never pass secret values through Terraform variables that persist in state.
-- **Media and static files:** use a private, versioned S3 bucket and the EC2 instance profile. Prefer a supported InvenTree S3 storage integration for media; confirm the exact settings for the pinned release. Do not mount ephemeral instance storage as the only media copy. Restrict bucket access to the application role and required operators, and define lifecycle/retention and backup policies.
-- **Secrets:** keep the InvenTree secret key, database credentials, and integration API token in environment-scoped Secrets Manager secrets. Deliver them to EC2 using a least-privilege instance role and the supported configuration mechanism. Do not place plaintext in user data, AMIs, Terraform state/plans, container definitions, committed `.env` files, or logs. Rotate credentials and test rotation procedures.
-- **Operations:** emit system/application logs and health metrics to CloudWatch without customer data or credentials. Alert on unhealthy targets, EC2/disk pressure, failed workers, database storage/connections, stale inventory projection, and failed integration jobs. Back up RDS and media under a documented retention policy and test restore together into an isolated environment.
+## Subnets, Routes and Egress
 
-## Terraform and Network Implementation Sequence
+The owner approved these CIDRs. Each environment has four public /22s and four private /22s. Each private /22 is split into an application /23 and an isolated database /23 in the same AZ. AZs a and b are active; c and d are created but unused.
 
-1. Confirm the non-overlapping CIDR plan, operator access approach (Client VPN or SSM port forwarding), internal DNS name, dev/prod availability objectives, and InvenTree release/topology.
-2. In `infra/modules`, add or reuse modules for VPC/subnets/routes/endpoints, security groups, EC2/instance profile, internal ALB, RDS, S3 media, secrets, and monitoring. Keep `project`, `environment`, and `tags` conventions and expose values through module outputs.
-3. In `infra/dev`, create public, private application, and isolated database subnets across at least two AZs. Route only public subnets to the Internet Gateway; private application subnets use NAT/endpoints as needed; database subnet route tables have no internet route. Create the private RDS subnet group from isolated subnets.
-4. Define security-group references rather than broad CIDR rules for ALB-to-EC2, EC2-to-RDS, and Lambda-to-ALB flows. Keep RDS non-public. Attach SSM and application permissions through separate least-privilege IAM roles.
-5. Add DNS and internal TLS. Use ACM/private trust appropriate to internal clients; do not create a public endpoint solely to obtain a certificate or make service access easier. Ensure Lambda resolves the internal DNS name from the VPC.
-6. Review the Terraform plan for public IPs, public RDS, broad ingress/egress, unintended NAT/database routes, plaintext secrets, resource replacement, and state impact. Run `terraform fmt` and `terraform validate`. Apply only with explicit operator authorization.
-7. Deploy and validate the dev service, then promote the same intended configuration to prod with reviewed capacity, Multi-AZ database, NAT resilience, backup, alerting, and access settings.
+| AZ (ID) | Status | dev public | dev app | dev DB | prod public | prod app | prod DB |
+|---|---|---|---|---|---|---|---|
+| a (usw2-az2) | active | 192.168.0.0/22 | 192.168.16.0/23 | 192.168.18.0/23 | 192.168.32.0/22 | 192.168.48.0/23 | 192.168.50.0/23 |
+| b (usw2-az1) | active | 192.168.4.0/22 | 192.168.20.0/23 | 192.168.22.0/23 | 192.168.36.0/22 | 192.168.52.0/23 | 192.168.54.0/23 |
+| c (usw2-az3) | reserved | 192.168.8.0/22 | 192.168.24.0/23 | 192.168.26.0/23 | 192.168.40.0/22 | 192.168.56.0/23 | 192.168.58.0/23 |
+| d (usw2-az4) | reserved | 192.168.12.0/22 | 192.168.28.0/23 | 192.168.30.0/23 | 192.168.44.0/22 | 192.168.60.0/23 | 192.168.62.0/23 |
 
-Terraform examples must use the repository's provider/module conventions. Do not copy stand-alone Lightsail Terraform examples or create a second `inventree-aws/` root. Follow [Terraform conventions](terraform-conventions.md) and [Infrastructure development workflow](infrastructure-development.md); never run apply/destroy or AWS/state mutation without explicit authorization.
+- The dev VPC is `192.168.0.0/19` and the prod VPC is `192.168.32.0/19`.
+- **Pin subnets by AZ ID, not AZ letter.** Letter-to-ID mapping differs per account; the IDs above are this account's.
+- There is no overlap with the account's existing VPCs (`172.32.0.0/16` and the default `172.31.0.0/16`).
+- `192.168.x` overlaps typical home LANs. That is harmless with SSM tunnelling, but it rules out a future site-to-site VPN or Client VPN without readdressing.
+- Treat any CIDR change as destructive.
+
+Route tables:
+
+| Route table | Routes | Used by |
+|---|---|---|
+| Public (shared) | `local`; `0.0.0.0/0` → internet gateway | NAT instance only |
+| App a, app b | `local`; `0.0.0.0/0` → NAT instance ENI; S3 and DynamoDB gateway endpoints | InvenTree host, jumpbox, inventory Lambdas |
+| App c, app d | `local`; S3 and DynamoDB gateway endpoints; no default route | reserved |
+| DB (shared) | `local` only | RDS subnet group |
+
+Only the NAT instance has a public IP. RDS never has an internet route.
+
+**Why a NAT instance.** A t4g.nano NAT instance costs about $7.36/month, including its public IPv4 address. A NAT gateway costs about $32.85/month, and the seven interface endpoints the private hosts would otherwise need cost about $51/month in one AZ. A regional NAT gateway is billed per active AZ, so it saves nothing. One NAT cannot be shared across the dev and prod VPCs cheaply: peering does not transit through a NAT, and Transit Gateway attachments cost more than a NAT. Within each VPC, both active application route tables share the single NAT instance.
+
+NAT instance:
+- Auto Scaling group of one across public subnets a and b.
+- Latest Amazon Linux 2023 arm64 AMI, t4g.nano.
+- Auto-assigned public IPv4 rather than an Elastic IP, so there is no charge while it is stopped.
+- Boot script:
+  - Disables the source/destination check on the instance.
+  - Enables IP forwarding and nftables masquerade.
+  - Calls `ec2:ReplaceRoute` to point `0.0.0.0/0` in the app a/b route tables at its own ENI.
+  - Its IAM role is scoped to those route tables and to the instance itself.
+- Patched by monthly instance refresh.
+- If it fails, only egress stops: inventory sync and jobs, SSM access, ECR pulls, email, and certificate renewal. Checkout keeps working from the DynamoDB projection. An alarm fires when the NAT group is unhealthy.
+
+Egress controls:
+- Private security groups allow outbound traffic only on TCP 443, plus PostgreSQL to RDS from the host and the gateway-endpoint prefix lists.
+- The NAT security group accepts TCP 443 only from the host, jumpbox, and inventory-Lambda security groups.
+- The S3 gateway endpoint policy allows only:
+  - the environment's media and artifacts buckets;
+  - `al2023-repos-us-west-2-de612dc2`, for Amazon Linux packages without internet access;
+  - `prod-us-west-2-starport-layer-bucket`, for ECR image layers.
+- The DynamoDB gateway endpoint policy allows only the application table.
+- Keep the default network ACLs. Security groups are the workload-level policy.
+
+InvenTree 1.5.6 makes only two outbound internet calls by default: daily exchange rates from `api.frankfurter.app` and a weekly GitHub update check. Turn both off during setup, since the store is USD-only:
+- `CURRENCY_UPDATE_INTERVAL=0`
+- `INVENTREE_UPDATE_CHECK_INTERVAL=0`
+
+## Staff Access
+
+Staff reach the InvenTree UI through a Windows Server jumpbox inside the VPC. The laptop connects with native Remote Desktop over an AWS Systems Manager port-forwarding session, so there are no inbound ports, no VPN, and no public InvenTree endpoint. Step-by-step operator instructions are in the [README](../README.md#staff-access-to-inventree-windows-jumpbox).
+
+Jumpbox instance:
+- Latest AWS-provided Windows Server 2025 AMI, from the SSM public parameter. t3.small.
+- Auto Scaling group across app subnets a and b.
+- No public IP, no key pair, IMDSv2 required, encrypted 30 GB gp3 root.
+- **Desired capacity is 0 by default, with no schedule.**
+  - The owner starts it in the console when needed and returns it to 0 afterwards.
+  - The instance is stateless and its root volume is deleted on termination, so an idle jumpbox costs nothing.
+  - A CloudWatch alarm on the group's `GroupInServiceInstances` sends an email reminder after 8 hours in service. Enable Auto Scaling group metrics for this.
+- Patching: every launch uses the latest AMI, and a monthly instance refresh covers any long-running instance. There is no Windows Update.
+- Instance role:
+  - `AmazonSSMManagedInstanceCore` and the CloudWatch agent policy.
+  - `secretsmanager:GetSecretValue` on the jumpbox login secret only.
+  - `ssm:PutParameter` on `/<project>/<env>/jumpbox/rdp-thumbprint` only. The instance publishes its RDP certificate thumbprint there at boot.
+
+Connection:
+- **Primary:**
+  1. On the laptop, run `aws sso login`.
+  2. Start `aws ssm start-session` with document `AWS-StartPortForwardingSession`, forwarding local port 13389 to the jumpbox's port 3389.
+  3. Connect `mstsc` to `localhost:13389`.
+- **Fallback:** Fleet Manager Remote Desktop in the AWS console, using **User credentials** with the same Windows account. Never use its IAM Identity Center sign-in option: that creates a persistent local Administrator account on the instance. Fleet Manager sessions end after 60 minutes (renewable) or 10 idle minutes, and support text clipboard only, with no file transfer.
+
+Identity and MFA, in three layers:
+1. **AWS:** IAM Identity Center with MFA enforced. The permission set `inventree-<env>-operator` allows only:
+   - `ssm:StartSession` on the tagged jumpbox with the port-forwarding document;
+   - `ssm:TerminateSession` on the user's own sessions;
+   - `ssm-guiconnect:StartConnection`, `GetConnection`, and `CancelConnection`, for the fallback;
+   - `secretsmanager:GetSecretValue` on the jumpbox login secret;
+   - `ec2:DescribeInstances` and `autoscaling:Describe*`;
+   - `autoscaling:SetDesiredCapacity` and `autoscaling:UpdateAutoScalingGroup` on the jumpbox group only.
+2. **Windows:** one local non-admin user, `inventree-operator`, in Remote Desktop Users.
+   - Launch user data (which contains no secrets) creates or updates it from the Secrets Manager secret `<project>-<env>-jumpbox-login`.
+   - Terraform creates only the secret container; the value is set out of band and never enters Terraform state.
+   - The Administrator password is not retrievable. Administrative work uses SSM Run Command.
+3. **InvenTree:** local InvenTree accounts with the `LOGIN_ENFORCE_MFA` global setting enabled.
+
+Egress from the jumpbox:
+- The SSM agent must reach public SSM endpoints over TCP 443 through the NAT instance, so the security group cannot block browsing on its own. The owner accepted this tradeoff.
+- Windows Defender Firewall denies all outbound traffic by default and allows only:
+  - the SSM agent and session worker;
+  - the CloudWatch agent;
+  - EC2Launch;
+  - DNS to the VPC resolver;
+  - **Edge to the VPC CIDR only.**
+- The non-admin user cannot change these rules.
+
+File transfer:
+- InvenTree runs inside the jumpbox's browser, so files move through RDP drive redirection.
+- The laptop maps one dedicated folder to a `subst` drive (`T:`) and redirects only that drive.
+- This carries uploads (part images, datasheets, invoices, CSV/XLSX imports, label templates) and downloads (exports, PDF reports and labels).
+- Verify during dev acceptance that `subst` drives appear in the `mstsc` drive list.
+- Rejected alternatives:
+  - an S3 transfer bucket (too many steps per file);
+  - an upload route in the admin app (it becomes a generic InvenTree proxy, which is prohibited);
+  - giving the jumpbox general internet access.
+
+Audit:
+- CloudTrail records `StartSession` and `StartConnection` events.
+- The CloudWatch agent forwards Windows Security logon events 4624 and 4625.
+- Caddy access logs and InvenTree's own login records identify the user.
+- Session Manager does not record the contents of port-forwarding sessions. With a single staff user, RDP session recording is not required.
+
+InvenTree host administration uses SSM Session Manager shell sessions with session logging. SSM port forwarding to the host is break-glass only. There is no SSH anywhere.
+
+## InvenTree Host
+
+### Process Topology
+
+Run InvenTree **1.5.6**, pinned by image digest (`inventree/inventree:1.5.6@sha256:…`).
+
+Host:
+- One Amazon Linux 2023 arm64 host in an Auto Scaling group of one across app subnets a and b.
+- Instance size: **t4g.small** (2 GiB) in dev and **t4g.medium** (4 GiB) in prod. Covering prod with a one-year EC2 Instance Savings Plan is a prod go-live gate (see [Dev vs Prod and Cost](#dev-vs-prod-and-cost)).
+- 20 GB gp3 root and a 1 GiB swap file.
+- Docker, the CloudWatch agent, and the SSM agent come from Amazon Linux repositories through the S3 gateway endpoint.
+
+Containers:
+
+| Container | Command | Role |
+|---|---|---|
+| `inventree-server` | gunicorn | Web and API. `INVENTREE_GUNICORN_WORKERS=2`; the default of CPU×2+1 is too many for the memory. |
+| `inventree-worker` | `invoke worker` | Background tasks and scheduled tasks, as a django-q2 cluster. |
+| `caddy` | Caddy, custom-built with the `caddy-dns/route53` module | TLS on 443; serves static files and proxies to gunicorn. |
+
+InvenTree uses **django-q2**, not Celery:
+- **Broker:** the task queue lives in PostgreSQL. InvenTree configures django-q2's ORM broker, which takes precedence over Redis even when a cache is configured.
+- **Scheduler:** it runs inside the worker cluster and claims due schedules with row locks.
+- **No Redis:** without Redis, InvenTree uses a per-process local-memory cache and limits the worker to one thread. That is correct for a single node and saves memory.
+
+Build and mirror images in CI outside the VPC:
+- Push the InvenTree digest and the custom Caddy build to environment ECR repositories.
+- Hosts pull through the NAT instance and the S3 gateway endpoint.
+- Never use mutable `latest` or `stable` tags.
+
+Configuration:
+- `INVENTREE_SITE_URL`: `https://inventree.vitamin-packs.com` (prod) or `https://inventree.dev.vitamin-packs.com` (dev).
+- Explicit `INVENTREE_ALLOWED_HOSTS` and `INVENTREE_TRUSTED_ORIGINS`.
+- `INVENTREE_AUTO_UPDATE=false`, so migrations never run implicitly.
+- Secret key and OIDC key via `INVENTREE_SECRET_KEY_FILE` and `INVENTREE_OIDC_PRIVATE_KEY_FILE`, written to tmpfs at boot from Secrets Manager. They must stay constant across host replacements; otherwise InvenTree generates new ones and invalidates sessions and tokens.
+- Deliver secrets through the instance role. Never put them in user data, AMIs, Terraform state, container definitions, committed `.env` files, or logs.
+
+### TLS and Private DNS
+
+There is no load balancer. Caddy terminates TLS on the host with a **Let's Encrypt** certificate obtained by DNS-01:
+- It writes only the `_acme-challenge.<fqdn>` TXT record in the existing public `vitamin-packs.com` hosted zone.
+- IAM conditions `route53:ChangeResourceRecordSetsNormalizedRecordNames`, `RecordTypes`, and `Actions` limit it to that name and type.
+- Terraform reads the public zone with a data source and never imports or manages it.
+- The public zone has no A record for either InvenTree hostname, so InvenTree is not reachable from the internet.
+- Clients need no custom trust store. Lambda (certifi) and Edge trust the Let's Encrypt roots.
+- The hostnames appear in Certificate Transparency logs. The owner accepted this. There is no AWS Private CA.
+- After each issuance or renewal, the host copies Caddy's certificate storage to the artifacts bucket and restores it at boot. This keeps host replacements under Let's Encrypt's limit of five duplicate certificates per seven days.
+
+Private DNS:
+- Each environment has a Route 53 **private hosted zone whose apex is exactly the InvenTree hostname**, associated only with that environment's VPC:
+  - prod: `inventree.vitamin-packs.com`
+  - dev: `inventree.dev.vitamin-packs.com`
+- Never create a private zone named `vitamin-packs.com`. The VPC resolver would return NXDOMAIN for every name missing from it, breaking mail and other `vitamin-packs.com` lookups inside the VPC.
+- At boot, the host UPSERTs the zone's apex A record to its own private IP with a 60-second TTL. IAM limits it to that zone, name, record type, and UPSERT.
+- The InvenTree client in `backend/shared` retries connection errors so it tolerates the TTL window after a replacement.
+
+### Email
+
+InvenTree administration email (password resets, notifications) goes through the Amazon SES API with the instance role. There are no SMTP credentials and no IAM user keys.
+
+InvenTree 1.5.6 bundles `django-anymail[amazon-ses]`. Configure:
+- `INVENTREE_EMAIL_BACKEND=anymail.backends.amazon_ses.EmailBackend`
+- `INVENTREE_ANYMAIL={"AMAZON_SES_CLIENT_PARAMS":{"region_name":"us-west-2"}}`
+- `INVENTREE_EMAIL_SENDER=inventree@vitamin-packs.com` in prod, or `inventree-dev@vitamin-packs.com` in dev.
+
+IAM allows `ses:SendEmail` and `ses:SendRawEmail` on the `vitamin-packs.com` identity only, with a `ses:FromAddress` condition for the environment's sender. Confirm the exact action set in dev.
+
+SES identity:
+- A domain identity for `vitamin-packs.com` with Easy DKIM, in the `ses-identity` module, one per account.
+- Terraform adds the three DKIM CNAME records to the existing public zone. It leaves the existing Google Workspace MX, SPF, and DKIM records untouched.
+- DMARC alignment comes from DKIM; there is no custom MAIL FROM domain.
+- Recipients are addresses at the verified domain, so the account can remain in the SES sandbox (200 messages per day).
+
+### Health, Deployment and Persistence
+
+Health:
+- A systemd timer on the host calls `https://localhost/api/system/health/` and `invoke worker-health`, which checks the worker heartbeat, and publishes the results as a CloudWatch metric.
+- After three consecutive failures it marks its own instance unhealthy with `autoscaling:SetInstanceHealth`, so the group replaces it.
+- The group also uses EC2 status checks.
+- Alarms go to an SNS topic with an email subscription for the owner.
+
+Persistence: nothing authoritative lives on the host.
+- The database is in RDS and media is in S3.
+- Secrets are in Secrets Manager; static files are rebuilt from the image.
+- The Caddy certificate is backed up to S3, and logs go to CloudWatch.
+- Replacing the instance loses nothing.
+
+Upgrade procedure (stage every upgrade in dev first):
+1. Take a manual RDS snapshot, and confirm S3 media versioning is on.
+2. Stop the worker container.
+3. Run a one-off `invoke migrate` container through SSM Run Command. This is the only place migrations run. Use `--skip-backup` semantics; the RDS snapshot is the backup, and the image's `pg_dump` must match the PostgreSQL major version.
+4. Start an Auto Scaling instance refresh (minimum healthy 0%) to the launch template with the new image digest.
+5. Smoke-test the UI, the API, the worker heartbeat, and an inventory-sync run.
+6. Check API compatibility for the inventory Lambdas before promoting to prod.
+
+The site is down for a few minutes during a refresh. That is acceptable because checkout reads the DynamoDB projection and never calls InvenTree synchronously.
+
+Roll back the application image only when the schema is still compatible. Otherwise use the [restore procedure](#rds-postgresql).
+
+### Scale-Out Path
+
+Scale-out is documented, not built. If InvenTree ever needs more than one web node:
+1. Put an internal ALB in front of two or more web instances.
+2. Run a separate worker group of one.
+3. Add a shared cache.
+
+Preconditions:
+- InvenTree 1.5.6 builds only plaintext `redis://` cache URLs, so a managed cache needs a TLS tunnel or a newer release that supports TLS.
+- The prod budget must increase.
+- Without a shared cache, multiple web nodes would each keep separate local-memory caches.
+
+## RDS PostgreSQL
+
+- **Engine:** PostgreSQL **17**, latest 17.x minor. This matches InvenTree's reference container database and the `pg_dump` client in its image.
+- **Instance:** db.t4g.micro, **single-AZ** in both environments, with 20 GB gp3 storage.
+- **Encryption:** AWS-managed KMS key.
+- **Network:** not publicly accessible. The DB subnet group uses DB subnets a and b.
+- **Maintenance:** automatic minor version upgrades off; minor and major upgrades are staged in dev first.
+- **TLS:** a custom parameter group sets `rds.force_ssl=1`. It is already the default on PostgreSQL 15 and later; set it explicitly so it can't regress.
+  - InvenTree connects with `INVENTREE_DB_OPTIONS={"sslmode":"verify-full","sslrootcert":"/etc/ssl/rds/global-bundle.pem"}`.
+  - The RDS CA bundle comes from the artifacts bucket.
+- **Credentials:**
+  - The master user password is RDS-managed in Secrets Manager and is used only for administration and bootstrap.
+  - A separate `inventree_app` login owns only the `inventree` database and is not a superuser. Its credentials live in the InvenTree Secrets Manager secret.
+- **Backups:** automated backups with point-in-time recovery, 7-day retention.
+  - Prod has deletion protection and a final snapshot on delete.
+  - Recovery point is about 5 minutes; RDS uploads transaction logs every five minutes.
+  - Recovery time is measured in hours: there is no automatic failover. The owner accepted this for cost.
+
+Restore procedure (rehearse it in dev each quarter and before prod upgrades):
+1. Restore to a point in time or from a snapshot as a **new** DB instance, using the same subnet group, security group, and parameter group.
+2. Restore S3 media objects to the same timestamp from object versions.
+3. Update the SSM parameter that holds `INVENTREE_DB_HOST`.
+4. Start an Auto Scaling instance refresh of the InvenTree host.
+5. Validate the UI, the API, and inventory reconciliation, then retire the old instance.
+
+## Media and Artifacts
+
+Media bucket (one per environment):
+- Private, versioned, SSE-S3, Block Public Access on.
+- InvenTree configuration:
+  - `INVENTREE_STORAGE_TARGET=s3`
+  - `INVENTREE_S3_BUCKET_NAME=<bucket>`
+  - `INVENTREE_S3_REGION_NAME=us-west-2`
+  - `INVENTREE_S3_ENDPOINT_URL=https://s3.us-west-2.amazonaws.com` (required: InvenTree builds its media URL from it)
+  - No access keys; boto3 uses the instance role.
+- Bucket policy denies non-TLS requests and denies all object access unless `aws:SourceVpce` is this VPC's S3 gateway endpoint.
+- This works because InvenTree serves media as presigned S3 URLs that the browser fetches directly. The only browser is on the jumpbox, whose S3 route is the gateway endpoint.
+- Noncurrent object versions expire after 7 days, matching RDS backup retention.
+
+Artifacts bucket (one per environment):
+- Holds the pinned Docker Compose binary and checksum, the RDS CA bundle, and the Caddy certificate backup.
+- Same controls as the media bucket.
+
+The backup and restore scope is RDS, S3 media versions, and the Secrets Manager secrets. Keep the InvenTree secret key and OIDC key: losing them logs everyone out and invalidates issued tokens.
+
+## Security Groups
+
+| Security group | Inbound | Outbound |
+|---|---|---|
+| `jumpbox` | none | TCP 443 → `inventree`; TCP 443 → `0.0.0.0/0` via NAT (the host firewall limits this to the SSM and CloudWatch agents); TCP 443 → S3 prefix list |
+| `inventree` (EC2 host) | TCP 443 from `jumpbox` and `inv-lambda` | TCP 5432 → `rds`; TCP 443 → `0.0.0.0/0` via NAT; TCP 443 and 80 → S3 prefix list |
+| `rds` | TCP 5432 from `inventree` | none |
+| `inv-lambda` | none | TCP 443 → `inventree`; TCP 443 → `0.0.0.0/0` via NAT (Secrets Manager, SQS); TCP 443 → DynamoDB prefix list |
+| `nat` | TCP 443 from `jumpbox`, `inventree`, and `inv-lambda` | TCP 443 → `0.0.0.0/0` |
+
+- Use security-group references wherever a peer is a security group.
+- The RDS security group never allows the VPC CIDR, Lambda, the jumpbox, or any operator network.
+- Neither the InvenTree host nor the jumpbox has an inbound port open to operators. Both are reached only through SSM.
+- There is no SSH or RDP ingress anywhere.
+- Operators have no network path to RDS. Database administration runs on the InvenTree host through SSM.
+
+## Dev vs Prod and Cost
+
+| | dev (on-demand) | prod (always on) |
+|---|---|---|
+| Hostname | `inventree.dev.vitamin-packs.com` | `inventree.vitamin-packs.com` |
+| InvenTree host | t4g.small on-demand, group of 0 or 1 | t4g.medium on the Savings Plan, group of 1 |
+| RDS | db.t4g.micro single-AZ, stopped when idle | db.t4g.micro single-AZ |
+| NAT instance | group of 0 or 1 | group of 1 |
+| Jumpbox | 0 or 1, started manually | 0 or 1, started manually, with an 8-hour reminder alarm |
+| Email sender | `inventree-dev@vitamin-packs.com` | `inventree@vitamin-packs.com` |
+| Inventory sync schedule | disabled; run manually | enabled |
+
+Dev runs only when needed:
+- A nightly EventBridge Scheduler job, using universal targets, sets the dev Auto Scaling groups to 0 and stops the DB instance. It also handles the automatic restart RDS performs after seven days stopped.
+- Starting dev is a deliberate operator action, in this order: RDS, then the NAT instance, then the InvenTree host, then the jumpbox.
+- A dev-only start script under `scripts/` is planned. It must follow the [deployment-script rules](infrastructure-development.md#deployment-scripts).
+
+**Prod estimate, per month.** Prices are us-west-2 on-demand from the AWS Pricing API (September 2026), 730 hours per month; "est." items are estimates.
+
+| Item | $/month |
+|---|---|
+| InvenTree host: t4g.medium on a one-year no-upfront EC2 Instance Savings Plan ($0.0211/h), plus 20 GB gp3 | 15.40 + 1.60 |
+| RDS db.t4g.micro single-AZ, plus 20 GB gp3 | 11.68 + 2.30 |
+| NAT instance: t4g.nano, 8 GB gp3, public IPv4 | 3.07 + 0.64 + 3.65 |
+| Jumpbox: t3.small Windows, about 20 hours a month | ~0.80 |
+| Secrets Manager: four secrets | 1.60 |
+| Route 53 private hosted zone | 0.50 |
+| CloudWatch logs, alarms, and metrics (est.) | ~1.50 |
+| SES, S3, and data transfer (est.) | ~0.40 |
+| **Total** | **≈ 43** |
+
+- **Buy the t4g-family EC2 Instance Savings Plan before prod go-live.** It is a billing commitment, bought in the console, not in Terraform. Without it the t4g.medium costs $0.0336/h on demand and the total rises to about $52, over the $50 budget. The plan applies to any t4g size in the Region.
+- **Dev:** about $4.40/month idle (RDS storage, secrets, private zone), plus about $0.08 per running hour.
+- Check the prod run rate in Cost Explorer after the first full week. Confirm that Savings Plan utilization is near 100%.
+
+## Secret Rotation
+
+| Secret | Used by | Cadence | Method | Impact |
+|---|---|---|---|---|
+| RDS master password | administration and bootstrap only | Every 7 days, automatic | RDS-managed secret | None; InvenTree never uses it |
+| `inventree_app` database password | InvenTree containers | Every 90 days, and immediately on suspected exposure | Scripted manual rotation (below) | About one minute of downtime |
+| InvenTree integration API token | Inventory Lambdas | Every 90 days | Overlap rotation using InvenTree token expiry (below) | None |
+| Jumpbox Windows password | The staff user | Monthly | Put a new secret version; the next jumpbox launch applies it | None |
+| InvenTree secret key and OIDC key | InvenTree | Only on compromise | New secret value, then container restart | Logs out all sessions and invalidates OIDC tokens: 1.5.6 has no secret-key fallback |
+| TLS certificate | Caddy | About every 60 days, automatic | Let's Encrypt renewal by DNS-01 | None |
+| Identity Center password and MFA | The staff user | Identity Center policy | Identity Center | None |
+
+**Why the database password is rotated manually.** A Secrets Manager rotation Lambda would need its own network path to RDS, breaking the rule that only the InvenTree host reaches the database. Single-user rotation also changes the password under the running application, which needs a restart anyway. Alternating-user rotation avoids the restart but needs a shared owner role, so that objects created by Django migrations stay usable by both logins. That design isn't worth it for one user and an hours-level recovery objective.
+
+Database password rotation runbook (SSM Run Command on the InvenTree host):
+1. Generate a new password.
+2. Using the RDS-managed master secret, run `ALTER ROLE inventree_app PASSWORD …`.
+3. Put the new password as a new version of the InvenTree secret.
+4. Restart the InvenTree containers so they read the new secret.
+5. Check `/api/system/health/` and a login, then record the rotation.
+
+Integration token overlap procedure:
+1. In InvenTree, create a new API token for the integration user, with an expiry about 100 days out.
+2. Put it as a new version of the integration-token secret. The Lambdas cache the secret for five minutes and re-read it on HTTP 401.
+3. After 24 hours, revoke the old token in InvenTree.
+
+## Terraform Modules and Prerequisites
+
+Implement these reusable modules in `infra/modules` and compose them through an `inventree` orchestrator module in `infra/dev`, then `infra/prod`. Keep the `project`, `environment`, and `tags` conventions, and connect modules through outputs.
+
+| Module | Key outputs |
+|---|---|
+| `network`: VPC, subnets, internet gateway, route tables, S3 and DynamoDB gateway endpoints and their policies | `vpc_id`, `public_subnet_ids`, `private_app_subnet_ids`, `db_subnet_ids`, `private_app_route_table_ids`, `s3_prefix_list_id`, `dynamodb_prefix_list_id` |
+| `nat-instance` | `nat_asg_name`, `nat_security_group_id` |
+| `inventree-security-groups` | `inventree_sg_id`, `rds_sg_id`, `inventory_lambda_sg_id`, `jumpbox_sg_id` |
+| `route53-private-zone`, plus a data source for the existing public zone | `private_zone_id`, `inventree_fqdn` |
+| `ecr`: InvenTree image and custom Caddy build | `repository_urls` |
+| `s3-media`, `s3-artifacts` | bucket names and ARNs |
+| `secrets`: containers only; values set out of band | `inventree_app_secret_arn`, `integration_token_secret_arn`, `jumpbox_login_secret_arn` |
+| `ec2-asg`: InvenTree host, instance role with scoped Route 53 and SES permissions, health reporting | `inventree_asg_name`, `inventree_role_arn` |
+| `rds-postgres` | `db_endpoint`, `db_instance_id`, `master_user_secret_arn` |
+| `windows-jumpbox` | `jumpbox_asg_name`, `jumpbox_role_arn` |
+| `monitoring`: SNS topic with an email subscription to `var.alert_email`, plus alarms | `alerts_topic_arn` |
+| `ses-identity`: domain identity and DKIM records, one per account | `ses_identity_arn` |
+| `dev-scheduler`: dev only | `schedule_arns` |
+
+The backend consumes `private_app_subnet_ids`, `inventory_lambda_sg_id`, `inventree_fqdn` (the InvenTree base URL), and `integration_token_secret_arn`. See [Backend API](backend-api.md#private-inventree-connectivity).
+
+Prerequisites. Account state was verified read-only on 2026-09-28:
+- **Done:**
+  - Public hosted zone `vitamin-packs.com` exists.
+  - IAM Identity Center is enabled in `us-west-2` with MFA enforced.
+  - CloudTrail is enabled.
+- **Service quotas:** all at defaults, and no increase is needed.
+  - Elastic IPs: 0 used; the NAT instance uses an auto-assigned address.
+  - VPCs per Region: 4 of 5 after both environments exist. Request more before adding another VPC.
+  - On-demand standard vCPUs: 1920.
+  - Lambda concurrency: 1000.
+  - Fleet Manager concurrent connections: 5.
+- **To do:**
+  - Remote-state bootstrap.
+  - A CI job that mirrors the pinned InvenTree digest and builds the Caddy image into ECR.
+  - Set the SNS alert address (`larryj@vitamin-packs.com`) and confirm the subscription email.
+  - Buy the Savings Plan before prod go-live.
+
+Review every plan for public IPs other than the NAT instance, public RDS, broad ingress, unintended default routes on the DB or reserved subnets, plaintext secrets, resource replacement, and state impact. Run `terraform fmt` and `terraform validate`. Apply only with explicit operator authorization. Do not copy stand-alone Lightsail examples or create a second Terraform root. Never run apply, destroy, or state or AWS mutation without explicit authorization.
+
+## Acceptance Tests
+
+Run these in dev before promoting, and again in prod before go-live.
+
+- **Network:**
+  - The DB route table has only the `local` route, and the reserved app route tables have no default route.
+  - Only the NAT instance has a public IP.
+  - An S3 request from the jumpbox to a bucket outside the endpoint policy is denied.
+- **Egress:**
+  - Edge on the jumpbox cannot load any public site, while the SSM tunnel works.
+  - InvenTree makes no calls to `api.frankfurter.app` or GitHub.
+- **TLS and DNS:**
+  - Lambda and Edge validate the Let's Encrypt certificate with default trust.
+  - After an instance refresh, the private record points to the new host within 60 seconds and the certificate is restored from S3 without a new issuance.
+- **Jumpbox:**
+  - Following the README exactly, connect as the non-admin user, upload a laptop file as a part image through the redirected drive, and copy a CSV export back.
+  - The Fleet Manager fallback works with User credentials, and no Identity Center-created admin account exists.
+  - A user without the permission set cannot start a session.
+  - The 8-hour reminder alarm fires.
+- **RDS:**
+  - `pg_stat_ssl` shows `ssl = t` for InvenTree connections, and a connection with `sslmode=disable` is rejected.
+  - A point-in-time restore rehearsal completes and InvenTree starts against the restored instance.
+- **Worker and health:**
+  - Stopping the worker raises the heartbeat alarm.
+  - A host that fails health checks is replaced.
+  - Scheduled tasks run once per interval.
+- **Media:**
+  - An upload lands in S3 and survives an instance replacement.
+  - A versioned restore works.
+  - Object access from outside the gateway endpoint is denied.
+- **Email:**
+  - An InvenTree test email reaches `larryj@vitamin-packs.com` with DKIM passing.
+  - No SMTP credentials exist.
+- **Rotation:**
+  - The database-password runbook completes with only a restart.
+  - Integration-token overlap rotation causes no Lambda failures.
+- **Dev on demand:**
+  - The nightly stop leaves only storage running.
+  - The start sequence brings dev up in order.
+- **Cost:** the prod run rate is under $50/month after one full week, with the Savings Plan covering the t4g.medium hours.
+
+## Open Owner Actions
+
+All design decisions are resolved. Remaining owner actions:
+1. Buy the one-year t4g EC2 Instance Savings Plan before prod go-live.
+2. Confirm the SNS email subscription.
+3. Change the sender addresses if `inventree@` and `inventree-dev@` are not wanted.
+
+## References
+
+- InvenTree 1.5.6 source, tag `1.5.6`:
+  - `contrib/container/docker-compose.yml`, `Caddyfile`, `gunicorn.conf.py`
+  - `src/backend/InvenTree/InvenTree/setting/worker.py`, `setting/storages.py`, `setting/db_backend.py`, `cache.py`, `settings.py`
+  - `src/backend/InvenTree/common/setting/system.py`
+  - `src/backend/requirements.txt`
+  - django-q2 1.10.0 `brokers/__init__.py` and `scheduler.py`
+- InvenTree documentation: [Docker](https://docs.inventree.org/en/stable/start/docker/), [Configuration](https://docs.inventree.org/en/stable/start/config/), [Processes](https://docs.inventree.org/en/stable/start/processes/)
+- Amazon RDS: [SSL with PostgreSQL](https://docs.aws.amazon.com/AmazonRDS/latest/UserGuide/PostgreSQL.Concepts.General.SSL.html), [Point-in-time restore](https://docs.aws.amazon.com/AmazonRDS/latest/UserGuide/USER_PIT.html), [Secrets Manager integration](https://docs.aws.amazon.com/AmazonRDS/latest/UserGuide/rds-secrets-manager.html), [Stopping an instance](https://docs.aws.amazon.com/AmazonRDS/latest/UserGuide/USER_StopInstance.html)
+- AWS Systems Manager: [Starting a session (port forwarding)](https://docs.aws.amazon.com/systems-manager/latest/userguide/session-manager-working-with-sessions-start.html), [Fleet Manager Remote Desktop](https://docs.aws.amazon.com/systems-manager/latest/userguide/fleet-manager-remote-desktop-connections.html)
+- Route 53: [Private hosted zone considerations](https://docs.aws.amazon.com/Route53/latest/DeveloperGuide/hosted-zone-private-considerations.html), [IAM conditions for record sets](https://docs.aws.amazon.com/Route53/latest/DeveloperGuide/specifying-rrset-conditions.html)
+- Networking and compute: [Lambda VPC access](https://docs.aws.amazon.com/lambda/latest/dg/configuration-vpc.html), [Regional NAT gateway](https://aws.amazon.com/blogs/networking-and-content-delivery/introducing-amazon-vpc-regional-nat-gateway/), [Updating Amazon Linux without internet access](https://repost.aws/knowledge-center/ec2-al1-al2-update-yum-without-internet)
+- [Let's Encrypt rate limits](https://letsencrypt.org/docs/rate-limits/)
+- AWS Pricing API and Savings Plans offering rates, `us-west-2`, queried 2026-09-28.
 
 ## InvenTree API and Data Contract
 
-Implement the InvenTree client in `backend/shared` so inventory sync and stock-posting jobs use one authenticated, timeout-bounded integration. Put only the required inventory job Lambdas in the VPC and give them access to the internal ALB. Keep checkout/payment handlers outside the VPC unless they require private connectivity; this avoids forcing unrelated public payment API calls through NAT. If a checkout path must call InvenTree synchronously, document the reason and its NAT/endpoints needs, and prefer the durable job model below.
+Implement the InvenTree client in `backend/shared` so inventory sync and stock-posting jobs use one authenticated, timeout-bounded integration. Put only the required inventory job Lambdas in the VPC and allow them to reach the private InvenTree HTTPS endpoint. Keep checkout and payment handlers outside the VPC unless they require private connectivity. This avoids forcing unrelated public payment API calls through the NAT instance. If a checkout path must call InvenTree synchronously, document the reason and its egress needs, and prefer the durable job model below.
 
 Give the integration service account only the InvenTree permissions required for reads and stock movements. Use API behavior verified against the pinned InvenTree release's docs/schema; do not guess endpoint names, payloads, or reservation semantics. Keep API tokens server-side. Bound retries and make non-idempotent requests safe.
 
@@ -98,9 +521,9 @@ Stage InvenTree upgrades in dev, pin the image/release, take and verify backups,
 
 ## Implementation and Verification Checklist
 
-1. Confirm the pinned InvenTree release, EC2 process topology, broker, S3 media support, RDS version/TLS, secret injection, VPC CIDRs, internal access path, and Lambda-to-ALB connectivity before building dependent code.
+1. The hosting design above is resolved: InvenTree 1.5.6 process topology, PostgreSQL-backed django-q2 broker, S3 media, RDS PostgreSQL 17 with verified TLS, secret delivery, approved CIDRs, jumpbox access, and Lambda connectivity to the private HTTPS endpoint. Complete the [open owner actions](#open-owner-actions) before prod go-live.
 2. Build dev networking and service resources. Review security groups, route tables, public exposure, secret flow, and Terraform plans. Run format/validation; do not apply without operator authorization.
-3. Deploy the dev application and verify internal DNS/TLS, Client VPN or SSM operator access, SSM management without SSH ingress, private RDS connectivity, media persistence, worker processing, alarms, and backup/restore.
+3. Deploy the dev application and run the [acceptance tests](#acceptance-tests): private DNS/TLS, jumpbox access through SSM, SSM management without SSH ingress, private RDS connectivity, media persistence, worker processing, email, alarms, and backup/restore.
 4. Implement mappings, sync, reservation-aware projection, idempotent stock jobs, admin writes, and reconciliation. Update [Backend API](backend-api.md), [Payment processing](payment-processing.md), and the DynamoDB data model when contracts change.
 5. Test component and finished-kit stock without double counting, concurrent last-unit checkout, stale projection rejection, InvenTree downtime, failed/duplicate/out-of-order payment events, cancellation, retry after partial movement, and reconciliation after admin adjustment.
 6. Validate the entire dev path from InvenTree stock to catalog availability, checkout reservation, verified payment, physical movement, reservation retirement, failure alerts, and restore. Promote only the reviewed equivalent to prod via [Infrastructure development workflow](infrastructure-development.md).
