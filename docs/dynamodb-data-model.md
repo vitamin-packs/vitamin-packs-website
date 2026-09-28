@@ -21,6 +21,7 @@ One table per environment, named `${project}-${environment}-data` (e.g. `diyhobb
 | Stock projection | `STOCK#<partId>` | `PROJECTION` | One per InvenTree part that any SKU consumes. Derived from InvenTree; written only by inventory sync, checkout, release, and job completion. See [Inventory projection and reservations](#inventory-projection-and-reservations). |
 | Order reservation | `ORDER#<orderId>` | `RESERVATION` | One per order: every part quantity the order holds against the projection. |
 | Inventory job | `ORDER#<orderId>` | `INVJOB#<kind>` | One per order per movement kind (`COMMIT`, `UNCOMMIT`, `SHIP`). Durable, idempotent InvenTree stock movement. |
+| Admin stock adjustment job | `ADJ#<adjustmentId>` | `INVJOB#ADJUST` | One per admin stock adjustment. Same job lifecycle; see [Inventory job](#inventory-job-orderorderid--invjobkind). |
 | Inventory sync state | `SYNC#inventory` | `STATE` | Last start, last success, and error counts for the sync. |
 
 `<partId>` is the InvenTree part primary key in that environment. Dev and prod InvenTree have different keys, so part mappings are environment data and are never promoted from dev to prod.
@@ -41,7 +42,7 @@ fulfillment_mode        string  ("STOCKED_PART" | "COMPONENTS"; required when se
 inventree_part_id       number  (STOCKED_PART: the part sold; COMPONENTS: the kit assembly part whose BOM is used)
 stock_requirements      map<partId, number>  # per one unit sold, in each part's InvenTree units; written only by inventory sync
 mapping_version         string  (hash of mode, part IDs, quantities, units, BOM checksum, eligibility version)
-mapping_status          string  ("OK" | "ERROR"); checkout rejects anything but "OK"
+mapping_status          string  ("PENDING" | "OK" | "ERROR"); checkout rejects anything but "OK"; an admin mapping change sets "PENDING" until the next sync validates it
 mapping_error           string  (sanitized reason when mapping_status = "ERROR")
 availability_hint       map { state: "in_stock" | "low" | "out" | "unknown", as_of: number }  # advisory display only
 GSI2PK / GSI2SK         "INVMAP" / "SKU#<sku>"  (sellable products only; lets sync enumerate mapped SKUs)
@@ -178,6 +179,19 @@ created_at, completed_at  number
 GSI2PK / GSI2SK    "INVJOB#OPEN" / "<created_at zero-padded to 10>#<orderId>#<kind>"  (only while not terminal)
 ```
 
+An admin stock adjustment uses the same attributes with `PK = ADJ#<adjustmentId>`, `SK = INVJOB#ADJUST`, and these differences:
+
+```
+kind               "ADJUST"
+job_key            "vp-<env>-adj-<adjustmentId>"
+op                 string  (default "ADD" | "REMOVE" | "COUNT"; the offered set is an open owner decision)
+part_id, location_id, quantity   (location in the environment's eligible allowlist)
+actor_sub, reason  string  (audit: the admin's Cognito sub and the stated reason)
+GSI2SK             "<created_at zero-padded to 10>#ADJ#<adjustmentId>#ADJUST"
+```
+
+A decrease larger than the part's `available_qty` is rejected with 409 before the item is written, and the worker checks it again when it plans. There is no admin override. See [Async job contracts](backend-api.md#async-job-contracts).
+
 The job item is the durable record. The SQS message only wakes a worker. If the queue loses or delays a message, the job is still listed under `INVJOB#OPEN`, and a sweeper re-enqueues it.
 
 ### TTL
@@ -211,7 +225,7 @@ GSI2 also carries five sparse, fixed-partition keys. None of them collides with 
 | `INVMAP` | `SKU#<sku>` | sellable products | sync enumerates mapped SKUs |
 | `INVSTOCK` | `PART#<partId>` | projections | sync and reconciliation enumerate parts |
 | `INVHOLD` | `EXP#<expires_at>#<orderId>` | reservations while `HELD` | expiry sweeper |
-| `INVJOB#OPEN` | `<created_at>#<orderId>#<kind>` | non-terminal jobs | re-enqueue sweeper and reconciliation |
+| `INVJOB#OPEN` | `<created_at>#<orderId>#<kind>`, or `<created_at>#ADJ#<adjustmentId>#ADJUST` | non-terminal jobs | re-enqueue sweeper and reconciliation |
 | `PAYEVT#OPEN` | `<next_attempt_at>#<provider>#<eventId>` | payment events while `RECEIVED`, `PROCESSING`, or `FAILED` | payment sweeper re-drive and alarms |
 
 GSI reads are eventually consistent. Sweepers treat index results only as candidates. They re-read the base item with `ConsistentRead=True`, and their conditional writes enforce the state.

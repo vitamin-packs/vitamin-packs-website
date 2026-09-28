@@ -28,9 +28,13 @@ const hobbies = await response.json();
 
 ## Backend
 
-Store Lambda function source and backend-specific dependencies in `backend`, one subfolder per domain (e.g. `catalog`, `cart`, `checkout`, `orders`, `admin`, `webhooks-stripe`, `webhooks-paypal`). All seven domains are implemented in Python. Expose their required HTTP operations through Amazon API Gateway (HTTP API, `api-lambda` Terraform module), with a Cognito JWT authorizer on every route except public catalog browsing and provider webhooks.
+Store Lambda function source and backend-specific dependencies in `backend`, one flat subfolder per Lambda function. There are ten functions, all in Python, each with its own execution role (see [Backend API](backend-api.md#functions-and-triggers)):
 
-Keep shared code (DynamoDB access helpers, claim/authorization helpers, response helpers) in `backend/shared`. It ships as a Lambda layer rather than being copied into every function's deployment package, so there is exactly one copy of it at runtime as well as in source.
+- seven HTTP functions behind Amazon API Gateway (HTTP API, `api-lambda` Terraform module): `catalog`, `cart`, `checkout`, `orders`, `admin`, `webhooks-stripe`, `webhooks-paypal`. Every route has a Cognito JWT authorizer except public catalog browsing and provider webhooks.
+- `sweeper`, run by EventBridge Scheduler. It expires holds, re-drives payment events, and re-enqueues open inventory jobs.
+- `inventory-sync` (scheduled or async-invoked) and `inventory-jobs` (SQS-driven). These are the only functions that call InvenTree.
+
+Keep shared code (DynamoDB, claim/authorization, response, payment-processor, and InvenTree-client helpers) in `backend/shared`. At build time it is copied into each function's zip alongside that function's own locked dependencies; there is no Lambda layer. Every zip is then self-contained and rolls back on its own, and no function gets another function's dependencies. The source still exists only once, in `backend/shared` (see [Backend API](backend-api.md#packaging)).
 
 Backend work must:
 
@@ -43,7 +47,7 @@ Backend work must:
 - Keep shared Python code within `backend/shared` rather than duplicating it among Lambda functions.
 - Give each Lambda function its own IAM role scoped to only the DynamoDB actions (and, once added, Secrets Manager access) it needs — don't attach one broad role to every function.
 - Payment functions use the `payments` module's provider-specific Secrets Manager ARNs. Checkout routes require Cognito JWTs; Stripe and PayPal webhook routes are public API routes because they authenticate with provider signatures inside their handlers.
-- Keep only backend functions that need private InvenTree connectivity attached to the environment VPC. Route inventory sync and stock-posting traffic to the private InvenTree HTTPS endpoint, which is resolved through private DNS and has no load balancer (see [InvenTree integration](inventree-integration.md)). Keep unrelated checkout and payment functions outside the VPC unless a documented requirement justifies the added dependency on the NAT instance. Browsers must never call the internal service.
+- Attach only `inventory-sync` and `inventory-jobs` to the environment VPC. They call the private InvenTree HTTPS endpoint, which is resolved through private DNS and has no load balancer (see [InvenTree integration](inventree-integration.md)). All other functions stay outside the VPC, including checkout, the webhooks, `sweeper`, and `admin`, so provider and Cognito calls never depend on the NAT instance. `admin` never calls InvenTree: stock adjustments, shipping, and sync requests become typed asynchronous jobs (see [Backend API](backend-api.md#async-job-contracts)). Browsers must never call the internal service.
 - The `checkout` function calculates totals from DynamoDB products rather than trusting client prices, reserves inventory and writes order header/line-item records transactionally, then creates a Stripe Checkout Session or PayPal Order. PayPal approval is completed through the authenticated `/checkout/paypal/capture` route; final `paid` status comes only from a verified provider webhook, processed (or re-driven by the payment sweeper) by the payment-event processor, which re-fetches the provider object before acting (see [Payment processing](payment-processing.md#payment-event-ledger)).
 
 Example Lambda response shape:
