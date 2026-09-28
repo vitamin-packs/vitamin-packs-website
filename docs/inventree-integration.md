@@ -319,7 +319,7 @@ The backup and restore scope is RDS, S3 media versions, and the Secrets Manager 
 | `jumpbox` | none | TCP 443 → `inventree`; TCP 443 → `0.0.0.0/0` via NAT (the host firewall limits this to the SSM and CloudWatch agents); TCP 443 → S3 prefix list |
 | `inventree` (EC2 host) | TCP 443 from `jumpbox` and `inv-lambda` | TCP 5432 → `rds`; TCP 443 → `0.0.0.0/0` via NAT; TCP 443 and 80 → S3 prefix list |
 | `rds` | TCP 5432 from `inventree` | none |
-| `inv-lambda` | none | TCP 443 → `inventree`; TCP 443 → `0.0.0.0/0` via NAT (Secrets Manager, SQS); TCP 443 → DynamoDB prefix list |
+| `inv-lambda` | none | TCP 443 → `inventree`; TCP 443 → `0.0.0.0/0` via NAT (Secrets Manager, Lambda Invoke API); TCP 443 → DynamoDB prefix list |
 | `nat` | TCP 443 from `jumpbox`, `inventree`, and `inv-lambda` | TCP 443 → `0.0.0.0/0` |
 
 - Use security-group references wherever a peer is a security group.
@@ -512,7 +512,7 @@ Proposed on 2026-09-28. InvenTree facts below were verified against the 1.5.6 so
 |---|---|---|
 | Physical quantity, locations, stock status, adjustments, BOM | InvenTree | Read-only projection (`observed_qty`) and display BOM |
 | Price, description, sellability, category | DynamoDB catalog | Authoritative |
-| SKU-to-part mapping (`fulfillment_mode`, `inventree_part_id`) | DynamoDB catalog, set only through `require_admin` handlers that validate the part in InvenTree | Authoritative |
+| SKU-to-part mapping (`fulfillment_mode`, `inventree_part_id`) | DynamoDB catalog, set only through `require_admin` handlers. A change sets `mapping_status = PENDING`, and the next sync validates the part and BOM in InvenTree | Authoritative |
 | Checkout holds and committed-but-unobserved movements | DynamoDB | Reservation ledger and `reserved_qty` |
 | Whether a physical movement happened | InvenTree stock tracking entries | Job records hold evidence (tracking IDs) only |
 
@@ -565,13 +565,14 @@ Double counting is prevented structurally:
 
 ### Physical movements
 
-Three job kinds, each a DynamoDB job item and an SQS message (standard queue with DLQ):
+Four job kinds, each a DynamoDB job item and an SQS message (standard queue with DLQ), processed by the `inventory-jobs` function ([Async job contracts](backend-api.md#async-job-contracts)):
 
 | Job | When | InvenTree call | Projection effect |
 |---|---|---|---|
 | `COMMIT` | verified payment | `POST /api/stock/transfer/` from eligible locations to `Web orders – committed` | observed drops on the next sync, and the reservation retires in the same update |
 | `UNCOMMIT` | refund or cancel after COMMIT and before shipping. If the refund arrived while COMMIT was `IN_PROGRESS` or `FAILED`, the COMMIT completion transaction creates it | transfer back from `committed` to the part's default eligible location | observed rises on the next sync |
 | `SHIP` | admin marks the order shipped (only when the order is `paid`, COMMIT is `COMPLETED`, no dispute is open, and there is no `payment_exception`) | `POST /api/stock/remove/` from `committed` | none (the location is ineligible) |
+| `ADJUST` | an admin stock adjustment (`ADJ#<adjustmentId>`) | the single stock-adjustment request for its `op` at one eligible location. Verify the endpoint against the 1.5.6 schema in dev | observed changes on the targeted sync that the worker requests on completion |
 
 Payment events never call InvenTree and never wait for a job. A COMMIT that is `IN_PROGRESS` or `FAILED` is never cancelled, because its movement may already have happened. A refund in that window is recorded on the order and carried into UNCOMMIT by the completion transaction ([Payment processing](payment-processing.md#order-payment-and-inventory-states), row 12).
 
@@ -591,7 +592,11 @@ A sweeper runs every 5 minutes. It re-enqueues `INVJOB#OPEN` jobs whose lease or
 
 ### Admin stock changes
 
-Admin stock changes go through authorized backend operations that write physical stock in InvenTree. Each admin handler must enforce the `Admins` Cognito group. Do not expose a generic InvenTree proxy or directly edit the DynamoDB projection from an admin form. Audit actor, part, location, quantity, reason, and resulting movement, then trigger a targeted sync of the affected parts. Catalog reads use DynamoDB, not synchronous InvenTree calls. Staff edits made directly in InvenTree through the jumpbox are equally valid, and the next sync picks them up.
+Admin stock changes are asynchronous ADJUST jobs. The `admin` handler never calls InvenTree; after it enforces the `Admins` Cognito group, it:
+- writes an audited job item (actor, part, location, quantity, reason);
+- enqueues the job and returns 202.
+
+`inventory-jobs` then performs the movement, records the resulting tracking IDs, and requests a targeted sync of the part. A decrease larger than the part's `available_qty` is rejected with 409, and admins cannot override that. Do not expose a generic InvenTree proxy or directly edit the DynamoDB projection from an admin form. Catalog reads use DynamoDB, not synchronous InvenTree calls. Staff edits made directly in InvenTree through the jumpbox are equally valid, and the next sync picks them up.
 
 ## Reconciliation and Operations
 

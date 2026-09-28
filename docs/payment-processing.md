@@ -229,7 +229,7 @@ def process(provider: str, object_ref: str, ledger) -> None:
         try_send_sqs(job)                                # failure tolerated; the open-job sweeper re-enqueues
 ```
 
-The **payment sweeper** runs every 5 minutes. It queries GSI2 `PAYEVT#OPEN` for items whose `next_attempt_at` or lease has passed, claims each one exactly as above, and calls `process()`. It needs no stored payload, because `object_ref` is enough to re-fetch. Its function placement is decided with the backend domain layout (resolution Prompt 3).
+The **payment sweeper** runs every 5 minutes. It queries GSI2 `PAYEVT#OPEN` for items whose `next_attempt_at` or lease has passed, claims each one exactly as above, and calls `process()`. It needs no stored payload, because `object_ref` is enough to re-fetch. It runs in the out-of-VPC `sweeper` function (see [Backend API](backend-api.md#functions-and-triggers)).
 
 ### Subscribed events
 

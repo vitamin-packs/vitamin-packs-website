@@ -74,14 +74,15 @@ Record decisions in the relevant architecture documents before implementation. D
    backend/
      catalog/ cart/ checkout/ orders/ admin/
      webhooks-stripe/ webhooks-paypal/
-     inventory-sync/ inventory-jobs/ shared/
+     sweeper/ inventory-sync/ inventory-jobs/
+     shared/
    frontend/
    admin/
    scripts/
    docs/
    ```
 
-   Adjust domain boundaries only when the reviewed API and deployment design calls for it. Keep the two frontends independently buildable/deployable and keep shared Python code in `backend/shared`.
+   Each `backend/` folder except `shared/` is exactly one Lambda function, with the trigger, VPC placement and role listed in [Backend API](backend-api.md#functions-and-triggers). Change function boundaries only through that document. Keep the two frontends independently buildable and deployable. Keep shared Python code in `backend/shared`; it is bundled into each function's zip, with no Lambda layer ([Packaging](backend-api.md#packaging)).
 
 2. Establish remote Terraform state/bootstrap, provider locks, environment variables, naming/tags, and least-privilege CI/operator credentials. Protect state and plan artifacts as sensitive; never commit state, `.terraform/`, credentials, secrets, or local `*.tfvars`.
 3. Add CI checks for Terraform formatting/validation, Python tests/lint, frontend lint/tests/build, artifact scanning for secrets, and documentation checks. CI must not auto-apply infrastructure.
@@ -98,12 +99,16 @@ Provision in dependency order:
 3. Cognito customer and admin user pools, storefront/admin app clients, the admin pool's Admins group, and outputs consumed by API/frontend configuration. Admin users are created by the AWS account owner via CLI, never by Terraform.
 4. DynamoDB table and required indexes, with point-in-time recovery/backups and narrowly scoped Lambda IAM policies.
 5. Private S3 buckets, CloudFront distributions/OAC, SPA fallback, TLS, logging, and cache invalidation strategy for both apps.
-6. API Gateway HTTP API, JWT authorizer, CORS restricted to the environment's CloudFront origins, Lambda roles/functions/layer, and environment-scoped configuration.
+6. API Gateway HTTP API with explicit routes (no `ANY` or `{proxy+}` route), JWT authorizers, and CORS restricted to the environment's CloudFront origins. The ten Lambda functions each get their own role from the [IAM matrix](backend-api.md#iam), with zips from the artifact bucket (no layer) and environment-scoped configuration. Attach only `inventory-sync` and `inventory-jobs` to the VPC.
 7. Secrets Manager secret containers and scoped access policies. Populate secret versions outside Terraform state using approved secure procedures; use sandbox credentials in dev.
 8. InvenTree networking, NAT instance, private EC2 host, jumpbox, isolated RDS, S3 media and artifacts, private DNS and Let's Encrypt TLS, SES identity, monitoring, backups, restore capability, and the dev scheduler. Use the modules listed in [InvenTree integration](inventree-integration.md#terraform-modules-and-prerequisites).
    - Both environments run a single node with single-AZ RDS. This is an accepted tradeoff: prod hosting stays under $50/month with a recovery objective measured in hours.
    - Dev runs on demand and is stopped nightly.
-9. Inventory synchronization trigger/queue/scheduler and durable job/retry/dead-letter handling, plus alarms and operational dashboards.
+9. Inventory and maintenance triggers, per [Functions and triggers](backend-api.md#functions-and-triggers):
+   - the `inventory-jobs` SQS queue and DLQ (`maxReceiveCount` 5, visibility timeout 360 s) and its event source mapping (batch size 1, partial batch responses, maximum concurrency 2);
+   - EventBridge Scheduler schedules for `sweeper` (every 5 minutes) and `inventory-sync` (a 5-minute full sync in prod only, and daily reconciliation);
+   - a Scheduler role limited to invoking those two functions;
+   - alarms and operational dashboards.
 
 Use outputs to connect modules rather than duplicating identifiers. Review every dev plan for unexpected replacements, public exposure, IAM overreach, secret values, and state changes. Run formatting/validation and plan review; only apply when an operator explicitly authorizes it.
 
@@ -130,10 +135,10 @@ Use outputs to connect modules rather than duplicating identifiers. Review every
 
 Build API and data functionality in small, deployable increments:
 
-1. Implement shared response, validation, DynamoDB, Cognito-claim, Secrets Manager, and InvenTree-client utilities. The InvenTree client must use bounded timeouts, TLS, sanitized errors, safe retry rules, and server-side credentials.
+1. Implement shared response, validation, DynamoDB, Cognito-claim, Secrets Manager, and InvenTree-client utilities in `backend/shared`, bundled into each zip by `scripts/build-lambdas.sh`. The InvenTree client follows [InvenTree client](backend-api.md#inventree-client): named operations only, bounded timeouts, default TLS verification, POSTs never retried after an unknown outcome, sanitized errors, and server-side credentials. Add the import-boundary test with the first shared module.
 2. Implement public catalog reads from DynamoDB. Only individually sellable products receive the catalog index keys; kit-only components remain absent from standalone catalog results.
 3. Implement Cognito-protected cart and order reads with customer ownership checks. Validate all API inputs before database/provider calls.
-4. Implement admin catalog and inventory operations. Require `require_admin` in each handler before any mutation. Stock adjustments go to InvenTree, are audited, and trigger/reconcile the projection; never directly edit the projection as if it were physical stock.
+4. Implement admin catalog and inventory operations. Require `require_admin` in each handler before any mutation. `admin` never calls InvenTree. Stock adjustments, shipping, and sync requests become audited ADJUST and SHIP jobs or `inventory-sync` invocations, and return 202 ([Async job contracts](backend-api.md#async-job-contracts)). `inventory-jobs` performs the movement and then requests a targeted sync. A decrease larger than `available_qty` is rejected with 409, with no admin override. Never directly edit the projection as if it were physical stock.
 5. Implement inventory sync to read eligible physical stock and BOMs, validate mappings, and write a versioned projection without overwriting active checkout reservations. Store source revision/time and last-success time. Make staleness thresholds explicit and observable.
 6. Implement checkout with server-calculated prices and an atomic DynamoDB transaction that validates current availability, reserves all required units/components, and creates a pending order. Reject stale or missing projections. Do not trust submitted price or inventory values.
 7. Implement payment-provider session/order creation and verified webhook handlers. Add conditional idempotency markers and conditional order-state transitions. Verify Stripe/PayPal dev sandbox configuration before integration testing.
@@ -157,6 +162,12 @@ Treat any uncertainty about external API behavior as a verification task against
 Run the following checks before production promotion:
 
 - **Static and unit checks:** Terraform fmt/validate, Python lint/type checks and unit tests, both frontend lint/test/build/HTML checks, dependency/security scans, and secret scanning.
+- **Backend packaging and boundaries:**
+  - Two builds from one commit produce identical zips, and each zip imports its handler in a clean `python3.13` arm64 environment.
+  - The import-boundary test passes.
+  - The route table has no proxy route.
+  - IAM Access Analyzer validation passes. `catalog` is denied `GetSecretValue`, and neither inventory function can read the `inventree_app` or RDS master secret.
+  - Only `inventory-sync` and `inventory-jobs` have a VPC configuration, and neither can reach port 5432.
 - **Infrastructure checks:** review dev plans, IAM permissions, CORS origins, bucket privacy/OAC, TLS, DNS, alarms, backup configuration, and log redaction.
 - **Identity/API checks:** the [Cognito acceptance tests](cognito-authentication.md#acceptance-tests):
   - public catalog without a token;
