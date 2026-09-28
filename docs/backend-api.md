@@ -24,21 +24,26 @@ Each domain folder is its own Lambda deployment package: its own `requirements.t
 
 ## API Gateway
 
-Use an HTTP API (not REST API) — cheaper and sufficient for this use case. One Cognito JWT authorizer, configured against the User Pool's `user_pool_id`/issuer (see [Cognito authentication](cognito-authentication.md)), attached to every route except public catalog browsing and the two webhook routes (which authenticate differently — see below). Checkout and PayPal capture require the Cognito JWT.
+Use an HTTP API (not REST API) — cheaper and sufficient for this use case. Two Cognito JWT authorizers, one per user pool, as specified in [Cognito authentication](cognito-authentication.md#api-gateway-jwt-authorizers):
+
+- `customer-jwt`: customer pool issuer, audience `[storefront_client_id]`.
+- `admin-jwt`: admin pool issuer, audience `[admin_client_id]`.
+
+Every protected route sets `authorizationScopes = ["aws.cognito.signin.user.admin"]` so API Gateway rejects ID tokens with 403 (invalid or expired tokens get 401; HTTP APIs cannot change these codes). Browsers send the Cognito **access token**. Public catalog browsing and the two webhook routes have no authorizer. Checkout and PayPal capture require `customer-jwt`. CORS preflight (`OPTIONS`) is answered by the API's CORS configuration without an authorizer.
 
 | Method | Route | Lambda | Auth |
 |---|---|---|---|
 | GET | `/products` | `catalog` | none (public) |
 | GET | `/products/{sku}` | `catalog` | none (public) |
 | GET | `/categories/{tag}` | `catalog` | none (public) |
-| GET | `/cart` | `cart` | Cognito JWT |
-| PUT | `/cart` | `cart` | Cognito JWT |
-| POST | `/checkout/stripe` | `checkout` | Cognito JWT |
-| POST | `/checkout/paypal` | `checkout` | Cognito JWT |
-| POST | `/checkout/paypal/capture` | `checkout` | Cognito JWT |
-| GET | `/orders` | `orders` | Cognito JWT |
-| GET | `/orders/{orderId}` | `orders` | Cognito JWT |
-| * | `/admin/*` | `admin` | Cognito JWT + `Admins` group check in-handler |
+| GET | `/cart` | `cart` | `customer-jwt` |
+| PUT | `/cart` | `cart` | `customer-jwt` |
+| POST | `/checkout/stripe` | `checkout` | `customer-jwt` |
+| POST | `/checkout/paypal` | `checkout` | `customer-jwt` |
+| POST | `/checkout/paypal/capture` | `checkout` | `customer-jwt` + order ownership check in-handler |
+| GET | `/orders` | `orders` | `customer-jwt` |
+| GET | `/orders/{orderId}` | `orders` | `customer-jwt` + order ownership check in-handler |
+| * | `/admin/*` | `admin` | `admin-jwt` + `require_admin` (claim + live Cognito check) in-handler |
 | POST | `/webhooks/stripe` | `webhooks-stripe` | Stripe signature (no Cognito authorizer) |
 | POST | `/webhooks/paypal` | `webhooks-paypal` | PayPal signature (no Cognito authorizer) |
 
@@ -59,6 +64,12 @@ Do not place RDS in Lambda subnets or allow Lambda security groups direct databa
 ```python
 import json
 
+from shared.auth import AuthServiceUnavailable
+
+
+class NotFoundError(Exception):
+    """Missing resource, or one the caller does not own (never reveal which)."""
+
 
 def handler(event: dict, context) -> dict:
     try:
@@ -66,6 +77,10 @@ def handler(event: dict, context) -> dict:
         return _response(200, body)
     except PermissionError as error:
         return _response(403, {"message": str(error)})
+    except NotFoundError:
+        return _response(404, {"message": "Not found"})
+    except AuthServiceUnavailable:
+        return _response(503, {"message": "Authorization service unavailable"})
     except ValueError as error:
         return _response(400, {"message": str(error)})
 
@@ -80,7 +95,22 @@ def _response(status_code: int, body: dict) -> dict:
 
 - Validate and parse input before touching DynamoDB or a payment provider.
 - Return explicit status codes (`400` for bad input, `403` for authorization failures, `404` for missing resources) rather than letting unhandled exceptions produce an opaque `500`.
-- Admin handlers call `require_admin(event)` (see [Cognito authentication](cognito-authentication.md)) before doing anything else.
+- Admin handlers call `require_admin(event)` (see [Cognito authentication](cognito-authentication.md#backend-authorization)) before doing anything else. It checks the token, the `Admins` claim, and live admin-pool membership. It fails closed: 403 when not authorized, 503 when Cognito is unreachable.
+- Customer handlers get the caller's identity only from `require_customer_sub(event)` (the `sub` claim). Never read a user ID from the path, query string, or body. Carts, profiles, and order history are keyed by that `sub`.
+- Order-scoped routes (`GET /orders/{orderId}`, `POST /checkout/paypal/capture`) load the order header and return 404 when it is missing or its `user_sub` is not the caller's `sub`.
+- The `401` for missing/invalid/expired tokens comes from the API Gateway authorizer; Lambdas never see those requests.
+- Never log tokens, the `Authorization` header, or full claim sets; log `sub`, route, and the authorization decision.
+
+### Authorization tests
+
+The backend, not the admin UI, is the security boundary. Prove it with tests that call the API directly:
+
+- Unit: `parse_groups` for every claim representation and near-miss names; `require_admin` and `require_customer_sub` reject wrong `token_use`/`iss`/`client_id`. Also: `require_admin` returns 503 on Cognito errors and 403 on disabled or group-removed users (Cognito client stubbed).
+- Route table: every route except the three public catalog routes and the two webhooks has an authorizer and the required scope. Every `/admin/*` route uses `admin-jwt`.
+- Dev integration (raw HTTP): the [Cognito acceptance tests](cognito-authentication.md#acceptance-tests), including:
+  - customer-token and ID-token rejection on every admin route;
+  - immediate 403 after admin group removal;
+  - cross-customer order/capture access returning 404.
 
 ## IAM
 
@@ -88,7 +118,7 @@ One execution role per Lambda function, scoped to only what that function needs:
 
 - `catalog`, `cart`, `orders`: read (and, for `cart`, write) on the DynamoDB table.
 - `checkout`: DynamoDB write (reserve inventory, create order) + read access to the Stripe/PayPal secrets.
-- `admin`: full DynamoDB read/write on the table.
+- `admin`: full DynamoDB read/write on the table, plus `cognito-idp:AdminGetUser` and `cognito-idp:AdminListGroupsForUser` on the **admin** user pool ARN only (for the live check in `require_admin`). No Cognito write actions.
 - `webhooks-stripe`/`webhooks-paypal`: DynamoDB write (mark order paid, write the idempotency marker) + read access to that provider's secret only.
 - `inventory-sync`/`inventory-jobs`: only the DynamoDB/SQS/secrets permissions required by their sync or movement workflow, plus VPC network access to the private InvenTree HTTPS endpoint (`AWSLambdaVPCAccessExecutionRole` permissions). Do not grant these functions RDS credentials or direct database access.
 
