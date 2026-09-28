@@ -20,7 +20,7 @@ backend/
   shared/            common code (DynamoDB access helpers, claim helpers, response helpers) imported by the folders above
 ```
 
-Each domain folder is its own Lambda deployment package: its own `requirements.txt` plus a handler module. Keep shared logic in `backend/shared` and package it alongside each function at build time rather than duplicating it.
+Each domain folder is its own Lambda deployment package: its own `requirements.txt` plus a handler module. Payment functions pin `stripe==15.6.1` and one exact `requests` release (see [Payment processing](payment-processing.md#dependencies-and-provider-versions)). Keep shared logic in `backend/shared` and package it alongside each function at build time rather than duplicating it.
 
 ## API Gateway
 
@@ -40,7 +40,7 @@ Every protected route sets `authorizationScopes = ["aws.cognito.signin.user.admi
 | PUT | `/cart` | `cart` | `customer-jwt` |
 | POST | `/checkout/stripe` | `checkout` | `customer-jwt` |
 | POST | `/checkout/paypal` | `checkout` | `customer-jwt` |
-| POST | `/checkout/paypal/capture` | `checkout` | `customer-jwt` + order ownership check in-handler |
+| POST | `/checkout/paypal/capture` | `checkout` | `customer-jwt` + order ownership check in-handler. Captures and returns 202; never marks paid ([flow](payment-processing.md#paypal)) |
 | GET | `/orders` | `orders` | `customer-jwt` |
 | GET | `/orders/{orderId}` | `orders` | `customer-jwt` + order ownership check in-handler |
 | * | `/admin/*` | `admin` | `admin-jwt` + `require_admin` (claim + live Cognito check) in-handler |
@@ -117,10 +117,10 @@ The backend, not the admin UI, is the security boundary. Prove it with tests tha
 One execution role per Lambda function, scoped to only what that function needs:
 
 - `catalog`, `cart`, `orders`: read (and, for `cart`, write) on the DynamoDB table.
-- `checkout`: DynamoDB `TransactWriteItems` (reserve stock projections, create the order and reservation, guard the cart) + read access to the Stripe/PayPal secrets. See [DynamoDB data model](dynamodb-data-model.md#checkout-reservation-pseudocode).
+- `checkout`: DynamoDB `TransactWriteItems` (reserve stock projections, create the order and reservation, guard the cart), `UpdateItem` on the order and reservation (store the provider reference, PayPal capture claim), and read access to the Stripe/PayPal secrets. See [DynamoDB data model](dynamodb-data-model.md#checkout-reservation-pseudocode). No SQS or job permissions: it never marks an order paid.
 - `admin`: full DynamoDB read/write on the table, plus `cognito-idp:AdminGetUser` and `cognito-idp:AdminListGroupsForUser` on the **admin** user pool ARN only (for the live check in `require_admin`). No Cognito write actions.
-- `webhooks-stripe`/`webhooks-paypal`: DynamoDB write (mark order paid, move the reservation to `COMMITTING`, create the COMMIT job, write the idempotency marker), `sqs:SendMessage` on the inventory-jobs queue, and read access to that provider's secret only.
-- Reservation-expiry sweeper: DynamoDB read/write on reservations, orders, and projections, plus provider secrets to expire sessions. It calls provider APIs, so it runs outside the VPC. Its function placement is decided with the backend domain layout (resolution Prompt 3).
+- `webhooks-stripe`/`webhooks-paypal` (the payment-event processor): DynamoDB read/write on orders, refunds, reservations, projections (release and late re-reserve), inventory jobs, and `PAYEVT#` ledger items. Also `sqs:SendMessage` on the inventory-jobs queue, and read access to that provider's secret only.
+- Reservation-expiry and payment-event sweeper: the processor's permissions plus a `Query` on GSI2 (`INVHOLD`, `PAYEVT#OPEN`) and both provider secrets, to retrieve or expire sessions and re-drive events. It calls provider APIs, so it runs outside the VPC. Its function placement is decided with the backend domain layout (resolution Prompt 3).
 - `inventory-sync`/`inventory-jobs`: only the DynamoDB/SQS/secrets permissions required by their sync or movement workflow, plus VPC network access to the private InvenTree HTTPS endpoint (`AWSLambdaVPCAccessExecutionRole` permissions). Do not grant these functions RDS credentials or direct database access.
 
 Do not attach a single broad "DynamoDB full access" or "Secrets Manager full access" policy shared across every function.

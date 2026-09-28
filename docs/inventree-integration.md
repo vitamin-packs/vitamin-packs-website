@@ -570,8 +570,10 @@ Three job kinds, each a DynamoDB job item and an SQS message (standard queue wit
 | Job | When | InvenTree call | Projection effect |
 |---|---|---|---|
 | `COMMIT` | verified payment | `POST /api/stock/transfer/` from eligible locations to `Web orders – committed` | observed drops on the next sync, and the reservation retires in the same update |
-| `UNCOMMIT` | refund or cancel after COMMIT and before shipping | transfer back from `committed` to the part's default eligible location | observed rises on the next sync |
-| `SHIP` | admin marks the order shipped (only after COMMIT is `COMPLETED`) | `POST /api/stock/remove/` from `committed` | none (the location is ineligible) |
+| `UNCOMMIT` | refund or cancel after COMMIT and before shipping. If the refund arrived while COMMIT was `IN_PROGRESS` or `FAILED`, the COMMIT completion transaction creates it | transfer back from `committed` to the part's default eligible location | observed rises on the next sync |
+| `SHIP` | admin marks the order shipped (only when the order is `paid`, COMMIT is `COMPLETED`, no dispute is open, and there is no `payment_exception`) | `POST /api/stock/remove/` from `committed` | none (the location is ineligible) |
+
+Payment events never call InvenTree and never wait for a job. A COMMIT that is `IN_PROGRESS` or `FAILED` is never cancelled, because its movement may already have happened. A refund in that window is recorded on the order and carried into UNCOMMIT by the completion transaction ([Payment processing](payment-processing.md#order-payment-and-inventory-states), row 12).
 
 Returns are recorded by staff in InvenTree into `Returns – inspection`, with status RETURNED (85, ineligible). Stock becomes sellable only when staff inspect it and move it to an eligible location with status OK. Nothing restocks automatically.
 
@@ -607,6 +609,7 @@ Run reconciliation daily in prod, after every admin stock change, and after any 
 | InvenTree tracking notes matching `vp-<env>-` with no `COMPLETED` job, or a job `COMPLETED` whose tracking IDs are gone (for example after a PITR restore) | InvenTree `/api/stock/track/?search=vp-<env>-` | Alert; never auto-move stock |
 | Committed-location quantity per part does not equal committed-but-not-shipped orders | InvenTree plus `ORDER#` queries | Alert |
 | Mapping `ERROR`, or finished stock on a `COMPONENTS` kit | `INVMAP` | Alert |
+| Payment event open longer than 30 min or in `NEEDS_ATTENTION`, or an order with `payment_exception` or an open dispute that holds stock | GSI2 `PAYEVT#OPEN`, `ORDER#` | Alert; blocks fulfillment; never auto-refund or auto-move stock |
 
 Only projection arithmetic (the first two rows) is auto-repaired. Physical stock is never auto-adjusted.
 
@@ -621,7 +624,10 @@ The defaults above let implementation proceed in dev. These need owner confirmat
 1. Fulfillment mode per kit: finished kits (`STOCKED_PART`) or component-derived (`COMPONENTS`).
 2. The eligible location IDs per environment, and whether any non-OK status (for example ATTENTION) is sellable. Default: OK only.
 3. Two-step movement (commit at payment, remove at shipping) versus removal at payment. Also the names and IDs of the committed and returns locations.
-4. Checkout hold duration. Default: a 30-minute Stripe session and a 35-minute reservation.
+4. Checkout hold duration. **Resolved 2026-09-28** ([Payment processing](payment-processing.md#inventory)):
+   - a 31-minute Stripe session and a 35-minute reservation for both providers;
+   - Stripe offers card and wallet methods only;
+   - a PayPal `PENDING` capture holds stock for up to 72 hours.
 5. Late payment after a hold was released: re-reserve, and if that fails, refund automatically, backorder, or leave it to the operator. Default: operator.
 6. Refund or cancel after commit: whether UNCOMMIT is automatic. Also the policy for inspecting and restocking returns.
 7. Policy for optional and consumable BOM lines. Defaults: optional lines are a mapping error; consumable lines are not reserved.
@@ -630,7 +636,7 @@ The defaults above let implementation proceed in dev. These need owner confirmat
 10. SKU-to-part identity rule. Default: IPN equals SKU.
 11. Sync interval and freshness limit. Defaults: 5 and 20 minutes, with checkout blocked when stale.
 12. Whether InvenTree build, sales, or transfer allocations are subtracted from sellable stock. Default: yes.
-13. Partial refunds and chargebacks: whether they are money-only (default) or also affect stock.
+13. Partial refunds and chargebacks: whether they are money-only (default) or also affect stock. Default for disputes: an open dispute blocks shipping, and a lost dispute or a PayPal reversal is handled as a full refund.
 14. Any existing `inventory_count` values: discard them (default), or import them once as an audited InvenTree stock count.
 15. Whether the storefront shows exact counts or only in-stock/low/out, and the low-stock threshold.
 
