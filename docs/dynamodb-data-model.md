@@ -12,10 +12,10 @@ One table per environment, named `${project}-${environment}-data` (e.g. `diyhobb
 |---|---|---|---|
 | Product | `PRODUCT#<sku>` | `PRODUCT#<sku>` | Kits and individual components share this shape. |
 | Category | `CATEGORY#<tag>` | `METADATA` | Display label/description/sort order for a browsable tag. |
-| Order header | `ORDER#<orderId>` | `ORDER#<orderId>` | One per order. |
+| Order header | `ORDER#<orderId>` | `ORDER#<orderId>` | One per order. Stores `user_sub` (the owning customer's Cognito `sub`) for ownership checks. |
 | Order line item | `ORDER#<orderId>` | `ORDER#<orderId>#ITEM#<sku>` | One per SKU in the order; `Query` on `PK` returns the header and all line items together. |
 | User profile | `USER#<sub>` | `PROFILE` | `<sub>` is the Cognito user pool subject claim. |
-| Cart | `CART#<userId>` | `CART#<userId>` | In-progress cart; consider a `ttl` attribute to expire abandoned carts. |
+| Cart | `CART#<sub>` | `CART#<sub>` | In-progress cart, keyed by the caller's Cognito `sub` claim; consider a `ttl` attribute to expire abandoned carts. |
 | Webhook receipt | `WEBHOOK#<provider>#<eventId>` | `RECEIVED` | Idempotency marker for Stripe/PayPal webhook events; see [Payment processing](payment-processing.md). |
 
 ### Product attributes
@@ -65,7 +65,7 @@ Set only on order header items (not on line items), so a `Query` on `GSI2` retur
 | Browse a category, sorted by price | `Query` on `GSI1` with `GSI1PK=CATEGORY#<tag>` |
 | Get an order and its line items | `Query` on `PK=ORDER#<orderId>` |
 | List a user's orders | `Query` on `GSI2` with `GSI2PK=USER#<sub>` |
-| Get or update a cart | `GetItem`/`PutItem` on `PK=SK=CART#<userId>` |
+| Get or update a cart | `GetItem`/`PutItem` on `PK=SK=CART#<sub>` |
 | Decrement inventory when an order is placed | `UpdateItem` with a condition expression so writes fail closed instead of overselling |
 
 ## Dev seed data

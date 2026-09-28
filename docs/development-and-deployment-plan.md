@@ -17,7 +17,11 @@ Some referenced contracts and paths are not yet in the checked-in tree, includin
 - **Static delivery:** separate private S3 buckets and CloudFront distributions for storefront and admin. CloudFront is the public delivery layer; use the existing SPA fallback and do not expose S3 origins directly.
 - **API:** API Gateway HTTP API invoking domain-specific Python Lambdas in `backend/`. Public catalog routes and provider webhook routes are exceptions to Cognito JWT authorization; webhooks verify provider signatures. Every admin handler checks the `Admins` group claim.
 - **Application data:** one DynamoDB table and shared access helpers in `backend/shared`. DynamoDB stores catalog/customer/order state and the versioned sellable-stock projection plus active reservations. It is not the authority for physical inventory.
-- **Identity:** one Cognito User Pool, separate storefront/admin app clients, embedded SRP login and account UI, and an `Admins` group. Do not introduce a Hosted UI redirect assumption.
+- **Identity:** two Cognito user pools, specified in [Cognito authentication](cognito-authentication.md):
+  - a customer pool (self sign-up, optional TOTP) with the storefront client;
+  - an admin pool (admin-create-only, required TOTP, `Admins` group) with the admin client.
+
+  Both apps use embedded SRP login and account UI and send access tokens to the API. Do not introduce a Hosted UI redirect assumption.
 - **Payments:** Stripe and PayPal secrets in environment-scoped Secrets Manager entries. The backend calculates prices and starts provider sessions; only verified provider events can establish payment success. Payment state and inventory-posting state remain distinct.
 - **Inventory:** InvenTree is the authority for physical stock, stock locations, adjustments, and kit/component BOMs. The backend synchronizes eligible stock into DynamoDB, checks freshness, reserves atomically, and posts physical movements through durable, idempotent work. Browsers never call InvenTree or receive its credentials.
 - **InvenTree hosting:** InvenTree 1.5.6 on one private EC2 host per environment, in an Auto Scaling group of one: t4g.small in dev, t4g.medium in prod covered by a Savings Plan.
@@ -91,7 +95,7 @@ Provision in dependency order:
 
 1. State/bootstrap and environment foundations; establish resource tags and outputs.
 2. DNS and certificates, including the CloudFront certificate in `us-east-1` where required.
-3. Cognito User Pool, storefront/admin app clients, Admins group, and outputs consumed by API/frontend configuration.
+3. Cognito customer and admin user pools, storefront/admin app clients, the admin pool's Admins group, and outputs consumed by API/frontend configuration. Admin users are created by the AWS account owner via CLI, never by Terraform.
 4. DynamoDB table and required indexes, with point-in-time recovery/backups and narrowly scoped Lambda IAM policies.
 5. Private S3 buckets, CloudFront distributions/OAC, SPA fallback, TLS, logging, and cache invalidation strategy for both apps.
 6. API Gateway HTTP API, JWT authorizer, CORS restricted to the environment's CloudFront origins, Lambda roles/functions/layer, and environment-scoped configuration.
@@ -154,7 +158,13 @@ Run the following checks before production promotion:
 
 - **Static and unit checks:** Terraform fmt/validate, Python lint/type checks and unit tests, both frontend lint/test/build/HTML checks, dependency/security scans, and secret scanning.
 - **Infrastructure checks:** review dev plans, IAM permissions, CORS origins, bucket privacy/OAC, TLS, DNS, alarms, backup configuration, and log redaction.
-- **Identity/API checks:** public catalog without a token; protected routes without/with expired tokens; customer isolation; non-admin rejection from every admin route; admin success with valid Admins claim; webhook routes reject invalid provider signatures.
+- **Identity/API checks:** the [Cognito acceptance tests](cognito-authentication.md#acceptance-tests):
+  - public catalog without a token;
+  - protected routes return 401 for no token, an expired token, and another pool's token, and 403 for an ID token;
+  - customer isolation (404 on others' orders);
+  - non-admin and customer-token rejection from every admin route;
+  - admin success with a valid Admins claim, and immediate 403 after group removal;
+  - webhook routes reject invalid provider signatures.
 - **Catalog/cart checks:** sellable SKU visibility, kit-only exclusion, missing mapping errors, cart persistence and input validation.
 - **Concurrency/payment checks:** two simultaneous attempts for the last unit permit at most one reservation; client-tampered prices are ignored; checkout failures release reservations; duplicate/out-of-order webhooks do not duplicate payment transitions.
 - **Inventory checks:** freshness rejection, excluded stock locations/states, correct kit/component math without double counting, unavailable/missing parts, InvenTree downtime, retry after partial failure, duplicate job delivery, admin adjustment reconciliation, and alerting on stale projection.

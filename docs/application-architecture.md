@@ -10,7 +10,7 @@ Frontend work must:
 - Configure CloudFront as the public delivery layer; do not expose the S3 origin for direct public use when CloudFront origin access is available.
 - Use the API Gateway endpoint for browser-to-backend requests rather than invoking Lambda functions directly.
 - Keep environment-specific API endpoints outside committed frontend source when they contain sensitive or deployment-specific values.
-- Authenticate against Cognito directly from the browser (SRP auth flow) and embed login/logout/signup/account-management UI in the app itself; there is no Cognito Hosted UI domain to redirect to. The admin app authenticates against a separate app client from the storefront.
+- Authenticate against Cognito directly from the browser (SRP auth flow) and embed login/logout/signup/account-management UI in the app itself; there is no Cognito Hosted UI domain to redirect to. The admin app authenticates against a separate admin user pool and app client (admin-create-only, TOTP MFA required); the storefront uses the customer pool. Browsers send Cognito access tokens to the API (see [Cognito authentication](cognito-authentication.md)).
 
 Example browser request:
 
@@ -34,7 +34,7 @@ Keep shared code (DynamoDB access helpers, claim/authorization helpers, response
 
 Backend work must:
 
-- Validate and authorize API Gateway request data before processing it. Admin-only operations must check the `cognito:groups` claim for `Admins` membership in the handler itself (see `backend/shared/auth.py`'s `require_admin`); the JWT authorizer only proves the caller is logged in, not that they're an admin, and the frontend hiding admin routes is not access control.
+- Validate and authorize API Gateway request data before processing it. Admin-only operations must call `backend/shared/auth.py`'s `require_admin` in the handler itself. It parses `cognito:groups` tolerantly with exact matching and confirms current `Admins` membership with a live admin-pool lookup (see [Cognito authentication](cognito-authentication.md#backend-authorization)). The JWT authorizer only proves the caller holds a valid admin-pool access token, not that they're an admin, and the frontend hiding admin routes is not access control. Customer handlers take identity only from the token's `sub` and enforce ownership of carts and orders.
 - Read and write the shared DynamoDB single table (see [DynamoDB data model](dynamodb-data-model.md) and the `dynamodb` module) using its `PK`/`SK`/`GSI1`/`GSI2` key structure via `backend/shared/dynamodb.py`; do not introduce additional tables without updating that module.
 - When writing a `PRODUCT#<sku>` item, only set `GSI1PK`/`GSI1SK` when the item is sellable individually (`sellable_individually = true`); omit them for kit-only components so they stay out of catalog browsing.
 - Return explicit HTTP status codes and JSON responses that the frontend can handle predictably.
