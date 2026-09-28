@@ -46,7 +46,11 @@ Webhook routes must skip the Cognito authorizer entirely (the caller is Stripe/P
 
 ## Private InvenTree Connectivity
 
-Only the inventory synchronization and stock-movement workers that call InvenTree should attach to the environment VPC. Place their Lambda ENIs in private application subnets and route requests to the internal InvenTree ALB using private DNS. Their security group may egress to the ALB security group on HTTPS and to only the VPC endpoints/services those functions require. The ALB must allow inbound HTTPS from that Lambda security group; its targets are EC2 instances in private application subnets. The EC2 security group accepts the target port only from the ALB security group.
+Only the inventory synchronization and stock-movement workers that call InvenTree should attach to the environment VPC. Place their Lambda ENIs in the active private application subnets and call the environment's private InvenTree HTTPS endpoint by its private DNS name: `inventree.vitamin-packs.com` in prod or `inventree.dev.vitamin-packs.com` in dev. There is no load balancer.
+- **Target:** the name resolves to the single InvenTree EC2 host, where Caddy terminates TLS with a publicly trusted certificate, so default certificate verification works.
+- **Egress:** the Lambda security group may egress on HTTPS to the InvenTree host security group, and on TCP 443 through the NAT instance to reach Secrets Manager and SQS. DynamoDB traffic uses its gateway endpoint.
+- **Ingress:** the InvenTree host security group accepts HTTPS only from this Lambda security group and the staff jumpbox.
+- **Retries:** the host's private IP changes when it is replaced (60-second DNS TTL), so the shared InvenTree client must retry connection errors with bounded backoff.
 
 Do not place RDS in Lambda subnets or allow Lambda security groups direct database access. EC2 alone connects to RDS on PostgreSQL's port, and the RDS security group accepts that port only from the EC2 application security group. Do not give the InvenTree EC2 instances public IPs or inbound SSH; use SSM. Keep checkout/payment functions outside the VPC unless a documented dependency requires InvenTree access, since VPC attachment changes their internet-egress requirements. The VPC/subnet and operator-access design is specified in [InvenTree integration](inventree-integration.md).
 
@@ -86,7 +90,7 @@ One execution role per Lambda function, scoped to only what that function needs:
 - `checkout`: DynamoDB write (reserve inventory, create order) + read access to the Stripe/PayPal secrets.
 - `admin`: full DynamoDB read/write on the table.
 - `webhooks-stripe`/`webhooks-paypal`: DynamoDB write (mark order paid, write the idempotency marker) + read access to that provider's secret only.
-- `inventory-sync`/`inventory-jobs`: only the DynamoDB/SQS/secrets permissions required by their sync or movement workflow, plus VPC network access to the internal InvenTree ALB. Do not grant these functions RDS credentials or direct database access.
+- `inventory-sync`/`inventory-jobs`: only the DynamoDB/SQS/secrets permissions required by their sync or movement workflow, plus VPC network access to the private InvenTree HTTPS endpoint (`AWSLambdaVPCAccessExecutionRole` permissions). Do not grant these functions RDS credentials or direct database access.
 
 Do not attach a single broad "DynamoDB full access" or "Secrets Manager full access" policy shared across every function.
 

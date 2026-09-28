@@ -20,16 +20,36 @@ Some referenced contracts and paths are not yet in the checked-in tree, includin
 - **Identity:** one Cognito User Pool, separate storefront/admin app clients, embedded SRP login and account UI, and an `Admins` group. Do not introduce a Hosted UI redirect assumption.
 - **Payments:** Stripe and PayPal secrets in environment-scoped Secrets Manager entries. The backend calculates prices and starts provider sessions; only verified provider events can establish payment success. Payment state and inventory-posting state remain distinct.
 - **Inventory:** InvenTree is the authority for physical stock, stock locations, adjustments, and kit/component BOMs. The backend synchronizes eligible stock into DynamoDB, checks freshness, reserves atomically, and posts physical movements through durable, idempotent work. Browsers never call InvenTree or receive its credentials.
-- **InvenTree hosting:** EC2 application nodes and RDS for PostgreSQL in a dedicated environment VPC, with durable S3 media, a supported broker/cache, and background workers. Keep EC2 and RDS private; expose the InvenTree service only through an internal ALB reachable by VPC-attached inventory Lambdas and authorized operators via Client VPN or SSM port forwarding. See [InvenTree integration](inventree-integration.md) for the subnet and security-group design.
+- **InvenTree hosting:** InvenTree 1.5.6 on one private EC2 host per environment, in an Auto Scaling group of one: t4g.small in dev, t4g.medium in prod covered by a Savings Plan.
+  - Caddy terminates TLS with a Let's Encrypt certificate. There is no load balancer.
+  - RDS for PostgreSQL 17 is single-AZ in isolated subnets.
+  - The django-q2 worker uses PostgreSQL as its broker. Media is in S3.
+  - Email goes through the SES API.
+  - A NAT instance provides TCP 443 egress.
+  - Each environment has its own VPC, which holds only these resources and the VPC-attached inventory Lambdas.
+  - The InvenTree HTTPS endpoint is reachable only from those Lambdas and from a Windows jumpbox that staff start manually and reach through an SSM port-forward.
+  - Prod hosting targets under $50/month.
+  - See [InvenTree integration](inventree-integration.md) for the full design.
 - **Infrastructure:** Terraform roots under `infra/dev` and `infra/prod`, reusable modules in `infra/modules`, and deployment automation under `scripts/`. Start in dev and promote reviewed configuration to prod. Use `us-west-2`, except CloudFront ACM certificates in `us-east-1` through the established provider alias.
 
 ## Phase 0: Resolve Contracts and Architecture Gates
 
 Complete these decisions before creating dependent infrastructure or application code:
 
-1. Confirm the EC2 process topology for the pinned InvenTree version, supported web/worker/beat layout, durable S3 media configuration, broker support, health checks, upgrade/migration process, and safe secret delivery. Confirm RDS engine compatibility and verified TLS.
-2. Select a non-overlapping VPC CIDR and approve operator access through Client VPN or SSM port forwarding. Implement public subnets only for NAT, private application subnets for EC2/internal ALB/inventory Lambdas, and isolated database subnets for RDS. RDS must be non-public and have no internet route; EC2 must have no public IP or inbound SSH.
-3. Prove VPC DNS and security-group-restricted connectivity from inventory Lambdas to the internal ALB and from EC2 to RDS. Ensure staff can reach the InvenTree UI only through the approved private access path. Do not add a public InvenTree endpoint to simplify integration.
+1. **Resolved (2026-09-28)** in [InvenTree integration](inventree-integration.md). Before prod go-live, complete its [open owner actions](inventree-integration.md#open-owner-actions): Savings Plan purchase and SNS subscription confirmation.
+   - Process topology: InvenTree 1.5.6 with gunicorn, a django-q2 worker using a PostgreSQL broker, and Caddy.
+   - S3 media and the upgrade/migration procedure.
+   - Health checks and secret delivery.
+   - RDS PostgreSQL 17 with `verify-full` TLS.
+2. **Resolved:**
+   - CIDRs: the approved dev `192.168.0.0/19` and prod `192.168.32.0/19` plans.
+   - Staff access: a Windows jumpbox reached through an SSM port-forward, with no Client VPN.
+   - Subnets: public subnets hold only the NAT instance; private application subnets hold the InvenTree host, jumpbox, and inventory Lambdas; isolated database subnets hold RDS with a local-only route.
+   - Only the NAT instance has a public IP, and there is no inbound SSH or RDP.
+3. Prove the connectivity paths:
+   - Private DNS resolution, and security-group-restricted connectivity from the inventory Lambdas to the InvenTree HTTPS endpoint, and from the host to RDS.
+   - Staff reach the InvenTree UI only from the jumpbox.
+   - Do not add a public InvenTree endpoint to simplify integration.
 4. Decide the stock model: finished kits versus component-derived kits, eligible stock locations/states, units of measure, mapping ownership, BOM rules, and whether any SKU can be both an independent sellable product and a kit component. Prevent double counting.
 5. Define order/payment/inventory states, reservation expiry, payment failure and cancellation handling, refunds/returns, fulfillment gating, reconciliation, and operator recovery. Do not imply a distributed transaction across DynamoDB, payment providers, and InvenTree.
 6. Create the missing DynamoDB data-model contract, including key/index definitions, product/catalog access patterns, order and line records, cart ownership, reservation ledger, webhook idempotency, inventory jobs, and versioned stock projection. Verify every access pattern against DynamoDB indexes before coding.
@@ -76,20 +96,31 @@ Provision in dependency order:
 5. Private S3 buckets, CloudFront distributions/OAC, SPA fallback, TLS, logging, and cache invalidation strategy for both apps.
 6. API Gateway HTTP API, JWT authorizer, CORS restricted to the environment's CloudFront origins, Lambda roles/functions/layer, and environment-scoped configuration.
 7. Secrets Manager secret containers and scoped access policies. Populate secret versions outside Terraform state using approved secure procedures; use sandbox credentials in dev.
-8. InvenTree VPC networking, internal ALB, private EC2 compute, isolated RDS, broker, durable media, internal DNS/TLS, monitoring, backups, and restore capability, only after Phase 0 confirms the topology. Use single-node/single-AZ capacity only as an explicit dev cost tradeoff; production should use multi-AZ application capacity and Multi-AZ RDS.
+8. InvenTree networking, NAT instance, private EC2 host, jumpbox, isolated RDS, S3 media and artifacts, private DNS and Let's Encrypt TLS, SES identity, monitoring, backups, restore capability, and the dev scheduler. Use the modules listed in [InvenTree integration](inventree-integration.md#terraform-modules-and-prerequisites).
+   - Both environments run a single node with single-AZ RDS. This is an accepted tradeoff: prod hosting stays under $50/month with a recovery objective measured in hours.
+   - Dev runs on demand and is stopped nightly.
 9. Inventory synchronization trigger/queue/scheduler and durable job/retry/dead-letter handling, plus alarms and operational dashboards.
 
 Use outputs to connect modules rather than duplicating identifiers. Review every dev plan for unexpected replacements, public exposure, IAM overreach, secret values, and state changes. Run formatting/validation and plan review; only apply when an operator explicitly authorizes it.
 
 ## Phase 3: InvenTree Dev Service
 
-1. Pin the InvenTree release/container image to a reviewed version or immutable digest. Do not use mutable `latest` or an unreviewed floating tag.
-2. Deploy the EC2 web and required worker/scheduler processes in private application subnets behind the internal ALB. Store PostgreSQL credentials, InvenTree secret key, and integration credentials in the approved environment secret store; deliver them through least-privilege instance roles and a supported mechanism. Never put plaintext values in Terraform configuration/state, user data, AMIs, container definitions, scripts, plans, or logs.
-3. Place RDS in isolated private subnets with public accessibility disabled and ingress limited to the EC2 application security group on PostgreSQL's port. Restrict broker and media access, enforce verified database TLS, enable durable S3 media, and test restore into an isolated dev target.
-4. Give EC2 no public IP and no inbound SSH. Manage it through SSM. Limit internal ALB ingress to the inventory Lambda security group and authorized operator VPN path; keep InvenTree absent from public frontend configuration and public DNS.
-5. Initialize users and roles through a controlled setup procedure. Create a least-privilege integration identity and rotate its token through the secret-management process.
+1. Pin InvenTree 1.5.6 by immutable image digest. Mirror it into ECR from CI outside the VPC, together with the custom Caddy build that includes the `caddy-dns/route53` module. Do not use mutable `latest`/`stable` or an unreviewed floating tag.
+2. Deploy the gunicorn server, django-q2 worker, and Caddy containers on the private EC2 host.
+   - Store PostgreSQL credentials, the InvenTree secret and OIDC keys, and the integration token in environment Secrets Manager secrets. Deliver them through the least-privilege instance role.
+   - Never put plaintext values in Terraform configuration/state, user data, AMIs, container definitions, scripts, plans, or logs.
+   - Run migrations only through the single one-off migrate step, never implicitly (`INVENTREE_AUTO_UPDATE=false`).
+3. Place RDS PostgreSQL 17 in isolated subnets with public access disabled and ingress limited to the InvenTree host security group on PostgreSQL's port. Enforce `sslmode=verify-full`, configure S3 media through the instance role, and test restore into an isolated dev target.
+4. Give the host and jumpbox no public IP, no inbound SSH or RDP, and SSM-only management.
+   - Limit the host's HTTPS ingress to the inventory Lambda and jumpbox security groups.
+   - Keep InvenTree absent from public frontend configuration and public DNS. Only the ACME challenge TXT and SES DKIM records go in the public zone.
+5. Initialize users and roles through a controlled setup procedure:
+   - Enforce MFA (`LOGIN_ENFORCE_MFA`).
+   - Disable exchange-rate updates and update checks: `CURRENCY_UPDATE_INTERVAL=0`, `INVENTREE_UPDATE_CHECK_INTERVAL=0`.
+   - Configure SES email through Anymail with the instance role.
+   - Create a least-privilege integration identity and rotate its token by the overlap procedure in [Secret rotation](inventree-integration.md#secret-rotation).
 6. Validate version-specific InvenTree APIs/schema against pinned documentation. Build explicit SKU-to-part/BOM mappings with unit tests and fail closed on missing or invalid mappings.
-7. Demonstrate private DNS/TLS, Lambda-to-ALB connectivity, worker processing, S3 persistence, RDS backup/restore, health checks, and restricted staff/API access before connecting checkout.
+7. Pass the [InvenTree acceptance tests](inventree-integration.md#acceptance-tests) before connecting checkout, following the README steps for staff access. They cover private DNS/TLS, Lambda-to-host connectivity, jumpbox access and file transfer, worker processing, S3 persistence, email, RDS backup/restore, health checks, and restricted staff/API access.
 
 ## Phase 4: Backend and Inventory Vertical Slice
 
@@ -128,16 +159,24 @@ Run the following checks before production promotion:
 - **Concurrency/payment checks:** two simultaneous attempts for the last unit permit at most one reservation; client-tampered prices are ignored; checkout failures release reservations; duplicate/out-of-order webhooks do not duplicate payment transitions.
 - **Inventory checks:** freshness rejection, excluded stock locations/states, correct kit/component math without double counting, unavailable/missing parts, InvenTree downtime, retry after partial failure, duplicate job delivery, admin adjustment reconciliation, and alerting on stale projection.
 - **Lifecycle checks:** payment succeeds while inventory posting fails (order remains paid but fulfillment blocked); retry posts once; cancellation/expiry releases once; refund does not silently restock; scheduled reconciliation identifies and reports drift.
-- **Operational checks:** InvenTree upgrade in dev, database/media restore into isolated environment, credential rotation, log/metric review, and documented incident recovery.
+- **Operational checks:**
+  - InvenTree upgrade in dev, in order: snapshot, a single migrate step, then an instance refresh.
+  - Point-in-time database and versioned media restore into an isolated instance.
+  - The database-password and integration-token rotation procedures.
+  - The dev nightly stop and ordered start.
+  - Log and metric review, and documented incident recovery.
 
 Record test evidence and unresolved limitations. Do not use production customer, payment, inventory, or secret data in dev tests.
 
 ## Phase 7: Production Promotion and Operations
 
 1. Freeze and review the tested dev change set. Promote the same intended Terraform/module/application configuration to `infra/prod`, changing only reviewed environment-specific values and secrets.
-2. Use separate production credentials and payment-provider live secrets. Verify DNS, certificates, CloudFront origins, Cognito clients, API authorization, database/network restrictions, monitoring, backup retention, and restore readiness before release.
+2. Use separate production credentials and payment-provider live secrets. Verify DNS, certificates, CloudFront origins, Cognito clients, API authorization, database/network restrictions, monitoring, backup retention, and restore readiness before release. InvenTree go-live gates:
+   - The t4g EC2 Instance Savings Plan is purchased.
+   - The SNS alert subscription is confirmed.
+   - The prod InvenTree run rate is under $50/month after one full week.
 3. Produce and review a production Terraform plan. Require explicit human approval for apply and deployment. Deployment scripts must require an explicit environment, fail closed, preserve state and local configuration, avoid printing secrets, and never silently default to production.
-4. Deploy backward-compatible database/application changes first where applicable, then Lambdas/API, then frontends with controlled cache invalidation. Upgrade InvenTree only through its tested migration process. Do not roll back an application image against an incompatible migrated schema; use the documented restore procedure when necessary.
+4. Deploy backward-compatible database/application changes first where applicable, then Lambdas/API, then frontends with controlled cache invalidation. Upgrade InvenTree only through its tested migration process: RDS snapshot, stop the worker, a single migrate step, then an instance refresh. Do not roll back an application image against an incompatible migrated schema; use the documented restore procedure when necessary.
 5. Smoke-test public catalog, Cognito sessions, a controlled payment test strategy, webhook verification, inventory sync, and operator alarms. Monitor errors, stale projections, failed jobs, reservation age, webhook retries, API latency, and stock discrepancies.
 6. Define rollback and incident ownership before go-live: disable checkout if inventory/payment consistency is uncertain; retain order/payment records; reconcile before resuming sales; never manually edit physical/projection quantities without an audited procedure.
 
