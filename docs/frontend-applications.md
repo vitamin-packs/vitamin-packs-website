@@ -32,7 +32,7 @@ Do not import source modules across the two applications. If code becomes genuin
 - Build to static HTML, CSS, JavaScript, and asset files. Do not require a Node.js server at runtime.
 - Use relative or correctly configured absolute asset paths that work when uploaded to S3 and delivered through CloudFront.
 - Treat the CloudFront distribution as the public origin. Do not add direct public access to the S3 buckets.
-- Support client-side routing through the existing CloudFront SPA fallback to `/index.html`.
+- Support client-side routing through the CloudFront SPA fallback to `/index.html` that the planned `static-site` Terraform module configures.
 - Inject environment-specific, non-secret configuration at build time (for example, API endpoint, Cognito User Pool ID, and app client ID). Each app gets its own pool: the storefront uses the customer pool and `storefront` client; the admin app uses the admin pool and `admin` client (see [Cognito authentication](cognito-authentication.md#what-terraform-provides)). Do not commit environment-specific values when they belong in deployment configuration.
 - Never put Stripe secret keys, PayPal client secrets, AWS credentials, or other private values in browser code. Payment initiation and provider secrets stay in Python Lambda.
 - Use the API Gateway endpoint for backend requests. Never invoke Lambda directly from the browser.
@@ -132,7 +132,7 @@ Preventing script injection is the primary control:
   - `frame-ancestors 'none'`
   - `form-action 'self'`
 
-  No `'unsafe-inline'` or `'unsafe-eval'`. This needs a response-headers policy in the `static-site` Terraform module.
+  No `'unsafe-inline'` or `'unsafe-eval'`. This needs a response-headers policy in the planned `static-site` Terraform module.
 - **Payments are redirects, so the CSP needs no payment-provider origins.** CSP restricts what the page loads or calls: scripts, `fetch` targets, frames, and form posts. It does not restrict a top-level navigation. Per [Payment processing](payment-processing.md), the storefront sends the browser to Stripe's Checkout Session `url` or PayPal's approval link with `window.location.assign(url)`. Do not use a `<form>` POST: `form-action` would then need the provider origins.
   - If embedded payment UI (Stripe Elements/Payment Element, PayPal Smart Buttons) is adopted later, those SDKs load provider scripts and frames and call provider APIs from the page. Update the CSP with the origins from each provider's published CSP guidance, together with the payment doc.
 - The PayPal return URL carries PayPal's `token` query parameter, a PayPal order ID, not a Cognito token.

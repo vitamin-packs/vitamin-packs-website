@@ -2,6 +2,8 @@
 
 Use these prompts with an AWS architecture/infrastructure specialist and an InvenTree integration specialist to resolve the open design decisions before implementation. Run the prompts in order; later prompts depend on earlier decisions. The repository currently contains design documentation, not the described application or Terraform implementations, so distinguish verified repository facts from proposed design.
 
+> **Status (2026-09-28):** Prompts 1–7 have been run. The problem statements below describe the documentation *before* each prompt, so their "current" inconsistencies are superseded. Examples are the seven-domain count, the nested tree, the Lambda layer, `inventory_count`, and the internal ALB. Decisions, their status, and the remaining open questions are in the [Architecture decision register](architecture-decisions.md). Keep this file as a record, and do not treat its prompt text as current design.
+
 ## Shared Instructions
 
 Paste this preamble before any prompt below:

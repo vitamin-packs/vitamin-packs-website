@@ -1,10 +1,19 @@
 # DynamoDB Data Model
 
-This describes the single-table design backing the `dynamodb` Terraform module (`infra/modules/dynamodb`) and how backend Lambda code should read and write it. Follow [Application architecture](application-architecture.md) for where backend code lives, and [Terraform conventions](terraform-conventions.md) if you need to change the table definition itself.
+This is **proposed design** for the single table that the planned `dynamodb` Terraform module (`infra/modules/dynamodb`, not yet written) will create, and for how backend Lambda code should read and write it. Follow [Application architecture](application-architecture.md) for where backend code lives, and [Terraform conventions](terraform-conventions.md) if you need to change the table definition itself.
 
 ## Table
 
-One table per environment, named `${project}-${environment}-data` (e.g. `diyhobbies-dev-data`). Key schema: hash key `PK` (string), range key `SK` (string). Billing mode `PAY_PER_REQUEST`. Two GSIs: `GSI1` and `GSI2`.
+One table per environment, named `${project}-${environment}-data` (`project` is `vitamin-packs`, so `vitamin-packs-dev-data`; see [ADR-017](architecture-decisions.md#adr-017-terraform-project-value)). Key schema: hash key `PK` (string), range key `SK` (string). Billing mode `PAY_PER_REQUEST`. Two GSIs: `GSI1` and `GSI2`.
+
+### Timestamps
+
+Every stored timestamp is a UTC ISO 8601 string in one fixed format, `YYYY-MM-DDTHH:MM:SSZ` ([ADR-018](architecture-decisions.md#adr-018-timestamp-format)). Because the format is fixed-width, string order equals time order, so timestamps are compared directly in condition expressions and embedded directly in GSI sort keys. Writers format them with the `iso()` helper in `backend/shared`. Never store offsets, fractional seconds, or local time.
+
+Exceptions:
+- `ttl` is a Number in epoch seconds, because DynamoDB TTL only reads Number attributes ([TTL](https://docs.aws.amazon.com/amazondynamodb/latest/developerguide/howitworks-ttl.html)).
+- `sync_version` is an epoch-millisecond version counter, not a timestamp.
+- Provider API fields that take epoch seconds, such as Stripe's `expires_at`, are converted at the API call.
 
 ## Entities
 
@@ -15,7 +24,7 @@ One table per environment, named `${project}-${environment}-data` (e.g. `diyhobb
 | Order header | `ORDER#<orderId>` | `ORDER#<orderId>` | One per order. Stores `user_sub` (the owning customer's Cognito `sub`) for ownership checks. |
 | Order line item | `ORDER#<orderId>` | `ORDER#<orderId>#ITEM#<sku>` | One per SKU in the order; `Query` on `PK` returns the header and all line items together. |
 | User profile | `USER#<sub>` | `PROFILE` | `<sub>` is the Cognito user pool subject claim. |
-| Cart | `CART#<sub>` | `CART#<sub>` | In-progress cart, keyed by the caller's Cognito `sub` claim; consider a `ttl` attribute to expire abandoned carts. |
+| Cart | `CART#<sub>` | `CART#<sub>` | In-progress cart, keyed by the caller's Cognito `sub` claim. See [Cart attributes](#cart-attributes). |
 | Order refund | `ORDER#<orderId>` | `REFUND#<providerRefundId>` | One per provider refund; its conditional put makes `refunded_minor` count each refund once. |
 | Payment event | `PAYEVT#<provider>#<eventId>` | `EVENT` | Ledger of verified Stripe/PayPal events and their processing state; see [Payment event](#payment-event-payevtprovidereventid--event) and [Payment processing](payment-processing.md#payment-event-ledger). |
 | Stock projection | `STOCK#<partId>` | `PROJECTION` | One per InvenTree part that any SKU consumes. Derived from InvenTree; written only by inventory sync, checkout, release, and job completion. See [Inventory projection and reservations](#inventory-projection-and-reservations). |
@@ -44,7 +53,7 @@ stock_requirements      map<partId, number>  # per one unit sold, in each part's
 mapping_version         string  (hash of mode, part IDs, quantities, units, BOM checksum, eligibility version)
 mapping_status          string  ("PENDING" | "OK" | "ERROR"); checkout rejects anything but "OK"; an admin mapping change sets "PENDING" until the next sync validates it
 mapping_error           string  (sanitized reason when mapping_status = "ERROR")
-availability_hint       map { state: "in_stock" | "low" | "out" | "unknown", as_of: number }  # advisory display only
+availability_hint       map { state: "in_stock" | "low" | "out" | "unknown", as_of: string }  # advisory display only
 GSI2PK / GSI2SK         "INVMAP" / "SKU#<sku>"  (sellable products only; lets sync enumerate mapped SKUs)
 category_tag            string  (single primary tag; see GSI1 note below)
 difficulty              string  (e.g. "beginner" | "intermediate" | "advanced")
@@ -56,6 +65,23 @@ updated_at              string  (ISO 8601)
 
 Products carry **no stock quantity**. The former `inventory_count` attribute is removed: physical stock belongs to InvenTree, and sellable availability lives on the part-keyed stock projection. Admin product forms must not accept or write quantities. `availability_hint` is a display convenience written by sync and is never read by checkout.
 
+### Cart attributes
+
+```
+lines              list<{ sku: string, quantity: number }>   # at most 10 lines; quantity is a positive integer, validated server-side
+version            number  (starts at 1; every cart write increments it, conditioned on the version the client read)
+checkout_order_id  string  (set by the checkout transaction; absent otherwise)
+updated_at         string  (ISO)
+ttl                number  (epoch s: last write + 30 days; abandoned-cart expiry, duration is an open owner question)
+```
+
+Lifecycle (proposed, [ADR-019](architecture-decisions.md#adr-019-cart-schema-and-lifecycle)):
+- `PUT /cart` replaces `lines`, conditioned on `version = :client_version AND attribute_not_exists(checkout_order_id)`. Otherwise it returns 409, and the client re-reads the cart. Every write, including checkout's, resets `ttl`, so a cart never expires while a hold (at most 72 hours) is open.
+- Checkout sets `checkout_order_id` in its transaction (see [Checkout reservation](#checkout-reservation-pseudocode)). `GET /cart` returns it, so the storefront can resume the provider redirect or poll the order.
+- The verified-payment transaction ([row 6](payment-processing.md#order-payment-and-inventory-states)) deletes the cart, conditioned on `attribute_not_exists(PK) OR checkout_order_id = :oid`.
+- A release from `HELD` removes `checkout_order_id`, conditioned on `checkout_order_id = :oid`, so the customer can retry with the same lines. Releases after payment and late payments (row 7) do not touch the cart.
+- The cart stays locked while a checkout is open. The only ways to unlock it are payment or release, so without a customer cancel route that means hold expiry. See [OPEN-04](architecture-decisions.md#open-questions).
+
 ### Order header attributes
 
 ```
@@ -64,18 +90,18 @@ status              string  ("pending" | "payment_pending" | "paid" | "fulfilled
 inventory_state     string  (see Payment processing)
 total_minor         number  (integer cents, computed from server-side prices at checkout)
 currency            string  (e.g. "USD")
-created_at          number  (epoch s)
+created_at          string  (ISO)
 provider            string  ("stripe" | "paypal"; set when the provider session/order is created)
 provider_ref        string  (Stripe Checkout Session ID or PayPal order ID; set once, conditionally)
 checkout_url        string  (Stripe session URL or PayPal payer-action link, for browser retries)
-session_expires_at  number  (epoch s sent to the provider; stored so a retried create is identical)
+session_expires_at  string  (ISO; converted to epoch s for Stripe's `expires_at`; stored so a retried create is identical)
 payment_ref         string  (Stripe PaymentIntent ID or PayPal capture ID; set with paid)
-paid_at             number
+paid_at             string  (ISO)
 refunded_minor      number  (sum of REFUND# items; created as 0)
 refund_requested    bool    (refund arrived while COMMIT was IN_PROGRESS or FAILED)
 dispute_state       string  ("open" | "won" | "lost"; absent when there is no dispute)
 payment_exception   string  ("amount_mismatch" | "currency_mismatch" | "reference_mismatch" | "payee_mismatch" | "late_unreserved" | "unexpected_payment")
-GSI2PK / GSI2SK     "USER#<sub>" / "ORDER#<createdAt>#<orderId>"
+GSI2PK / GSI2SK     "USER#<sub>" / "ORDER#<created_at>#<orderId>"
 ```
 
 Only the payment-event processor writes `status` payment transitions, `payment_ref`, `paid_at`, `refunded_minor`, `dispute_state`, and `payment_exception` (see [Payment processing](payment-processing.md#order-payment-and-inventory-states)). The admin fulfillment gate reads `status`, `inventory_state`, `dispute_state`, and `payment_exception`.
@@ -90,13 +116,13 @@ object_ref          string  (Stripe Checkout Session / charge / dispute ID, or P
 order_id            string  (when resolvable)
 state               string  ("RECEIVED" | "PROCESSING" | "SUCCEEDED" | "IGNORED" | "FAILED" | "NEEDS_ATTENTION")
 attempts            number
-lease_owner         string, lease_until number   # 60 s processing lease
-next_attempt_at     number  (epoch s; backoff after FAILED)
+lease_owner         string, lease_until string   # 60 s processing lease
+next_attempt_at     string  (ISO; backoff after FAILED)
 last_error          string  (sanitized: error class, provider code, provider request ID)
 outcome             string  (applied transition, "noop", or the mismatch reason)
-received_at, processed_at   number
-GSI2PK / GSI2SK     "PAYEVT#OPEN" / "<next_attempt_at zero-padded to 10>#<provider>#<eventId>"  (only while RECEIVED, PROCESSING, or FAILED)
-ttl                 number  (processed_at + 35 days; set only on SUCCEEDED or IGNORED)
+received_at, processed_at   string  (ISO)
+GSI2PK / GSI2SK     "PAYEVT#OPEN" / "<next_attempt_at>#<provider>#<eventId>"  (only while RECEIVED, PROCESSING, or FAILED)
+ttl                 number  (epoch s: processed_at + 35 days; set only on SUCCEEDED or IGNORED)
 ```
 
 The item never stores the webhook body, because the processor re-fetches the provider object. `SUCCEEDED` is written only inside the same transaction as the business effect, so a failure after the claim never suppresses the event. `NEEDS_ATTENTION` items keep no `ttl` until an operator resolves them.
@@ -116,10 +142,10 @@ units                string   (InvenTree part units; quantities below are in the
 observed_qty         number   # eligible physical quantity InvenTree reported in the snapshot
 reserved_qty         number   # sum of this part across reservations that are HELD, COMMITTING, or COMMITTED and not yet retired
 available_qty        number   # invariant: observed_qty - reserved_qty; may go negative (alerted, blocks checkout)
-pending_retire       map<orderId, { qty: number, completed_at: number }>  # movements confirmed in InvenTree but not yet in observed_qty; created as {}
-source_snapshot_at   number   (epoch s: start of the sync run that produced observed_qty; drives freshness)
+pending_retire       map<orderId, { qty: number, completed_at: string }>  # movements confirmed in InvenTree but not yet in observed_qty; created as {}
+source_snapshot_at   string   (ISO: start of the sync run that produced observed_qty; drives freshness)
 sync_version         number   (epoch ms of that sync run; only increases)
-synced_at            number   (epoch s when the sync wrote this item)
+synced_at            string   (ISO: when the sync wrote this item)
 projection_status    string   ("OK" | "ERROR")
 eligibility_version  string   (hash of the eligible-location and status policy used)
 GSI2PK / GSI2SK      "INVSTOCK" / "PART#<partId zero-padded to 10>"
@@ -142,13 +168,13 @@ Here `R` is the sum of the retired `pending_retire` entries.
 state              string  ("HELD" | "COMMITTING" | "COMMITTED" | "RETIRED" | "RELEASED")
 parts              map<partId, number>   # aggregated across all order lines
 mapping_versions   map<sku, string>
-created_at         number  (epoch s)
-expires_at         number  (epoch s; meaningful only while HELD; 35 min, or 72 h after a PayPal PENDING capture)
-capture_claim_until number (epoch s; PayPal capture route's claim; the expiry sweeper skips a live claim)
-committed_at       number  (epoch s; set when the COMMIT job is confirmed)
-retired_at         number
+created_at         string  (ISO)
+expires_at         string  (ISO; meaningful only while HELD; 35 min, or 72 h after a PayPal PENDING capture)
+capture_claim_until string (ISO; PayPal capture route's claim; the expiry sweeper skips a live claim)
+committed_at       string  (ISO; set when the COMMIT job is confirmed)
+retired_at         string  (ISO)
 release_reason     string  ("session_failed" | "payment_failed" | "customer_cancelled" | "expired" | "refunded_before_commit" | "operator"; removed if a late payment re-reserves)
-GSI2PK / GSI2SK    "INVHOLD" / "EXP#<expires_at zero-padded to 10>#<orderId>"  (only while HELD; removed on any transition)
+GSI2PK / GSI2SK    "INVHOLD" / "EXP#<expires_at>#<orderId>"  (only while HELD; removed on any transition)
 ```
 
 `reserved_qty` counts a reservation while it is `HELD`, `COMMITTING`, or `COMMITTED`. It stops counting at exactly one of two points:
@@ -172,11 +198,11 @@ job_key            string  ("vp-<env>-<orderId>-<kind>"; written into InvenTree 
 state              string  ("QUEUED" | "IN_PROGRESS" | "COMPLETED" | "FAILED" | "CANCELLED" | "NEEDS_ATTENTION")
 plan               map<partId, number>
 from_location_ids  list<number>, to_location_id number
-attempts           number, next_attempt_at number, last_error string (sanitized)
-lease_owner        string, lease_until number
+attempts           number, next_attempt_at string (ISO), last_error string (sanitized)
+lease_owner        string, lease_until string (ISO)
 inventree_tracking_ids  list<number>   # evidence of the completed movement
-created_at, completed_at  number
-GSI2PK / GSI2SK    "INVJOB#OPEN" / "<created_at zero-padded to 10>#<orderId>#<kind>"  (only while not terminal)
+created_at, completed_at  string  (ISO)
+GSI2PK / GSI2SK    "INVJOB#OPEN" / "<created_at>#<orderId>#<kind>"  (only while not terminal)
 ```
 
 An admin stock adjustment uses the same attributes with `PK = ADJ#<adjustmentId>`, `SK = INVJOB#ADJUST`, and these differences:
@@ -187,7 +213,7 @@ job_key            "vp-<env>-adj-<adjustmentId>"
 op                 string  (default "ADD" | "REMOVE" | "COUNT"; the offered set is an open owner decision)
 part_id, location_id, quantity   (location in the environment's eligible allowlist)
 actor_sub, reason  string  (audit: the admin's Cognito sub and the stated reason)
-GSI2SK             "<created_at zero-padded to 10>#ADJ#<adjustmentId>#ADJUST"
+GSI2SK             "<created_at>#ADJ#<adjustmentId>#ADJUST"
 ```
 
 A decrease larger than the part's `available_qty` is rejected with 409 before the item is written, and the worker checks it again when it plans. There is no admin override. See [Async job contracts](backend-api.md#async-job-contracts).
@@ -212,7 +238,7 @@ The current design supports one primary `category_tag` per product. If a product
 ### GSI2 — a user's order history
 
 - `GSI2PK = USER#<sub>`
-- `GSI2SK = ORDER#<createdAt>#<orderId>`
+- `GSI2SK = ORDER#<created_at>#<orderId>`
 
 Set only on order header items (not on line items), so a `Query` on `GSI2` returns one row per order, newest/oldest depending on `ScanIndexForward`. Appending the order ID makes the index key unique if two orders share the same timestamp.
 
@@ -245,10 +271,10 @@ Order volume is small, so a single partition per key is acceptable. Revisit if h
 | Get an order's reservation and jobs | `Query` on `PK=ORDER#<orderId>` (header, lines, `RESERVATION`, `INVJOB#*`) |
 | Read a part's availability | `GetItem` on `PK=STOCK#<partId>`, `SK=PROJECTION` (`ConsistentRead` for writers) |
 | Enumerate mapped SKUs / projected parts | `Query` on `GSI2` with `GSI2PK=INVMAP` / `INVSTOCK` |
-| Find expired holds | `Query` on `GSI2` with `GSI2PK=INVHOLD`, `GSI2SK < EXP#<now>` |
+| Find expired holds | `Query` on `GSI2` with `GSI2PK=INVHOLD`, `GSI2SK < EXP#<now ISO>` |
 | Find open inventory jobs | `Query` on `GSI2` with `GSI2PK=INVJOB#OPEN` |
 | Claim or check a payment event | `UpdateItem` on `PK=PAYEVT#<provider>#<eventId>`, `SK=EVENT` (conditional on state and lease) |
-| Find payment events due for re-drive | `Query` on `GSI2` with `GSI2PK=PAYEVT#OPEN`, `GSI2SK < <now>` |
+| Find payment events due for re-drive | `Query` on `GSI2` with `GSI2PK=PAYEVT#OPEN`, `GSI2SK < <now ISO>` |
 | Find an order by provider reference | read `order_id` from the fetched provider object (`client_reference_id`, `custom_id`), then `GetItem`; no index needed |
 | Sync health | `GetItem` on `PK=SYNC#inventory`, `SK=STATE` |
 
@@ -332,25 +358,26 @@ def checkout(sub, cart_version, provider):
             need[part_id] += per_unit * line.quantity
     require(len(cart.lines) <= 10 and len(need) <= 75)           # transaction budget
 
-    order_id, now = new_uuid(), epoch_s()
-    expires_at = now + HOLD_SECONDS                              # 35 min; see Payment processing
-    fresh_after = now - FRESHNESS_SECONDS                        # 20 min in prod
+    order_id, now = new_uuid(), utc_now()                        # iso() formats YYYY-MM-DDTHH:MM:SSZ
+    expires_at = iso(now + HOLD)                                 # 35 min; see Payment processing
+    fresh_after = iso(now - FRESHNESS)                           # 20 min in prod
     actions = [
         Put(order_header(order_id, sub, status="pending", inventory_state="reserved",
                          total_minor=sum_of_lines, currency=currency, refunded_minor=0,
-                         session_expires_at=now + 1860),         # >= 30 min after session creation (60 s margin); stored for idempotent retries
+                         created_at=iso(now),
+                         session_expires_at=iso(now + timedelta(seconds=1860))),  # >= 30 min after session creation (60 s margin); stored for idempotent retries
             cond="attribute_not_exists(PK)"),
         *[Put(order_line(order_id, l, products[l.sku].price)) for l in cart.lines],
         *[ConditionCheck(product_key(p.sku), cond="price = :price AND mapping_version = :mv")
           for p in products],
         Put(reservation(order_id, state="HELD", parts=need, expires_at=expires_at,
-                        GSI2PK="INVHOLD", GSI2SK=f"EXP#{expires_at:010d}#{order_id}"),
+                        GSI2PK="INVHOLD", GSI2SK=f"EXP#{expires_at}#{order_id}"),
             cond="attribute_not_exists(PK)"),
-        Update(cart_key(sub), "SET checkout_order_id = :oid",
+        Update(cart_key(sub), "SET checkout_order_id = :oid, #ttl = :cart_ttl",
                cond="version = :v AND attribute_not_exists(checkout_order_id)"),
         *[Update(stock_key(part_id),
                  "SET reserved_qty = reserved_qty + :q, available_qty = available_qty - :q",
-                 cond="projection_status = :ok AND source_snapshot_at >= :fresh AND available_qty >= :q",
+                 cond="projection_status = :ok AND source_snapshot_at >= :fresh AND available_qty >= :q",   # :fresh = fresh_after
                  return_values_on_condition_check_failure="ALL_OLD")
           for part_id, q in need.items()],
     ]
@@ -377,7 +404,8 @@ Last-unit concurrency: when two buyers race, DynamoDB serializes both transactio
 
 ```python
 def sync():
-    run_ms = epoch_ms(); run_s = run_ms // 1000                  # taken BEFORE any InvenTree read
+    run_ms = epoch_ms(); run_at = iso_from_ms(run_ms)            # taken BEFORE any InvenTree read
+    retire_before = iso_from_ms(run_ms - CLOCK_MARGIN_S * 1000)
     for product in query_gsi2("INVMAP"):
         validate_and_write_mapping(product)                      # see InvenTree integration; ERROR fails closed
     for part_id in all_mapped_part_ids():
@@ -393,12 +421,12 @@ def sync():
                                cond="attribute_not_exists(PK)")
                 break
             retire = {oid: e for oid, e in cur.pending_retire.items()
-                      if e.completed_at < run_s - CLOCK_MARGIN_S}    # movement finished before this snapshot began
+                      if e.completed_at < retire_before}             # movement finished before this snapshot began
             R = sum(e.qty for e in retire.values())
             try:
                 update(stock_key(part_id),
                        "SET observed_qty = :new, reserved_qty = reserved_qty - :R, "
-                       "available_qty = available_qty + :adj, source_snapshot_at = :run_s, "
+                       "available_qty = available_qty + :adj, source_snapshot_at = :run_at, "
                        "sync_version = :run_ms, synced_at = :now, projection_status = :ok "
                        "REMOVE " + ", ".join(f"pending_retire.#o{i}" for i in range(len(retire))),
                        cond="observed_qty = :old AND sync_version < :run_ms AND "
@@ -409,7 +437,7 @@ def sync():
                 break
             except ConditionalCheckFailed:
                 continue                                         # a concurrent writer changed it; re-read
-    write_sync_state(run_s, success_counts)
+    write_sync_state(run_at, success_counts)
     write_availability_hints()
 ```
 
@@ -425,7 +453,7 @@ Manual changes in InvenTree simply change `observed_qty` on the next sync. If th
 
 ```python
 def complete_commit(order_id, worker_id, tracking_ids):
-    now = epoch_s()                                              # after InvenTree confirmed the movement
+    now = iso(utc_now())                                         # after InvenTree confirmed the movement
     res = get_reservation(order_id, consistent=True)
     order = get_order(order_id, consistent=True)
     uncommit = []
@@ -458,7 +486,12 @@ The order update is conditioned on the `refund_requested` value that was read. I
 ```python
 def release(order_id, reason, from_states=("HELD",), ledger=None):
     res = get_reservation(order_id, consistent=True)
+    order = get_order(order_id, consistent=True)
+    unlock_cart = ([Update(cart_key(order.user_sub), "REMOVE checkout_order_id",
+                           cond="checkout_order_id = :oid")]
+                   if from_states == ("HELD",) else [])          # pre-payment release only; see Cart attributes
     transact_write([
+        *unlock_cart,
         Update(reservation_key(order_id),
                "SET #s = :released, release_reason = :r REMOVE GSI2PK, GSI2SK",
                cond="#s IN (:from_states) AND (attribute_not_exists(capture_claim_until) "
@@ -470,7 +503,7 @@ def release(order_id, reason, from_states=("HELD",), ledger=None):
     ])
 ```
 
-A `ConditionalCheckFailed` on the reservation means it was already released or has moved past `HELD`, so treat the call as done. `COMMITTING` is releasable only when the COMMIT job is cancelled in the same transaction while still `QUEUED` (see [Payment processing](payment-processing.md#order-payment-and-inventory-states)).
+If only the cart action's condition fails (the cart was already unlocked or deleted), retry the release without it. A `ConditionalCheckFailed` on the reservation means it was already released or has moved past `HELD`, so treat the call as done. `COMMITTING` is releasable only when the COMMIT job is cancelled in the same transaction while still `QUEUED` (see [Payment processing](payment-processing.md#order-payment-and-inventory-states)).
 
 ### Example: writing a new sellable product vs. a kit-only component
 

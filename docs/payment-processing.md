@@ -19,7 +19,7 @@ The customer picks Stripe or PayPal at checkout. Both providers follow the same 
 
 | | Stripe | PayPal |
 |---|---|---|
-| Library | Official `stripe==15.6.1`, pinned exactly. It depends on `requests` and `typing_extensions`. | Thin in-house client, `backend/shared/paypal_client.py` (planned), on `requests`. Pin one exact 2.32.x release, shared with Stripe's dependency. |
+| Library | Official `stripe==15.6.1`, pinned exactly. It depends on `requests` and `typing_extensions`. | Thin in-house client, `backend/shared/payments/paypal_client.py` (planned), on `requests`. Pin one exact 2.32.x release, shared with Stripe's dependency. |
 | API version | `2026-08-26.dahlia`, pinned by the SDK release. Create each webhook endpoint with the same API version. Upgrade the SDK and the endpoint version together, in dev first. | Orders v2 (spec 2.32), Payments v2, Webhooks v1 |
 | Base URL | `https://api.stripe.com` in both environments. Test or live is selected by the key. | dev `https://api-m.sandbox.paypal.com`; prod `https://api-m.paypal.com`, from the Lambda environment variable `PAYPAL_API_BASE` |
 | Timeouts | `stripe.StripeClient(api_key, http_client=stripe.RequestsClient(timeout=(3, 10)), max_network_retries=2)`. The SDK default is 80 s, which exceeds the API Gateway limit. | Connect 3 s, read 10 s (15 s for capture) |
@@ -41,11 +41,11 @@ Every function fails fast at cold start when the environment and credentials dis
 
 ## Secrets
 
-Store each provider's credentials in AWS Secrets Manager, one secret per provider per environment (e.g. `${project}/${environment}/stripe`, `${project}/${environment}/paypal`). Never commit keys or hardcode them in Lambda source, per [Application architecture](application-architecture.md). Grant each Lambda's execution role read access to only the secret(s) it needs. Lambdas cache a secret for 5 minutes and re-read it once on a provider 401.
+Store each provider's credentials in AWS Secrets Manager, one secret per provider per environment named `${project}-${environment}-stripe` and `${project}-${environment}-paypal`, for example `vitamin-packs-dev-stripe` ([ADR-015](architecture-decisions.md#adr-015-payment-secret-naming)). The names follow the Terraform `${project}-${environment}-<purpose>` convention, so the deployer and secrets-operator permission sets' name scoping covers them. Never commit keys or hardcode them in Lambda source, per [Application architecture](application-architecture.md). Grant each Lambda's execution role read access to only the secret(s) it needs. Lambdas cache a secret for 5 minutes and re-read it once on a provider 401.
 
 The `payments` Terraform module (planned) creates these secret containers but never creates a secret version. Populate them out of band after applying the environment stack. Use sandbox credentials in dev and live credentials in prod.
 
-Stripe secret `${project}/${environment}/stripe`:
+Stripe secret `${project}-${environment}-stripe`:
 
 ```json
 {"api_key":"rk_test_...","webhook_secret":"whsec_...","webhook_secret_previous":null}
@@ -54,7 +54,7 @@ Stripe secret `${project}/${environment}/stripe`:
 - Prefer a restricted key (`rk_`) with write access to Checkout Sessions and Refunds, and read access to PaymentIntents, Charges, and Disputes.
 - `webhook_secret_previous` holds the old secret during a Stripe secret roll (up to 24 hours). Verification tries the current secret, then the previous one.
 
-PayPal secret `${project}/${environment}/paypal`:
+PayPal secret `${project}-${environment}-paypal`:
 
 ```json
 {"client_id":"...","client_secret":"...","webhook_id":"...","merchant_id":"..."}
@@ -129,8 +129,12 @@ Transaction rules:
 - InvenTree effects happen only inside jobs, and a payment event never proves that stock changed.
 
 Transaction sizes stay within the 100-action limit:
-- row 6 uses 4 items (ledger, order, reservation, job);
-- release and late-payment rows use at most 4 + P, with P ≤ 75 distinct parts.
+- row 6 uses 5 items (ledger, order, reservation, job, cart);
+- a release uses at most 5 + P (the cart action applies only to a release from `HELD`), and a late payment (row 7) at most 4 + P, with P ≤ 75 distinct parts.
+
+Routes not yet defined:
+- Row 4's "customer cancels" and rows 11–13's "cancel after payment" have no API route in [Backend API](backend-api.md#api-gateway). Adding one is an open owner decision: see [OPEN-03 and OPEN-04](architecture-decisions.md#open-questions).
+- Until those are decided, an unpaid hold ends only by expiry (row 5). Cancelling after payment means a full refund through the provider dashboard, which arrives as a refund event (rows 11–13, 15).
 
 ## Payment Validation
 
@@ -256,7 +260,7 @@ Keys are deterministic, so a retry after a crash reuses the same key. `expires_a
 |---|---|---|
 | Stripe create Checkout Session | `Idempotency-Key: vp-<env>-<orderId>-session` | ≥ 24 h |
 | Stripe expire session | none; retrieve the session and act on its `status` | — |
-| Stripe refund (admin) | `vp-<env>-<orderId>-refund-<n>`, where `n` is the admin's refund sequence | ≥ 24 h |
+| Stripe refund (admin; only if [OPEN-03](architecture-decisions.md#open-questions) adds an admin refund route) | `vp-<env>-<orderId>-refund-<n>`, where `n` is the admin's refund sequence | ≥ 24 h |
 | PayPal create order | `PayPal-Request-Id: uuid5(VP_NAMESPACE, "<env>:<orderId>:create")` | 6 h |
 | PayPal capture | `PayPal-Request-Id: uuid5(VP_NAMESPACE, "<env>:<orderId>:capture")` | 6 h |
 | PayPal order fields | `reference_id = custom_id = orderId`; `invoice_id = vp-<env>-<orderId>` (unique per merchant, so a second payment for the order is refused with `DUPLICATE_INVOICE_ID`) | permanent |
@@ -273,7 +277,7 @@ Numbered flow:
    - `mode=payment`, `ui_mode=hosted_page`, `payment_method_types=["card"]` (cards plus card-based wallets; no delayed-notification methods);
    - `line_items` built from server-side prices;
    - `client_reference_id=orderId`, and `metadata.order_id=orderId` on both the session and `payment_intent_data`;
-   - `expires_at = order.session_expires_at` (checkout time + 31 minutes, so it stays at least 30 minutes after the session is created);
+   - `expires_at` = the order's ISO `session_expires_at` converted to epoch seconds (checkout time + 31 minutes, so it stays at least 30 minutes after the session is created);
    - `success_url` and `cancel_url` on the storefront;
    - `Idempotency-Key` as above.
 2. A conditional update stores `provider = "stripe"`, `provider_ref` (the session ID), and `checkout_url` on the order (`attribute_not_exists(provider_ref) OR provider_ref = :id`). The URL is returned. A browser retry after success returns the stored URL (checkout pseudocode `existing_checkout`). A permanent creation failure is row 3.
@@ -385,6 +389,7 @@ A late payment requires a provider edge case, or a PayPal pending capture that o
 - order `pending`/`payment_pending` → `paid`, recording `payment_ref` (PaymentIntent ID or PayPal capture ID) and `paid_at`
 - reservation `HELD` → `COMMITTING`, removing the `INVHOLD` keys
 - COMMIT job `Put` with `attribute_not_exists`, indexed under `INVJOB#OPEN`
+- cart `Delete` conditioned on `attribute_not_exists(PK) OR checkout_order_id = :oid` ([Cart attributes](dynamodb-data-model.md#cart-attributes))
 - ledger `PROCESSING` → `SUCCEEDED`
 
 Send the SQS message after the transaction commits. If the send fails, the open-job sweeper re-enqueues the job.
@@ -439,7 +444,7 @@ Stripe also emails the account owner when an endpoint keeps failing.
 1. **Re-drive an event:** set its ledger item to `FAILED` with `next_attempt_at = now`. The sweeper processes it with a fresh provider fetch.
 2. **Missing event:** resend it from the Stripe Dashboard (up to 15 days) or `stripe events resend` (up to 30 days), or with PayPal `POST /v1/notifications/webhooks-events/{id}/resend`.
 3. **Order-level reconcile:** run `process()` for the order's `provider_ref`. It is idempotent.
-4. **Refund** through the provider dashboard or the admin refund action. The resulting provider event drives the state change.
+4. **Refund** through the provider dashboard. An admin refund action is an open decision ([OPEN-03](architecture-decisions.md#open-questions)). The resulting provider event drives the state change.
 5. **Consistency uncertain:** disable checkout, keep all order, payment, and ledger records, and reconcile before resuming (see [InvenTree integration](inventree-integration.md#reconciliation-and-operations)).
 
 ## Inventory Acceptance Tests

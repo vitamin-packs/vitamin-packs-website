@@ -2,7 +2,7 @@
 
 ## Staff access to InvenTree (Windows jumpbox)
 
-> **Status: planned procedure.** The resources below are defined in `infra/` once implemented. Names such as `<project>-<env>-jumpbox` are the intended Terraform names and outputs (`<project>` is the Terraform `project` value; `<env>` is `dev` or `prod`), not proof that anything is deployed. The design and its rationale are in [docs/inventree-integration.md](docs/inventree-integration.md#staff-access).
+> **Status: planned procedure.** The resources below are defined in `infra/` once implemented. Names such as `vitamin-packs-prod-jumpbox` are the intended Terraform names and outputs (`vitamin-packs` is the Terraform `project` value; use `dev` in place of `prod` for dev), not proof that anything is deployed. The design and its rationale are in [docs/inventree-integration.md](docs/inventree-integration.md#staff-access).
 
 InvenTree has no public address. You reach it from a Windows jumpbox inside the AWS VPC. Your laptop connects to the jumpbox with Remote Desktop through an AWS Systems Manager (SSM) tunnel, so no inbound ports are opened anywhere. These steps are written for **Windows 11 and PowerShell**.
 
@@ -61,11 +61,11 @@ Run these in PowerShell. The examples use prod; for dev, use `vp-dev-operator` a
 2. **Dev only: start the dev environment first.** Dev is stopped every night. Start it in this order: RDS, then the NAT instance, then the InvenTree host. A dev start script under `scripts/` is planned; until it exists, follow the start order in [docs/inventree-integration.md](docs/inventree-integration.md#dev-vs-prod-and-cost).
 
 3. **Start the jumpbox.** It normally runs zero instances and costs nothing while stopped.
-   - In the AWS console: **EC2 → Auto Scaling groups → `<project>-prod-jumpbox` → Edit → Desired capacity `1` → Update**.
+   - In the AWS console: **EC2 → Auto Scaling groups → `vitamin-packs-prod-jumpbox` → Edit → Desired capacity `1` → Update**.
    - Or from PowerShell:
 
      ```powershell
-     aws autoscaling set-desired-capacity --auto-scaling-group-name <project>-prod-jumpbox --desired-capacity 1 --profile $AwsProfile
+     aws autoscaling set-desired-capacity --auto-scaling-group-name vitamin-packs-prod-jumpbox --desired-capacity 1 --profile $AwsProfile
      ```
 
    This is a deliberate change to AWS resources. Wait 5–10 minutes for Windows to boot and register with SSM. If the jumpbox stays running for 8 hours, you get a reminder email.
@@ -74,7 +74,7 @@ Run these in PowerShell. The examples use prod; for dev, use `vp-dev-operator` a
 
    ```powershell
    $Id = aws ec2 describe-instances --profile $AwsProfile `
-     --filters "Name=tag:Name,Values=<project>-prod-jumpbox" "Name=instance-state-name,Values=running" `
+     --filters "Name=tag:Name,Values=vitamin-packs-prod-jumpbox" "Name=instance-state-name,Values=running" `
      --query "Reservations[].Instances[].InstanceId" --output text
    $Id
    ```
@@ -93,8 +93,8 @@ Run these in PowerShell. The examples use prod; for dev, use `vp-dev-operator` a
 
    ```powershell
    $AwsProfile = "vp-prod-operator"
-   aws ssm get-parameter --profile $AwsProfile --name /<project>/prod/jumpbox/rdp-thumbprint --query Parameter.Value --output text
-   aws secretsmanager get-secret-value --profile $AwsProfile --secret-id <project>-prod-jumpbox-login --query SecretString --output text | Set-Clipboard
+   aws ssm get-parameter --profile $AwsProfile --name /vitamin-packs/prod/jumpbox/rdp-thumbprint --query Parameter.Value --output text
+   aws secretsmanager get-secret-value --profile $AwsProfile --secret-id vitamin-packs-prod-jumpbox-login --query SecretString --output text | Set-Clipboard
    ```
 
 7. **Connect with Remote Desktop:**
@@ -130,7 +130,7 @@ Run these in PowerShell. The examples use prod; for dev, use `vp-dev-operator` a
 3. **Stop the jumpbox:** set the desired capacity back to `0`, either in the console as in step 3 or with:
 
    ```powershell
-   aws autoscaling set-desired-capacity --auto-scaling-group-name <project>-prod-jumpbox --desired-capacity 0 --profile $AwsProfile
+   aws autoscaling set-desired-capacity --auto-scaling-group-name vitamin-packs-prod-jumpbox --desired-capacity 0 --profile $AwsProfile
    ```
 
    The instance and its disk are deleted, and charges stop.
@@ -151,7 +151,7 @@ The fallback has limits: sessions end after 60 minutes (you can renew them) or a
 
 | Symptom | Fix |
 |---|---|
-| `TargetNotConnected` when starting the tunnel | The jumpbox isn't running yet, or hasn't registered with SSM. Wait 5–10 minutes after starting it. If it still fails, the NAT instance may be down; SSM traffic goes through it. Check the `<project>-<env>-nat` Auto Scaling group. |
+| `TargetNotConnected` when starting the tunnel | The jumpbox isn't running yet, or hasn't registered with SSM. Wait 5–10 minutes after starting it. If it still fails, the NAT instance may be down; SSM traffic goes through it. Check the `vitamin-packs-<env>-nat` Auto Scaling group. |
 | `SessionManagerPlugin is not found` | Reinstall the Session Manager plugin, then open a new PowerShell window. |
 | Port 13389 already in use | Change `localPortNumber` to another free port and use the same port in `mstsc /v:localhost:<port>`. |
 | RDP rejects the password | The password may have been rotated. Copy it again (step 6). If it still fails, stop and restart the jumpbox so it picks up the current password. |

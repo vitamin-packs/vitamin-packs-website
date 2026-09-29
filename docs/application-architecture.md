@@ -1,8 +1,10 @@
 # Application Architecture
 
+This is **proposed design**. The repository contains no application, backend, Terraform, or script source yet, so the modules and paths below are planned, not existing. Decisions and their status are recorded in the [Architecture decision register](architecture-decisions.md).
+
 ## Frontend
 
-There are two separate frontend applications, each its own S3 bucket and CloudFront distribution (see the `static-site` Terraform module): the customer-facing storefront in `frontend`, and the admin panel in `admin`. Build both with HTML, JavaScript, and Node.js tooling (React + Vite). The storefront is implemented as a responsive catalog/cart/account UI connected to the API, Cognito, and payment integration boundaries below. Deploy the generated static assets to Amazon S3 and deliver them through their CloudFront distribution.
+There are two separate frontend applications, each with its own S3 bucket and CloudFront distribution (from the planned `static-site` Terraform module): the customer-facing storefront in `frontend`, and the admin panel in `admin`. Build both with HTML, JavaScript, and Node.js tooling (React + Vite). The storefront is a responsive catalog/cart/account UI connected to the API, Cognito, and payment integration boundaries below. Deploy the generated static assets to Amazon S3 and deliver them through their CloudFront distribution.
 
 Frontend work must:
 
@@ -15,15 +17,15 @@ Frontend work must:
 Example browser request:
 
 ```javascript
-const response = await fetch(`${apiBaseUrl}/hobbies`, {
+const response = await fetch(`${apiBaseUrl}/products`, {
   headers: { Accept: "application/json" },
 });
 
 if (!response.ok) {
-  throw new Error("Unable to load hobbies.");
+  throw new Error("Unable to load products.");
 }
 
-const hobbies = await response.json();
+const products = await response.json();
 ```
 
 ## Backend
@@ -39,14 +41,14 @@ Keep shared code (DynamoDB, claim/authorization, response, payment-processor, an
 Backend work must:
 
 - Validate and authorize API Gateway request data before processing it. Admin-only operations must call `backend/shared/auth.py`'s `require_admin` in the handler itself. It parses `cognito:groups` tolerantly with exact matching and confirms current `Admins` membership with a live admin-pool lookup (see [Cognito authentication](cognito-authentication.md#backend-authorization)). The JWT authorizer only proves the caller holds a valid admin-pool access token, not that they're an admin, and the frontend hiding admin routes is not access control. Customer handlers take identity only from the token's `sub` and enforce ownership of carts and orders.
-- Read and write the shared DynamoDB single table (see [DynamoDB data model](dynamodb-data-model.md) and the `dynamodb` module) using its `PK`/`SK`/`GSI1`/`GSI2` key structure via `backend/shared/dynamodb.py`; do not introduce additional tables without updating that module.
+- Read and write the shared DynamoDB single table (see [DynamoDB data model](dynamodb-data-model.md) and the planned `dynamodb` module) using its `PK`/`SK`/`GSI1`/`GSI2` key structure via `backend/shared/dynamodb.py`; do not introduce additional tables without updating that module.
 - When writing a `PRODUCT#<sku>` item, only set `GSI1PK`/`GSI1SK` when the item is sellable individually (`sellable_individually = true`); omit them for kit-only components so they stay out of catalog browsing.
 - Return explicit HTTP status codes and JSON responses that the frontend can handle predictably.
-- Configure CORS in API Gateway only for the CloudFront-hosted frontend origins that require access (storefront and admin, per environment) — already wired in the `api-lambda` module from the `static-site` modules' URLs.
-- Avoid hardcoding credentials, tokens, or environment-specific configuration in Lambda source; use Secrets Manager or SSM Parameter Store for Stripe/PayPal secrets.
+- Configure CORS in API Gateway only for the CloudFront-hosted frontend origins that require access (storefront and admin, per environment). The planned `api-lambda` module takes these origins from the `static-site` modules' outputs.
+- Avoid hardcoding credentials, tokens, or environment-specific configuration in Lambda source; Stripe and PayPal credentials live only in Secrets Manager ([Payment processing](payment-processing.md#secrets)).
 - Keep shared Python code within `backend/shared` rather than duplicating it among Lambda functions.
-- Give each Lambda function its own IAM role scoped to only the DynamoDB actions (and, once added, Secrets Manager access) it needs — don't attach one broad role to every function.
-- Payment functions use the `payments` module's provider-specific Secrets Manager ARNs. Checkout routes require Cognito JWTs; Stripe and PayPal webhook routes are public API routes because they authenticate with provider signatures inside their handlers.
+- Give each Lambda function its own IAM role scoped to only the DynamoDB, SQS, and Secrets Manager actions it needs, per the [IAM matrix](backend-api.md#iam) — don't attach one broad role to every function.
+- Payment functions use the provider-specific Secrets Manager ARNs from the planned `payments` module. Checkout routes require Cognito JWTs; Stripe and PayPal webhook routes are public API routes because they authenticate with provider signatures inside their handlers.
 - Attach only `inventory-sync` and `inventory-jobs` to the environment VPC. They call the private InvenTree HTTPS endpoint, which is resolved through private DNS and has no load balancer (see [InvenTree integration](inventree-integration.md)). All other functions stay outside the VPC, including checkout, the webhooks, `sweeper`, and `admin`, so provider and Cognito calls never depend on the NAT instance. `admin` never calls InvenTree: stock adjustments, shipping, and sync requests become typed asynchronous jobs (see [Backend API](backend-api.md#async-job-contracts)). Browsers must never call the internal service.
 - The `checkout` function calculates totals from DynamoDB products rather than trusting client prices, reserves inventory and writes order header/line-item records transactionally, then creates a Stripe Checkout Session or PayPal Order. PayPal approval is completed through the authenticated `/checkout/paypal/capture` route; final `paid` status comes only from a verified provider webhook, processed (or re-driven by the payment sweeper) by the payment-event processor, which re-fetches the provider object before acting (see [Payment processing](payment-processing.md#payment-event-ledger)).
 
