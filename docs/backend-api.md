@@ -271,12 +271,13 @@ The source of `shared/` exists only once in the repository.
   - It iterates over the explicit list of ten functions, never `backend/*/`.
   - It leaves out `__pycache__` and `tests/`.
   - It writes deterministic zips (sorted entries, fixed timestamps) that contain a `BUILD_INFO.json` with the git SHA and the sha256 of `shared/` and of the lock file.
-- **Artifacts:** uploaded to `s3://<artifact-bucket>/lambda/<env>/<function>/<sha256>.zip`. Terraform's `aws_lambda_function` resources reference the S3 key and `source_code_hash`. As a result:
+  - It also writes a hash manifest, recorded by CI for each commit. The `publish` stage refuses to upload zips whose hashes differ from it.
+- **Artifacts:** uploaded create-only to `s3://${project}-<env>-deploy-artifacts/lambda/<env>/<function>/<sha256>.zip`. That bucket is separate from the InvenTree artifacts bucket, which admits only the VPC endpoint. Terraform's `aws_lambda_function` resources take the S3 key and `source_code_hash` from the release manifest ([Deployment scripts](#deployment-scripts)). As a result:
   - only changed zips redeploy;
   - a `shared/` change redeploys every function, which is intended;
   - rollback redeploys a function's previous key.
 - **Versioning:** `shared/` has no version number of its own. The git commit recorded in each zip is its version.
-- **Rollout compatibility:** Terraform updates functions one at a time, and in-flight records and messages cross versions. Shared data and message changes therefore follow expand-then-contract (see [Async job contracts](#async-job-contracts)). Consumers deploy before producers.
+- **Rollout compatibility:** Terraform updates functions independently and in no guaranteed order, and in-flight records and messages cross versions. Shared data and message changes therefore follow expand-then-contract (see [Async job contracts](#async-job-contracts)). Consumers deploy before producers.
 - **Local tests:**
   - Each function runs its tests in its own virtualenv, with only its lock file plus dev tools (`pytest`, `ruff`, `mypy`), so a missing dependency fails locally. `shared/` has its own tests.
   - An import-boundary test fails if anything other than `inventory-sync`/`inventory-jobs` imports `shared.inventree`, or anything other than the payment functions and `sweeper` imports `shared.payments`.
@@ -292,31 +293,26 @@ Its contents still count toward the 250 MB unzipped limit. Deployment-package mo
 
 ## Deployment scripts
 
-Create `scripts/deploy-dev.sh` and `scripts/deploy-prod.sh` — separate scripts per environment (not one script with an environment flag) so there's no risk of a default or typo silently targeting production. Each script must, per [Infrastructure development workflow](infrastructure-development.md):
+Backend releases use `scripts/deploy-dev.sh <stage>` and `scripts/deploy-prod.sh <stage>`.
+- These are separate files with a hardcoded environment, so production can never be targeted by omission or typo.
+- The stages, script contract, approval gates, and credentials are defined once, in [Infrastructure development workflow](infrastructure-development.md#release-workflow). This section covers only what is specific to Lambda.
+- **No script runs a bare `terraform apply`.** `apply` accepts only a saved plan that the operator reviewed. In prod, the plan hash must also match a pushed release tag.
 
-- Build every function in the explicit function list with `scripts/build-lambdas.sh` (see [Packaging](#packaging)) and upload the zips to the environment's artifact location.
-- Run `terraform -chdir=infra/<env> apply` only after the operator has explicitly invoked that script for that environment — the script itself must not be invoked automatically as part of some other workflow that could reach prod unintentionally.
-- Preserve Terraform state, credentials, and local `*.tfvars` files — never print or persist them.
-- Fail fast (`set -euo pipefail`) rather than continuing after a packaging or `terraform` error.
-
-Skeleton:
-
-```bash
-#!/usr/bin/env bash
-set -euo pipefail
-
-ENVIRONMENT="dev"                 # hardcoded per script — see deploy-prod.sh for the prod copy
-INFRA_DIR="infra/${ENVIRONMENT}"
-BUILD_DIR="$(mktemp -d)"
-
-# Deterministic, content-addressed zips for the explicit function list (see Packaging).
-scripts/build-lambdas.sh --out "${BUILD_DIR}"
-
-# Upload zips to the artifact bucket, then apply.
-aws s3 sync "${BUILD_DIR}" "s3://${ARTIFACT_BUCKET}/lambda/${ENVIRONMENT}/" --exclude "*" --include "*.zip"
-terraform -chdir="${INFRA_DIR}" apply
-```
-
-Whether a deployment script may run `apply` at all, or must stop after a reviewed plan, is decided by the infrastructure-promotion resolution (Prompt 6). This skeleton fixes only the build step.
-
-`deploy-prod.sh` is the same shape with `ENVIRONMENT="prod"` — keep them as two files, not a shared script parameterized by an argument, so production can never be targeted by omission.
+Lambda-specific contract:
+- **Publish (dev):**
+  1. `deploy-dev.sh publish` runs `scripts/build-lambdas.sh` over the explicit function list.
+  2. It checks the zip hashes against CI's manifest for the commit.
+  3. It uploads each zip with `If-None-Match` to `lambda/dev/<function>/<sha256>.zip`.
+  4. It writes the release manifest `releases/dev/<commit>.json`.
+- **Promote (prod):**
+  - `deploy-prod.sh promote <sha>` copies the **identical** zips that passed dev to the prod bucket, re-uploading them after verifying each sha256. The bucket policy blocks `CopyObject`.
+  - Prod never deploys a zip built separately from the one dev tested.
+- **Release manifest:**
+  - For each function: the S3 key, the hex sha256 (used in the key), and the base64 sha256 for `source_code_hash`, which Lambda reports as `CodeSha256` ([UpdateFunctionCode](https://docs.aws.amazon.com/lambda/latest/api/API_UpdateFunctionCode.html)).
+  - It is the only `-var-file` for artifact inputs.
+- **Ordering:**
+  - Terraform updates functions in no guaranteed order.
+  - A change that adds a job kind, message field, or item field ships its readers in one release and its first writer in a later one ([Async job contracts](#async-job-contracts)).
+  - Deploy the backend before the frontends.
+- **Rollback:** plan with the previous release manifest. Its zips are still in the bucket, and the new plan passes the same gates as any release.
+- **Secrets:** the payment and InvenTree secret values never pass through these scripts or Terraform ([Secrets](infrastructure-development.md#secrets)).

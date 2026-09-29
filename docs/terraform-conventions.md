@@ -5,23 +5,39 @@
 - Merge caller-provided tags with resource-specific `Name` and `Environment` tags. Resource names follow `${project}-${environment}-<purpose>`.
 - Create modules in `infra/modules`. Use one module for each AWS resource family; these modules orchestrate family modules rather than owning a second implementation of their resources.
 - Connect modules through outputs rather than duplicating resource IDs or other derived values.
-- Keep provider constraints and `.terraform.lock.hcl` files consistent across root configurations.
+- Keep provider constraints and `.terraform.lock.hcl` files consistent across root configurations. Every root sets `required_version = "~> 1.16.0"` and pins the provider major version. Commit lock files with hashes for every operator and CI platform (`terraform providers lock -platform=linux_amd64 …`).
+- Every root except `bootstrap` uses the S3 backend with `use_lockfile = true` and its own key (`dev/`, `prod/`). See [State, plans and artifacts](infrastructure-development.md#state-plans-and-artifacts).
+- Never hardcode AWS account IDs. Take them as per-environment inputs so prod can move to another account.
 
 ## Safety
 
-- Never edit or commit Terraform state, `.terraform/` contents, secrets, credentials, or local `*.tfvars` files.
-- Do not run `terraform apply`, `terraform destroy`, state mutation commands, or AWS mutation commands unless the user explicitly requests the operation.
+- Never edit or commit Terraform state, `.terraform/` contents, saved plan files, secrets, credentials, or local `*.tfvars` files. Saved plans contain sensitive values in cleartext ([terraform plan](https://developer.hashicorp.com/terraform/cli/commands/plan)); treat them like state.
+- Do not run `terraform apply`, `terraform destroy`, state mutation commands, or AWS mutation commands unless the user explicitly requests the operation. When authorized, apply only a saved, reviewed plan through the [release workflow](infrastructure-development.md#release-workflow) and its [approval gates](infrastructure-development.md#approval-gates). Never use `-auto-approve` or `-target`. Never run `destroy` from a script.
+- Terraform creates secret containers only. Never add `aws_secretsmanager_secret_version`, or `random_password` for a secret value; values are set out of band ([Secrets](infrastructure-development.md#secrets)).
 - Treat changes to CIDRs, remote-state settings, public ingress, resource identity, and resource names as potentially destructive. Explain replacement or exposure risk before changing them.
+- Protect stateful resources with `lifecycle { prevent_destroy = true }`. This covers:
+  - the state bucket;
+  - the DynamoDB table (which also has deletion protection);
+  - RDS (with deletion protection in prod, and `allow_major_version_upgrade = false` by default);
+  - the media and deploy-artifact buckets;
+  - both Cognito user pools;
+  - the Secrets Manager secret containers.
+- Give every Auto Scaling group whose capacity the scheduler or an operator manages `lifecycle { ignore_changes = [desired_capacity] }`. That is the jumpbox in both environments, and the InvenTree host and NAT instance in dev.
+- Never add an `instance_refresh` block to the InvenTree Auto Scaling group: it starts a refresh on any launch-template change, ahead of migrations. See [InvenTree rollout](infrastructure-development.md#inventree-rollout).
+- Adopt restored or existing resources with `import` blocks and renames with `moved` blocks in a reviewed plan, not with `terraform import` or `terraform state` commands.
 - Preserve unrelated work in the tree. Do not populate placeholder application or script files unless the task specifically calls for it.
 
 ## Validation
 
 - Format touched Terraform files with `terraform fmt <paths>` and check the full tree with `terraform fmt -check -recursive infra`.
-- Validate both roots after module or provider changes:
+- Validate every root after module or provider changes:
 
   ```sh
-  terraform -chdir=infra/bootstrap validate
-  terraform -chdir=infra/dev validate
+  for root in bootstrap dev prod; do
+    terraform -chdir="infra/${root}" init -backend=false -input=false
+    terraform -chdir="infra/${root}" validate
+  done
   ```
 
-- Run `terraform plan` only when initialized backend access and appropriate AWS credentials are available; review the plan for replacement and security changes before proposing an apply.
+  These checks need no AWS credentials and run in routine CI.
+- Plans read remote state, so only an operator generates them, through the `plan` stage of `scripts/deploy-<env>.sh`. CI never plans. Review the risk-checker summary for replacement, exposure, IAM, capacity, and secret changes before any apply ([Deployment Scripts](infrastructure-development.md#deployment-scripts)).

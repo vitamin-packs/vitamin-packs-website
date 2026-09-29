@@ -181,8 +181,8 @@ InvenTree uses **django-q2**, not Celery:
 - **Scheduler:** it runs inside the worker cluster and claims due schedules with row locks.
 - **No Redis:** without Redis, InvenTree uses a per-process local-memory cache and limits the worker to one thread. That is correct for a single node and saves memory.
 
-Build and mirror images in CI outside the VPC:
-- Push the InvenTree digest and the custom Caddy build to environment ECR repositories.
+Build and mirror images outside the VPC, in the operator's `publish` stage (dev) and `promote` stage (prod). CI has no AWS credentials ([Release workflow](infrastructure-development.md#release-workflow)):
+- Push the InvenTree digest and the custom Caddy build to tag-immutable environment ECR repositories.
 - Hosts pull through the NAT instance and the S3 gateway endpoint.
 - Never use mutable `latest` or `stable` tags.
 
@@ -243,13 +243,14 @@ Persistence: nothing authoritative lives on the host.
 - The Caddy certificate is backed up to S3, and logs go to CloudWatch.
 - Replacing the instance loses nothing.
 
-Upgrade procedure (stage every upgrade in dev first):
-1. Take a manual RDS snapshot, and confirm S3 media versioning is on.
-2. Stop the worker container.
-3. Run a one-off `invoke migrate` container through SSM Run Command. This is the only place migrations run. Use `--skip-backup` semantics; the RDS snapshot is the backup, and the image's `pg_dump` must match the PostgreSQL major version.
-4. Start an Auto Scaling instance refresh (minimum healthy 0%) to the launch template with the new image digest.
-5. Smoke-test the UI, the API, the worker heartbeat, and an inventory-sync run.
-6. Check API compatibility for the inventory Lambdas before promoting to prod.
+Upgrade procedure (stage every upgrade in dev first; the Terraform gates are in [InvenTree rollout](infrastructure-development.md#inventree-rollout)):
+1. Before the outage, produce and review (prod: approve) the saved Terraform plan that changes only the launch template's image digest. The Auto Scaling group has no `instance_refresh` block, so applying it replaces no host.
+2. Take a manual RDS snapshot, and confirm S3 media versioning is on.
+3. Stop the worker container.
+4. Run a one-off `invoke migrate` container with the new digest through SSM Run Command. This is the only place migrations run. Use `--skip-backup` semantics; the RDS snapshot is the backup, and the image's `pg_dump` must match the PostgreSQL major version.
+5. Apply the saved plan, then start an Auto Scaling instance refresh (minimum healthy 0%).
+6. Smoke-test the UI, the API, the worker heartbeat, and an inventory-sync run.
+7. Check API compatibility for the inventory Lambdas before promoting to prod.
 
 The site is down for a few minutes during a refresh. That is acceptable because checkout reads the DynamoDB projection and never calls InvenTree synchronously. The outage must stay inside the 20-minute [freshness limit](#sync-and-freshness).
 
@@ -290,7 +291,8 @@ Restore procedure (rehearse it in dev each quarter and before prod upgrades):
 2. Restore S3 media objects to the same timestamp from object versions.
 3. Update the SSM parameter that holds `INVENTREE_DB_HOST`.
 4. Start an Auto Scaling instance refresh of the InvenTree host.
-5. Validate the UI, the API, and inventory reconciliation, then retire the old instance.
+5. Validate the UI, the API, and inventory reconciliation.
+6. Bring the restored instance under Terraform with an `import` block in a reviewed saved plan. Then retire the old instance with a final snapshot ([InvenTree rollout](infrastructure-development.md#inventree-rollout)).
 
 ## Media and Artifacts
 
@@ -424,7 +426,7 @@ Prerequisites. Account state was verified read-only on 2026-09-28:
   - Fleet Manager concurrent connections: 5.
 - **To do:**
   - Remote-state bootstrap.
-  - A CI job that mirrors the pinned InvenTree digest and builds the Caddy image into ECR.
+  - The operator `publish` stage that mirrors the pinned InvenTree digest and builds the Caddy image into ECR (not CI, which has no AWS credentials).
   - Set the SNS alert address (`larryj@vitamin-packs.com`) and confirm the subscription email.
   - Buy the Savings Plan before prod go-live.
 

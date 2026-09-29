@@ -57,7 +57,11 @@ Complete these decisions before creating dependent infrastructure or application
 4. **Proposed (2026-09-28)** in [InvenTree integration](inventree-integration.md#inventory-data-contract), with [owner decisions](inventree-integration.md#inventory-owner-decisions) still open. Decide the stock model: finished kits versus component-derived kits, eligible stock locations/states, units of measure, mapping ownership, BOM rules, and whether any SKU can be both an independent sellable product and a kit component. Prevent double counting.
 5. **Proposed (2026-09-28)** in [Payment processing](payment-processing.md#order-payment-and-inventory-states). Provider specifics (libraries, idempotency, payment-event ledger, PayPal capture, holds) were resolved by Prompt 4 on 2026-09-28. Define order/payment/inventory states, reservation expiry, payment failure and cancellation handling, refunds/returns, fulfillment gating, reconciliation, and operator recovery. Do not imply a distributed transaction across DynamoDB, payment providers, and InvenTree.
 6. **Proposed (2026-09-28)** for inventory in [DynamoDB data model](dynamodb-data-model.md#inventory-projection-and-reservations). Create the remaining DynamoDB data-model contract, including key/index definitions, product/catalog access patterns, order and line records, cart ownership, reservation ledger, webhook idempotency, inventory jobs, and versioned stock projection. Verify every access pattern against DynamoDB indexes before coding.
-7. Align deployment automation with repository safety rules: CI may test, package, and create/review plans, but production mutation requires an explicit, approved operator action. Never run apply/destroy or AWS/state mutation as an implicit side effect.
+7. **Resolved (2026-09-28)** in [Infrastructure development workflow](infrastructure-development.md#release-workflow):
+   - CI holds no AWS credentials and runs only credential-free checks and builds.
+   - An operator publishes artifacts, plans, and applies only a saved, reviewed plan.
+   - Production apply also requires a pushed release tag bound to the plan hash.
+   - Apply, destroy, and AWS or state mutation never happen as a side effect.
 
 Record decisions in the relevant architecture documents before implementation. Do not create production resources while any security or data-ownership gate remains unresolved.
 
@@ -84,8 +88,20 @@ Record decisions in the relevant architecture documents before implementation. D
 
    Each `backend/` folder except `shared/` is exactly one Lambda function, with the trigger, VPC placement and role listed in [Backend API](backend-api.md#functions-and-triggers). Change function boundaries only through that document. Keep the two frontends independently buildable and deployable. Keep shared Python code in `backend/shared`; it is bundled into each function's zip, with no Lambda layer ([Packaging](backend-api.md#packaging)).
 
-2. Establish remote Terraform state/bootstrap, provider locks, environment variables, naming/tags, and least-privilege CI/operator credentials. Protect state and plan artifacts as sensitive; never commit state, `.terraform/`, credentials, secrets, or local `*.tfvars`.
-3. Add CI checks for Terraform formatting/validation, Python tests/lint, frontend lint/tests/build, artifact scanning for secrets, and documentation checks. CI must not auto-apply infrastructure.
+2. Establish the foundations:
+   - remote Terraform state through `infra/bootstrap` (versioned S3 bucket, `use_lockfile`);
+   - provider locks and the Terraform version pin;
+   - naming and tags;
+   - the operator permission sets in [Credentials and permissions](infrastructure-development.md#credentials-and-permissions).
+
+   Treat state and saved plans as secrets. Never commit state, `.terraform/`, plan files, credentials, secrets, or local `*.tfvars`.
+3. Add CI checks that need no AWS credentials:
+   - Terraform `fmt -check` and `validate` with `-backend=false` for bootstrap, dev, and prod;
+   - Python tests and lint, and the zip determinism check with its hash manifest;
+   - frontend lint, tests, and build;
+   - secret and dependency scanning, and documentation checks.
+
+   CI never plans, publishes, or applies ([Approval gates](infrastructure-development.md#approval-gates)).
 4. Document prerequisites, local setup, environment configuration, and the non-production testing process in the README after a runnable vertical slice exists.
 
 ## Phase 2: Dev Infrastructure
@@ -100,7 +116,7 @@ Provision in dependency order:
 4. DynamoDB table and required indexes, with point-in-time recovery/backups and narrowly scoped Lambda IAM policies.
 5. Private S3 buckets, CloudFront distributions/OAC, SPA fallback, TLS, logging, and cache invalidation strategy for both apps.
 6. API Gateway HTTP API with explicit routes (no `ANY` or `{proxy+}` route), JWT authorizers, and CORS restricted to the environment's CloudFront origins. The ten Lambda functions each get their own role from the [IAM matrix](backend-api.md#iam), with zips from the artifact bucket (no layer) and environment-scoped configuration. Attach only `inventory-sync` and `inventory-jobs` to the VPC.
-7. Secrets Manager secret containers and scoped access policies. Populate secret versions outside Terraform state using approved secure procedures; use sandbox credentials in dev.
+7. Secrets Manager secret containers and scoped access policies. Populate secret values with the out-of-band runbook in [Secrets](infrastructure-development.md#secrets), never through Terraform. Use sandbox credentials in dev.
 8. InvenTree networking, NAT instance, private EC2 host, jumpbox, isolated RDS, S3 media and artifacts, private DNS and Let's Encrypt TLS, SES identity, monitoring, backups, restore capability, and the dev scheduler. Use the modules listed in [InvenTree integration](inventree-integration.md#terraform-modules-and-prerequisites).
    - Both environments run a single node with single-AZ RDS. This is an accepted tradeoff: prod hosting stays under $50/month with a recovery objective measured in hours.
    - Dev runs on demand and is stopped nightly.
@@ -114,7 +130,7 @@ Use outputs to connect modules rather than duplicating identifiers. Review every
 
 ## Phase 3: InvenTree Dev Service
 
-1. Pin InvenTree 1.5.6 by immutable image digest. Mirror it into ECR from CI outside the VPC, together with the custom Caddy build that includes the `caddy-dns/route53` module. Do not use mutable `latest`/`stable` or an unreviewed floating tag.
+1. Pin InvenTree 1.5.6 by immutable image digest. The operator's `deploy-dev.sh publish` stage, run outside the VPC, mirrors it into tag-immutable ECR together with the custom Caddy build that includes the `caddy-dns/route53` module. CI has no AWS credentials. Do not use mutable `latest`/`stable` or an unreviewed floating tag.
 2. Deploy the gunicorn server, django-q2 worker, and Caddy containers on the private EC2 host.
    - Store PostgreSQL credentials, the InvenTree secret and OIDC keys, and the integration token in environment Secrets Manager secrets. Deliver them through the least-privilege instance role.
    - Never put plaintext values in Terraform configuration/state, user data, AMIs, container definitions, scripts, plans, or logs.
@@ -181,7 +197,8 @@ Run the following checks before production promotion:
 - **Inventory checks:** freshness rejection, excluded stock locations/states, correct kit/component math without double counting, unavailable/missing parts, InvenTree downtime, retry after partial failure, duplicate job delivery, admin adjustment reconciliation, and alerting on stale projection.
 - **Lifecycle checks:** payment succeeds while inventory posting fails (order remains paid but fulfillment blocked); retry posts once; cancellation/expiry releases once; refund does not silently restock; scheduled reconciliation identifies and reports drift.
 - **Operational checks:**
-  - InvenTree upgrade in dev, in order: snapshot, a single migrate step, then an instance refresh.
+  - InvenTree upgrade in dev, in the [InvenTree rollout](infrastructure-development.md#inventree-rollout) order: plan, snapshot, a single migrate step, apply, then an instance refresh. Confirm that the apply alone replaces no host.
+  - The [release-workflow acceptance tests](infrastructure-development.md#acceptance-tests).
   - Point-in-time database and versioned media restore into an isolated instance.
   - The database-password and integration-token rotation procedures.
   - The dev nightly stop and ordered start.
@@ -196,16 +213,29 @@ Record test evidence and unresolved limitations. Do not use production customer,
    - The t4g EC2 Instance Savings Plan is purchased.
    - The SNS alert subscription is confirmed.
    - The prod InvenTree run rate is under $50/month after one full week.
-3. Produce and review a production Terraform plan. Require explicit human approval for apply and deployment. Deployment scripts must require an explicit environment, fail closed, preserve state and local configuration, avoid printing secrets, and never silently default to production.
-4. Deploy backward-compatible database/application changes first where applicable, then Lambdas/API, then frontends with controlled cache invalidation. Upgrade InvenTree only through its tested migration process: RDS snapshot, stop the worker, a single migrate step, then an instance refresh. Do not roll back an application image against an incompatible migrated schema; use the documented restore procedure when necessary.
+3. Follow the [release workflow](infrastructure-development.md#release-workflow):
+   1. `deploy-prod.sh promote` copies the dev-tested artifacts.
+   2. `plan` produces a saved plan.
+   3. The operator reviews it, and `approve` pushes the release tag carrying the plan hash.
+   4. `apply` runs that exact plan.
+4. Follow [Sequencing](infrastructure-development.md#sequencing):
+   - artifacts first, then infrastructure and Lambdas, backend smoke tests, then frontends with index-only invalidation;
+   - readers before writers, and DynamoDB backfills as separate steps.
+
+   Upgrade InvenTree as its own release, following [InvenTree rollout](infrastructure-development.md#inventree-rollout):
+   1. Plan the launch-template change before the outage.
+   2. Take an RDS snapshot, stop the worker, and run the single migrate step.
+   3. Apply the plan, then start the instance refresh.
+
+   Do not roll back an application image against an incompatible migrated schema. Use the documented restore procedure, then reconcile Terraform with an `import` block.
 5. Smoke-test public catalog, Cognito sessions, a controlled payment test strategy, webhook verification, inventory sync, and operator alarms. Monitor errors, stale projections, failed jobs, reservation age, webhook retries, API latency, and stock discrepancies.
 6. Define rollback and incident ownership before go-live: disable checkout if inventory/payment consistency is uncertain; retain order/payment records; reconcile before resuming sales; never manually edit physical/projection quantities without an audited procedure.
 
 ## Deployment Guardrails
 
 - Start all infrastructure development in `infra/dev`; promote only after validation and review. Do not create infrastructure directly in prod except through a separately approved emergency process.
-- Require explicit target selection. Avoid a shared script whose omitted argument can target prod. A production script or workflow must still require a deliberate, approved invocation and must not be triggered automatically by routine CI.
-- Do not run `terraform apply`, `destroy`, state mutation, or AWS mutation without explicit operator authorization. Plan generation/review is not authorization to apply.
+- Require explicit target selection. Use separate `deploy-dev.sh` and `deploy-prod.sh` entry points, never a shared script whose omitted argument can target prod. Routine CI never triggers a deployment; it holds no AWS credentials.
+- Do not run `terraform apply`, `destroy`, state mutation, or AWS mutation without explicit operator authorization. Plan generation and review are not authorization to apply. The gates are in [Approval gates](infrastructure-development.md#approval-gates). An emergency prod change must be backported to dev within 2 days.
 - Never commit secrets, Terraform state, generated private configuration, or local `*.tfvars`. Restrict state and artifact access.
 - Keep Lambda IAM roles per function and narrowly scoped. Keep browser CORS limited to the correct CloudFront distribution origins.
 - Do not expose InvenTree credentials, admin APIs, or operational endpoints in frontend configuration. Avoid a generic InvenTree proxy.
