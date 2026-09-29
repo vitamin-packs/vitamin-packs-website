@@ -16,7 +16,7 @@ Do not introduce new infrastructure directly in `infra/prod`. Production changes
 
 ## Region
 
-All Terraform resources must be created in `us-west-2` wherever the resource type allows it. The only accepted exception is ACM certificates used by CloudFront, which AWS requires to be issued in `us-east-1`; use the `aws.us_east_1` provider alias already defined in each root for that case only. Do not introduce additional regions or provider aliases without updating this rule.
+All Terraform resources must be created in `us-west-2` wherever the resource type allows it. The only accepted exception is ACM certificates used by CloudFront, which AWS requires to be issued in `us-east-1`; use an `aws.us_east_1` provider alias, defined in each root, for that case only. Do not introduce additional regions or provider aliases without updating this rule.
 
 ## Release workflow
 

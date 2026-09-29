@@ -2,11 +2,11 @@
 
 This is the authoritative authentication and authorization contract for the storefront, the admin panel, the API Gateway HTTP API, and backend Lambdas. It describes **proposed design**: the `cognito-auth` Terraform module (`infra/modules/cognito-auth`), the authorizers, and the code below are not yet deployed or implemented. Follow [Application architecture](application-architecture.md) for where frontend/backend code lives, [Backend API](backend-api.md) for routes, and [Frontend applications](frontend-applications.md) for browser standards.
 
-Decisions recorded 2026-09-28 (Prompt 5). Verified against the AWS documentation listed in [References](#references).
+Decisions recorded 2026-09-28 (Prompt 5), with status in the [decision register](architecture-decisions.md) (ADR-009, ADR-010, ADR-016). Verified against the AWS documentation listed in [References](#references).
 
 ## What Terraform provides
 
-Two Cognito **user pools**, both on the **Lite** feature plan (nothing here requires Essentials), with email as the sign-in username. No Hosted UI/managed-login domain: every app calls the Cognito user pools API directly with SRP.
+Two Cognito **user pools**, both on the **Lite** feature plan (nothing here requires Essentials), with email as the sign-in username. Set `user_pool_tier = "LITE"` explicitly: new pools default to Essentials, and Lite includes SRP, groups, and authenticator-app (TOTP) MFA ([feature plans](https://docs.aws.amazon.com/cognito/latest/developerguide/cognito-sign-in-feature-plans.html)). No Hosted UI/managed-login domain: every app calls the Cognito user pools API directly with SRP.
 
 | | Customer pool | Admin pool |
 |---|---|---|
@@ -23,7 +23,7 @@ Both pools share the password policy (12+ characters, upper/lower/number/symbol)
 
 Admins have their own pool because MFA mode and self-sign-up are **user-pool-wide** settings. A shared pool could neither require TOTP for admins only nor stop anyone from calling `SignUp` with the admin client ID. The separate issuer also means a customer token cannot pass the admin authorizer at all.
 
-A Cognito **Identity Pool** and `authenticated` IAM role may exist for future direct-to-AWS needs (e.g. presigned admin uploads). The role has **no permissions attached**. If it is ever used, federate the **admin** pool only and attach a scoped policy in a later phase.
+No Cognito **Identity Pool** is created (proposed, [ADR-016](architecture-decisions.md#adr-016-no-cognito-identity-pool)). If a direct-to-AWS need such as presigned admin uploads is approved later, federate the **admin** pool only and attach a scoped role in that phase.
 
 Read `customer_user_pool_id`, `storefront_client_id`, `admin_user_pool_id`, `admin_client_id` (and the pools' issuer URLs) from the environment root's Terraform outputs (`infra/dev` / `infra/prod`). Do not hardcode them. Inject them at build/deploy time per [Frontend applications](frontend-applications.md).
 
@@ -464,7 +464,7 @@ Rules:
 
 ## Admin onboarding, audit, revocation, and recovery
 
-The **AWS account owner**, using an IAM principal with MFA, is the only operator. Do not create Cognito users with Terraform: `aws_cognito_user` would place temporary passwords in state. There is no standing break-glass admin user. Recovery is re-provisioning by the account owner.
+The **AWS account owner**, using an IAM principal with MFA, is the only operator. Which Identity Center permission set carries the `cognito-idp:Admin*` user-management actions is not yet defined ([OPEN-06](architecture-decisions.md#open-questions)). Do not create Cognito users with Terraform: `aws_cognito_user` would place temporary passwords in state. There is no standing break-glass admin user. Recovery is re-provisioning by the account owner.
 
 **Onboard** (targeting the environment's admin pool explicitly):
 
@@ -528,6 +528,7 @@ Run in dev against the deployed API with raw HTTP requests (no UI):
 - Cognito access token claims: https://docs.aws.amazon.com/cognito/latest/developerguide/amazon-cognito-user-pools-using-the-access-token.html
 - Cognito ID token claims: https://docs.aws.amazon.com/cognito/latest/developerguide/amazon-cognito-user-pools-using-the-id-token.html
 - Token revocation and its limits: https://docs.aws.amazon.com/cognito/latest/developerguide/token-revocation.html
+- User pool feature plans (Lite includes TOTP MFA; default tier is Essentials): https://docs.aws.amazon.com/cognito/latest/developerguide/cognito-sign-in-feature-plans.html
 - User pool MFA (pool-wide modes, `MFA_SETUP`): https://docs.aws.amazon.com/cognito/latest/developerguide/user-pool-settings-mfa.html
 - Sign-up, confirmation, admin-created users: https://docs.aws.amazon.com/cognito/latest/developerguide/signing-up-users-in-your-app.html
 - CloudTrail logging for Cognito: https://docs.aws.amazon.com/cognito/latest/developerguide/logging-using-cloudtrail.html

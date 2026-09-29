@@ -82,7 +82,7 @@ Egress controls:
   - the environment's media and artifacts buckets;
   - `al2023-repos-us-west-2-de612dc2`, for Amazon Linux packages without internet access;
   - `prod-us-west-2-starport-layer-bucket`, for ECR image layers.
-- The DynamoDB gateway endpoint policy allows only the application table.
+- The DynamoDB gateway endpoint policy allows only the application table and its indexes (`table/<name>/index/*`, because sync queries GSI2; see [Backend API](backend-api.md#private-inventree-connectivity)).
 - Keep the default network ACLs. Security groups are the workload-level policy.
 
 InvenTree 1.5.6 makes only two outbound internet calls by default: daily exchange rates from `api.frankfurter.app` and a weekly GitHub update check. Turn both off during setup, since the store is USD-only:
@@ -289,10 +289,10 @@ Preconditions:
 Restore procedure (rehearse it in dev each quarter and before prod upgrades):
 1. Restore to a point in time or from a snapshot as a **new** DB instance, using the same subnet group, security group, and parameter group.
 2. Restore S3 media objects to the same timestamp from object versions.
-3. Update the SSM parameter that holds `INVENTREE_DB_HOST`.
+3. Update the SSM parameter that holds `INVENTREE_DB_HOST` (`db_host_parameter_name`; the host's instance role may read only this parameter).
 4. Start an Auto Scaling instance refresh of the InvenTree host.
 5. Validate the UI, the API, and inventory reconciliation.
-6. Bring the restored instance under Terraform with an `import` block in a reviewed saved plan. Then retire the old instance with a final snapshot ([InvenTree rollout](infrastructure-development.md#inventree-rollout)).
+6. Bring the restored instance under Terraform with an `import` block in a reviewed saved plan. The same plan brings the SSM parameter's Terraform-managed value in line with the restored endpoint. Then retire the old instance with a final snapshot ([InvenTree rollout](infrastructure-development.md#inventree-rollout)).
 
 ## Media and Artifacts
 
@@ -319,7 +319,7 @@ The backup and restore scope is RDS, S3 media versions, and the Secrets Manager 
 | Security group | Inbound | Outbound |
 |---|---|---|
 | `jumpbox` | none | TCP 443 → `inventree`; TCP 443 → `0.0.0.0/0` via NAT (the host firewall limits this to the SSM and CloudWatch agents); TCP 443 → S3 prefix list |
-| `inventree` (EC2 host) | TCP 443 from `jumpbox` and `inv-lambda` | TCP 5432 → `rds`; TCP 443 → `0.0.0.0/0` via NAT; TCP 443 and 80 → S3 prefix list |
+| `inventree` (EC2 host) | TCP 443 from `jumpbox` and `inv-lambda` | TCP 5432 → `rds`; TCP 443 → `0.0.0.0/0` via NAT; TCP 443 → S3 prefix list (no port 80; re-add only on demonstrated need, [ADR-021](architecture-decisions.md#adr-021-inventree-host-s3-egress-port)) |
 | `rds` | TCP 5432 from `inventree` | none |
 | `inv-lambda` | none | TCP 443 → `inventree`; TCP 443 → `0.0.0.0/0` via NAT (Secrets Manager, Lambda Invoke API); TCP 443 → DynamoDB prefix list |
 | `nat` | TCP 443 from `jumpbox`, `inventree`, and `inv-lambda` | TCP 443 → `0.0.0.0/0` |
@@ -405,7 +405,7 @@ Implement these reusable modules in `infra/modules` and compose them through an 
 | `s3-media`, `s3-artifacts` | bucket names and ARNs |
 | `secrets`: containers only; values set out of band | `inventree_app_secret_arn`, `integration_token_secret_arn`, `jumpbox_login_secret_arn` |
 | `ec2-asg`: InvenTree host, instance role with scoped Route 53 and SES permissions, health reporting | `inventree_asg_name`, `inventree_role_arn` |
-| `rds-postgres` | `db_endpoint`, `db_instance_id`, `master_user_secret_arn` |
+| `rds-postgres`, including the SSM parameter `/<project>/<env>/inventree/db-host` that holds `INVENTREE_DB_HOST` ([ADR-020](architecture-decisions.md#adr-020-inventree-db-host-parameter)) | `db_endpoint`, `db_instance_id`, `master_user_secret_arn`, `db_host_parameter_name` |
 | `windows-jumpbox` | `jumpbox_asg_name`, `jumpbox_role_arn` |
 | `monitoring`: SNS topic with an email subscription to `var.alert_email`, plus alarms | `alerts_topic_arn` |
 | `ses-identity`: domain identity and DKIM records, one per account | `ses_identity_arn` |
@@ -475,7 +475,7 @@ Run these in dev before promoting, and again in prod before go-live.
 
 ## Open Owner Actions
 
-All design decisions are resolved. Remaining owner actions:
+All hosting design decisions are resolved. The inventory-contract questions are still open: see [Inventory Owner Decisions](#inventory-owner-decisions) and the [decision register](architecture-decisions.md#open-questions). Remaining owner actions:
 1. Buy the one-year t4g EC2 Instance Savings Plan before prod go-live.
 2. Confirm the SNS email subscription.
 3. Change the sender addresses if `inventree@` and `inventree-dev@` are not wanted.
@@ -498,9 +498,7 @@ All design decisions are resolved. Remaining owner actions:
 
 ## InvenTree API and Data Contract
 
-Implement the InvenTree client in `backend/shared` so inventory sync and stock-posting jobs use one authenticated, timeout-bounded integration. Put only the required inventory job Lambdas in the VPC and allow them to reach the private InvenTree HTTPS endpoint. Keep checkout and payment handlers outside the VPC unless they require private connectivity. This avoids forcing unrelated public payment API calls through the NAT instance. If a checkout path must call InvenTree synchronously, document the reason and its egress needs, and prefer the durable job model below.
-
-Give the integration service account only the InvenTree permissions required for reads and stock movements. Use API behavior verified against the pinned InvenTree release's docs/schema; do not guess endpoint names, payloads, or reservation semantics. Keep API tokens server-side. Bound retries and make non-idempotent requests safe.
+The InvenTree client is specified once, in [Backend API: InvenTree client](backend-api.md#inventree-client). That section covers its placement, configuration, authentication, timeouts, retries, redaction, and named operations. Which functions attach to the VPC is specified in [Private InvenTree Connectivity](backend-api.md#private-inventree-connectivity). Give the integration user only the InvenTree roles required for reads and stock movements.
 
 Treat missing mappings, disabled parts, unexpected units, and insufficient stock as explicit errors, not zero stock or permission to substitute another part. An order may be `paid` while inventory posting is pending; fulfillment must remain blocked until the movement succeeds or an operator resolves the failure. Do not claim a distributed transaction across DynamoDB, providers, and InvenTree.
 
@@ -594,7 +592,7 @@ A sweeper runs every 5 minutes. It re-enqueues `INVJOB#OPEN` jobs whose lease or
 
 ### Admin stock changes
 
-Admin stock changes are asynchronous ADJUST jobs. The `admin` handler never calls InvenTree; after it enforces the `Admins` Cognito group, it:
+Admin stock changes are asynchronous ADJUST jobs. The `admin` handler never calls InvenTree. After `require_admin` authorizes the caller (the `Admins` claim plus a live Cognito check, per [Cognito authentication](cognito-authentication.md#backend-authorization)), it:
 - writes an audited job item (actor, part, location, quantity, reason);
 - enqueues the job and returns 202.
 

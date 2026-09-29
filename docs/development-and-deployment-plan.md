@@ -6,16 +6,16 @@ Use this document as the implementation sequence and release checklist for deliv
 
 ## Verified Starting Point
 
-The checked-in workspace currently contains `AGENTS.md`, `README.md`, and documentation under `docs/`; application, backend, and Terraform source directories are not present in the repository root. `README.md` currently contains only the project heading. Treat the paths and AWS modules described in the guides as intended architecture, not as already deployed or implemented resources. Confirm the live repository and AWS state before making implementation or deployment assumptions.
+As of 2026-09-28 the repository contains only `AGENTS.md`, `README.md` (the planned InvenTree staff-access runbook), `LICENSE`, `.gitignore`, and design documents under `docs/`. Those documents include the [DynamoDB data model](dynamodb-data-model.md) and the [Architecture decision register](architecture-decisions.md).
 
-Some referenced contracts and paths are not yet in the checked-in tree, including `dynamodb-data-model.md`, `infra/`, `backend/`, `frontend/`, `admin/`, and `scripts/`. Create and review the missing contracts before code that depends on them. In particular, complete the DynamoDB data model before implementing catalog, cart, order, reservation, or inventory synchronization behavior.
+There is no `infra/`, `backend/`, `frontend/`, `admin/`, `scripts/`, or CI workflow. No AWS resource described in these guides has been verified as deployed. Treat every path, module, route, and resource here as proposed design, and confirm the live repository and AWS state before making implementation or deployment assumptions.
 
 ## Target Architecture
 
 - **Storefront:** `frontend/`, a responsive React + Vite static application. Public catalog browsing does not require login; cart, checkout, and order history use the signed-in customer's Cognito session.
 - **Admin:** `admin/`, a separately built and deployed React + Vite static application. It uses its own Cognito app client. All privileged operations are authorized in the backend, not merely hidden in the UI.
-- **Static delivery:** separate private S3 buckets and CloudFront distributions for storefront and admin. CloudFront is the public delivery layer; use the existing SPA fallback and do not expose S3 origins directly.
-- **API:** API Gateway HTTP API invoking domain-specific Python Lambdas in `backend/`. Public catalog routes and provider webhook routes are exceptions to Cognito JWT authorization; webhooks verify provider signatures. Every admin handler checks the `Admins` group claim.
+- **Static delivery:** separate private S3 buckets and CloudFront distributions for storefront and admin. CloudFront is the public delivery layer; use the SPA fallback from the planned `static-site` module and do not expose S3 origins directly.
+- **API:** API Gateway HTTP API invoking domain-specific Python Lambdas in `backend/`. Public catalog routes and provider webhook routes are exceptions to Cognito JWT authorization; webhooks verify provider signatures. Every admin handler calls `require_admin`, which checks the `Admins` claim and then does a live Cognito lookup ([Backend authorization](cognito-authentication.md#backend-authorization)).
 - **Application data:** one DynamoDB table and shared access helpers in `backend/shared`. DynamoDB stores catalog/customer/order state and the versioned sellable-stock projection plus active reservations. It is not the authority for physical inventory.
 - **Identity:** two Cognito user pools, specified in [Cognito authentication](cognito-authentication.md):
   - a customer pool (self sign-up, optional TOTP) with the storefront client;
@@ -38,32 +38,23 @@ Some referenced contracts and paths are not yet in the checked-in tree, includin
 
 ## Phase 0: Resolve Contracts and Architecture Gates
 
-Complete these decisions before creating dependent infrastructure or application code:
+Each gate's status is recorded once, in the [Architecture decision register](architecture-decisions.md). The linked contract holds the design.
 
-1. **Resolved (2026-09-28)** in [InvenTree integration](inventree-integration.md). Before prod go-live, complete its [open owner actions](inventree-integration.md#open-owner-actions): Savings Plan purchase and SNS subscription confirmation.
-   - Process topology: InvenTree 1.5.6 with gunicorn, a django-q2 worker using a PostgreSQL broker, and Caddy.
-   - S3 media and the upgrade/migration procedure.
-   - Health checks and secret delivery.
-   - RDS PostgreSQL 17 with `verify-full` TLS.
-2. **Resolved:**
-   - CIDRs: the approved dev `192.168.0.0/19` and prod `192.168.32.0/19` plans.
-   - Staff access: a Windows jumpbox reached through an SSM port-forward, with no Client VPN.
-   - Subnets: public subnets hold only the NAT instance; private application subnets hold the InvenTree host, jumpbox, and inventory Lambdas; isolated database subnets hold RDS with a local-only route.
-   - Only the NAT instance has a public IP, and there is no inbound SSH or RDP.
-3. Prove the connectivity paths:
-   - Private DNS resolution, and security-group-restricted connectivity from the inventory Lambdas to the InvenTree HTTPS endpoint, and from the host to RDS.
-   - Staff reach the InvenTree UI only from the jumpbox.
-   - Do not add a public InvenTree endpoint to simplify integration.
-4. **Proposed (2026-09-28)** in [InvenTree integration](inventree-integration.md#inventory-data-contract), with [owner decisions](inventree-integration.md#inventory-owner-decisions) still open. Decide the stock model: finished kits versus component-derived kits, eligible stock locations/states, units of measure, mapping ownership, BOM rules, and whether any SKU can be both an independent sellable product and a kit component. Prevent double counting.
-5. **Proposed (2026-09-28)** in [Payment processing](payment-processing.md#order-payment-and-inventory-states). Provider specifics (libraries, idempotency, payment-event ledger, PayPal capture, holds) were resolved by Prompt 4 on 2026-09-28. Define order/payment/inventory states, reservation expiry, payment failure and cancellation handling, refunds/returns, fulfillment gating, reconciliation, and operator recovery. Do not imply a distributed transaction across DynamoDB, payment providers, and InvenTree.
-6. **Proposed (2026-09-28)** for inventory in [DynamoDB data model](dynamodb-data-model.md#inventory-projection-and-reservations). Create the remaining DynamoDB data-model contract, including key/index definitions, product/catalog access patterns, order and line records, cart ownership, reservation ledger, webhook idempotency, inventory jobs, and versioned stock projection. Verify every access pattern against DynamoDB indexes before coding.
-7. **Resolved (2026-09-28)** in [Infrastructure development workflow](infrastructure-development.md#release-workflow):
-   - CI holds no AWS credentials and runs only credential-free checks and builds.
-   - An operator publishes artifacts, plans, and applies only a saved, reviewed plan.
-   - Production apply also requires a pushed release tag bound to the plan hash.
-   - Apply, destroy, and AWS or state mutation never happen as a side effect.
+| # | Gate | Status | Register | Contract |
+|---|---|---|---|---|
+| 1 | InvenTree 1.5.6 hosting: process topology, PostgreSQL-backed django-q2, S3 media, upgrade procedure, health, secret delivery, RDS PostgreSQL 17 with `verify-full` | Accepted | ADR-002, ADR-006 | [InvenTree integration](inventree-integration.md#inventree-host) |
+| 2 | Per-environment VPC, CIDRs, NAT instance, subnets and routes, jumpbox staff access, private DNS and TLS | Accepted | ADR-003, ADR-004, ADR-005 | [InvenTree integration](inventree-integration.md#vpc) |
+| 3 | Connectivity proofs: private DNS, security-group-restricted Lambda-to-host and host-to-RDS paths, InvenTree UI reachable only from the jumpbox, no public InvenTree endpoint | Pending the dev acceptance tests | – | [InvenTree acceptance tests](inventree-integration.md#acceptance-tests) |
+| 4 | Stock model: kit modes, eligibility, units, mappings, BOM rules, no double counting | Proposed; owner decisions open | ADR-011, OPEN-01 | [Inventory data contract](inventree-integration.md#inventory-data-contract) |
+| 5 | Order, payment, and inventory lifecycle; provider libraries; the event ledger | Proposed; cancel and refund routes open | ADR-012, OPEN-03, OPEN-04 | [Payment processing](payment-processing.md#order-payment-and-inventory-states) |
+| 6 | DynamoDB keys, indexes, cart, reservations, jobs, ledger, timestamps | Proposed | ADR-011, ADR-018, ADR-019 | [DynamoDB data model](dynamodb-data-model.md) |
+| 7 | Release workflow and approval gates | Accepted | ADR-013 | [Infrastructure development workflow](infrastructure-development.md#release-workflow) |
 
-Record decisions in the relevant architecture documents before implementation. Do not create production resources while any security or data-ownership gate remains unresolved.
+Rules:
+- Do not implement code that depends on an open question until the owner answers it, or until the register records the default that applies in dev.
+- Verify every access pattern against the DynamoDB indexes before coding.
+- Complete the register's [owner actions](architecture-decisions.md#owner-actions) before prod go-live.
+- Do not create production resources while any security or data-ownership gate remains unresolved.
 
 ## Phase 1: Repository and Delivery Foundations
 
