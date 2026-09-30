@@ -24,6 +24,9 @@ Everything below is **design**. As of 2026-09-28 the repository holds only docum
 | DynamoDB keys, indexes, cart, reservations, jobs, timestamps | [DynamoDB data model](dynamodb-data-model.md) |
 | Stock authority, eligibility, kits, sync, movements, reconciliation | [InvenTree integration: Inventory data contract](inventree-integration.md#inventory-data-contract) |
 | Order, payment, and inventory state table | [Payment processing](payment-processing.md#order-payment-and-inventory-states) |
+| Customer checkout cancel | [Payment processing: Customer Cancel](payment-processing.md#customer-cancel) |
+| Customer profile, address book, email mirror, account deletion | [DynamoDB data model: Profile attributes](dynamodb-data-model.md#profile-attributes), [Backend API: Account routes](backend-api.md#account-routes), [ADR-024](#adr-024-customer-profile-and-account-self-service) |
+| Refunds and cancelling paid orders | [Payment processing: state table](payment-processing.md#order-payment-and-inventory-states), [ADR-023](#adr-023-refunds-through-the-provider-dashboard) |
 | Provider libraries, ledger, idempotency, webhooks | [Payment processing](payment-processing.md) |
 | InvenTree hosting, VPC, staff access, DNS/TLS, RDS, cost | [InvenTree integration](inventree-integration.md) |
 | Staff access procedure | [README](../README.md#staff-access-to-inventree-windows-jumpbox) |
@@ -73,7 +76,7 @@ Everything below is **design**. As of 2026-09-28 the repository holds only docum
 
 ### ADR-007: Backend functions and VPC attachment
 - **Status:** Proposed, 2026-09-28. Owner: project owner.
-- **Decision:** Ten flat Python functions: seven HTTP functions, `sweeper`, `inventory-sync`, and `inventory-jobs`. Only the two inventory functions attach to the VPC. Routes are explicit, with no proxy route. → [Functions and triggers](backend-api.md#functions-and-triggers)
+- **Decision:** Eleven flat Python functions: eight HTTP functions, `sweeper`, `inventory-sync`, and `inventory-jobs`. The eighth HTTP function, `account`, was added by [ADR-024](#adr-024-customer-profile-and-account-self-service) on 2026-09-29. Only the two inventory functions attach to the VPC. Routes are explicit, with no proxy route. → [Functions and triggers](backend-api.md#functions-and-triggers)
 - **Rejected:** Seven "domains" with inventory nested under webhooks, VPC-attached payment functions, and a generic InvenTree proxy.
 - **Consequences:** Payment and Cognito calls never depend on the NAT instance. `admin` reaches InvenTree only through jobs.
 
@@ -115,7 +118,7 @@ Everything below is **design**. As of 2026-09-28 the repository holds only docum
   
   → [Payment processing](payment-processing.md)
 - **Rejected:** Standard-library HTTP, `paypal-server-sdk`, `paypalrestsdk`, and a separate "processed" marker.
-- **Consequences:** Only a verified provider object can set `paid`. The cancel and refund routes are open: see OPEN-03 and OPEN-04.
+- **Consequences:** Only a verified provider object can set `paid`. The customer cancel route is decided in [ADR-022](#adr-022-customer-checkout-cancel). Refunds and cancelling a paid order go through the provider dashboard: see [ADR-023](#adr-023-refunds-through-the-provider-dashboard).
 
 ### ADR-013: Release workflow and approval gates
 - **Status:** Accepted, 2026-09-28. Owner: project owner.
@@ -177,7 +180,7 @@ Everything below is **design**. As of 2026-09-28 the repository holds only docum
   
   → [Cart attributes](dynamodb-data-model.md#cart-attributes)
 - **Rejected:** Clearing the cart at checkout time, which loses the lines if payment fails.
-- **Consequences:** Row 6 grows to 5 transaction items, and a release to at most 5 + P. The cart stays locked until expiry unless [OPEN-04](#open-questions) adds a cancel route.
+- **Consequences:** Row 6 grows to 5 transaction items, and a release to at most 5 + P. The cart stays locked until payment, a customer cancel ([ADR-022](#adr-022-customer-checkout-cancel)), or hold expiry.
 
 ### ADR-020: InvenTree DB host parameter
 - **Status:** Accepted, 2026-09-28. Owner: project owner.
@@ -189,6 +192,46 @@ Everything below is **design**. As of 2026-09-28 the repository holds only docum
 - **Decision:** The `inventree` security group allows only TCP 443 to the S3 prefix list. Port 80 is removed, and is re-added only on a demonstrated need as a new decision. → [Security Groups](inventree-integration.md#security-groups)
 - **Consequences:** If AL2023 package installs or ECR layer pulls fail over the S3 gateway endpoint during dev acceptance, record the evidence and revisit.
 
+### ADR-022: Customer checkout cancel
+- **Status:** Accepted, 2026-09-29 (resolves the former OPEN-04). Owner: project owner.
+- **Decision:**
+  - `POST /checkout/cancel` on the `checkout` function (`customer-jwt` plus the order ownership check) cancels an unpaid checkout and unlocks the cart.
+  - Only an order in `pending` with a `HELD` reservation can be cancelled. `payment_pending` and every later state return 409.
+  - The route first makes the provider object unpayable, using the same confirmation as the hold-expiry sweeper. Only then does it run the existing release with `release_reason = customer_cancelled`.
+  - The storefront calls it on the provider `cancel_url` return and from a "Cancel checkout" action on the locked cart.
+
+  → [Customer Cancel](payment-processing.md#customer-cancel)
+- **Rejected:** Cancelling `payment_pending`, because a PayPal pending capture has money in flight. Putting the route on `orders`, which is read-only and holds no provider secrets. Cancelling implicitly on any cart edit.
+- **Consequences:** Customer cancel is its own state-table row (4a), separate from row 4's payment failure. Row 7 is unchanged: a payment after a customer cancel is `unexpected_payment`, alerted, and refunded by the operator. Cancelling a paid order is still a provider-dashboard refund ([ADR-023](#adr-023-refunds-through-the-provider-dashboard)).
+
+### ADR-023: Refunds through the provider dashboard
+- **Status:** Accepted, 2026-09-29 (resolves the former OPEN-03). Owner: project owner.
+- **Decision:**
+  - The admin app has no refund route and no route to cancel a paid order.
+  - The operator refunds in the Stripe or PayPal dashboard. Cancelling a paid order means a full refund.
+  - The provider's refund event drives the order and inventory state (rows 11–13, 15, and 15a).
+
+  → [Payment processing: state table](payment-processing.md#order-payment-and-inventory-states)
+- **Rejected:** An admin refund or cancel route. It would need `admin` access to the provider secrets, IAM changes, and a refund idempotency key.
+- **Consequences:** No admin code touches the provider secrets. The Stripe restricted key needs only read access to Refunds. Every operator refund, including rows 6d and 7 and `unexpected_payment`, goes through the dashboard. Automatic refunds of late payments (OPEN-01 item 5) would need a new decision.
+
+### ADR-024: Customer profile and account self-service
+- **Status:** Proposed, 2026-09-29. The owner chose the scope (contact details and an address book), the ship-to snapshot, and self-service deletion. The contract details await confirmation. Owner: project owner.
+- **Context:** `USER#<sub>` / `PROFILE` had no attributes or writer. Access tokens carry no email, and no document said how an order gets a shipping address.
+- **Decision:**
+  - One profile item holds display name, phone, marketing opt-in, a mirror of the Cognito email, and up to 5 embedded addresses with a default. Every write is version-guarded.
+  - Cognito is the email authority. Only the new `account` function writes the mirror, from `AdminGetUser`. The customer pool keeps the old email until a new one is verified.
+  - Checkout takes a saved `addressId` and copies the address and email onto the order (`ship_to`, `contact_email`). Stripe and PayPal do not collect shipping. PayPal gets `SET_PROVIDED_ADDRESS`.
+  - `POST /account/delete` requires a sign-in within 10 minutes and no open checkout. It tombstones the profile, deletes the cart, then deletes the Cognito user. Orders are kept.
+
+  → [Profile attributes](dynamodb-data-model.md#profile-attributes), [Account routes](backend-api.md#account-routes), [Account deletion](backend-api.md#account-deletion)
+- **Rejected:**
+  - Separate address items, which need a second read and cannot switch the default atomically.
+  - Provider-collected shipping, which leaves the address outside our order record until the webhook.
+  - A Cognito post-confirmation trigger to create profiles; the profile is created lazily on the first write.
+  - Amplify `deleteUser` from the browser, which could skip the checkout and cleanup checks.
+- **Consequences:** ADR-007 grows to eleven functions. The `account` role gets customer-pool `AdminGetUser`, `AdminUserGlobalSignOut`, and `AdminDeleteUser`. The checkout transaction budget is unchanged. Orders keep personal data after an account is deleted until OPEN-11 is answered.
+
 ## Open questions
 
 Each question has a default that applies in dev. Prod needs an answer.
@@ -197,13 +240,13 @@ Each question has a default that applies in dev. Prod needs an answer.
 |---|---|---|---|
 | OPEN-01 | Inventory owner decisions 1–3 and 5–15 ([list](inventree-integration.md#inventory-owner-decisions)): kit modes, eligible locations and statuses, the two-step movement and location IDs, late-payment handling, automatic UNCOMMIT and returns, optional and consumable BOM lines, trackable parts, cart limits, the SKU-to-part rule, sync and freshness intervals, allocation subtraction, partial refunds and disputes, legacy `inventory_count`, storefront availability display | As listed there | Prod go-live; the dev mapping data |
 | OPEN-02 | Which ADJUST operations the admin app offers | Add, remove, and count at one eligible location; transfers stay in InvenTree | The admin inventory UI and ADJUST worker |
-| OPEN-03 | Should the admin app issue refunds or cancel paid orders? It would need a route, `admin` access to the provider secrets, and IAM changes. | No. Refund in the provider dashboard; the provider event drives state | Admin refund UI; rows 11–13 "cancel" wording |
-| OPEN-04 | Should customers be able to cancel an unpaid checkout (`customer_cancelled`, row 4) and unlock their cart? | No route. The hold and cart lock end at expiry (35 minutes) | The storefront return-from-cancel UX |
 | OPEN-05 | Abandoned-cart TTL duration | 30 days after the last write | Cart implementation (the value only) |
 | OPEN-06 | Which Identity Center permission set may create, disable, and re-group Cognito admin users? | The account owner's own administrator access | Admin onboarding runbook, least privilege |
 | OPEN-07 | Is SHIP stock fungible within the committed location, or must it follow batch or serial traceability? | Fungible (see [Physical movements](inventree-integration.md#physical-movements)) | The SHIP job plan |
 | OPEN-08 | InvenTree sender addresses (`inventree@`, `inventree-dev@`) | As documented | SES setup |
 | OPEN-09 | If a `vitamin-packs-<env>-*` S3 bucket name is taken globally, what naming fallback applies? | None chosen. Confirm availability at the first dev plan | The first dev apply |
+| OPEN-10 | Which countries can orders ship to (`SHIP_COUNTRIES`)? | US only | Prod go-live; address validation beyond US formats |
+| OPEN-11 | How long are an order's `ship_to` and `contact_email` kept after the customer deletes their account, and are they then scrubbed? | Kept with the order indefinitely | Prod go-live; the privacy notice |
 
 ## Owner actions
 
@@ -221,7 +264,7 @@ These are not design decisions. They must be done before prod go-live ([Open Own
 
 **Before backend code that depends on a contract:**
 - [ ] `backend/shared` provides `iso()` and `now_iso()` helpers, with tests for the fixed format (ADR-018).
-- [ ] The customer profile (`USER#<sub>` / `PROFILE`) has no defined attributes or writer. Define them before any handler needs customer email, because access tokens carry none.
+- [x] The customer profile (`USER#<sub>` / `PROFILE`) contract is defined ([ADR-024](#adr-024-customer-profile-and-account-self-service)). Implement the `account` function before checkout, which needs a saved address.
 - [ ] Record the dev defaults for OPEN-01, OPEN-02, and OPEN-07 in the dev part-map and location configuration.
 
 **To verify in dev (evidence required before prod):**
@@ -229,11 +272,13 @@ These are not design decisions. They must be done before prod go-live ([Open Own
 - [ ] Check InvenTree 1.5.6 `/api-doc/` shapes for the ADJUST endpoint, transfer and remove, and tracking search ([InvenTree client](backend-api.md#inventree-client)).
 - [ ] Confirm the host health timer works. It calls `https://localhost/api/system/health/`, but Caddy's certificate is issued for the InvenTree FQDN, so the timer must either call the FQDN (resolved to the host) or send the right Host/SNI. Record the working form in the [Health](inventree-integration.md#health-deployment-and-persistence) section.
 - [ ] Confirm the GSI2 projection includes the attributes the sweepers read ([GSI2 overloads](dynamodb-data-model.md#gsi2-overloads-for-inventory-operations)).
+- [ ] Confirm the Lite-tier customer pool honors `attributes_require_verification_before_update = ["email"]` ([Email change](cognito-authentication.md#email-change)).
+- [ ] Confirm the PayPal sandbox accepts `shipping_preference=SET_PROVIDED_ADDRESS` with `purchase_units[0].shipping`, and that the buyer cannot change it ([PayPal](payment-processing.md#paypal)).
 - [ ] Confirm package installs and ECR layer pulls succeed with 443-only S3 egress (ADR-021).
 - [ ] Confirm the exact SES action set, and that `subst` drives appear in `mstsc`.
 - [ ] Run every acceptance-test list: [InvenTree](inventree-integration.md#acceptance-tests), [inventory](payment-processing.md#inventory-acceptance-tests), [payment](payment-processing.md#payment-acceptance-tests), [Cognito](cognito-authentication.md#acceptance-tests), and [release workflow](infrastructure-development.md#acceptance-tests).
 
 **Before prod go-live:**
-- [ ] OPEN-01 answered, and OPEN-03, OPEN-04, and OPEN-08 answered or their defaults explicitly accepted.
+- [ ] OPEN-01 answered, and OPEN-08, OPEN-10, and OPEN-11 answered or their defaults explicitly accepted.
 - [ ] Owner actions complete.
 - [ ] Prod run rate under $50/month after one week.

@@ -46,7 +46,7 @@ Each gate's status is recorded once, in the [Architecture decision register](arc
 | 2 | Per-environment VPC, CIDRs, NAT instance, subnets and routes, jumpbox staff access, private DNS and TLS | Accepted | ADR-003, ADR-004, ADR-005 | [InvenTree integration](inventree-integration.md#vpc) |
 | 3 | Connectivity proofs: private DNS, security-group-restricted Lambda-to-host and host-to-RDS paths, InvenTree UI reachable only from the jumpbox, no public InvenTree endpoint | Pending the dev acceptance tests | – | [InvenTree acceptance tests](inventree-integration.md#acceptance-tests) |
 | 4 | Stock model: kit modes, eligibility, units, mappings, BOM rules, no double counting | Proposed; owner decisions open | ADR-011, OPEN-01 | [Inventory data contract](inventree-integration.md#inventory-data-contract) |
-| 5 | Order, payment, and inventory lifecycle; provider libraries; the event ledger | Proposed; cancel and refund routes open | ADR-012, OPEN-03, OPEN-04 | [Payment processing](payment-processing.md#order-payment-and-inventory-states) |
+| 5 | Order, payment, and inventory lifecycle; provider libraries; the event ledger | Proposed; customer cancel and dashboard-only refunds accepted | ADR-012, ADR-022, ADR-023 | [Payment processing](payment-processing.md#order-payment-and-inventory-states) |
 | 6 | DynamoDB keys, indexes, cart, reservations, jobs, ledger, timestamps | Proposed | ADR-011, ADR-018, ADR-019 | [DynamoDB data model](dynamodb-data-model.md) |
 | 7 | Release workflow and approval gates | Accepted | ADR-013 | [Infrastructure development workflow](infrastructure-development.md#release-workflow) |
 
@@ -103,10 +103,10 @@ Provision in dependency order:
 
 1. State/bootstrap and environment foundations; establish resource tags and outputs.
 2. DNS and certificates, including the CloudFront certificate in `us-east-1` where required.
-3. Cognito customer and admin user pools, storefront/admin app clients, the admin pool's Admins group, and outputs consumed by API/frontend configuration. Admin users are created by the AWS account owner via CLI, never by Terraform.
+3. Cognito customer and admin user pools (the customer pool keeps the old email until a new one is verified: `attributes_require_verification_before_update = ["email"]`), storefront/admin app clients, the admin pool's Admins group, and outputs consumed by API/frontend configuration. Admin users are created by the AWS account owner via CLI, never by Terraform.
 4. DynamoDB table and required indexes, with point-in-time recovery/backups and narrowly scoped Lambda IAM policies.
 5. Private S3 buckets, CloudFront distributions/OAC, SPA fallback, TLS, logging, and cache invalidation strategy for both apps.
-6. API Gateway HTTP API with explicit routes (no `ANY` or `{proxy+}` route), JWT authorizers, and CORS restricted to the environment's CloudFront origins. The ten Lambda functions each get their own role from the [IAM matrix](backend-api.md#iam), with zips from the artifact bucket (no layer) and environment-scoped configuration. Attach only `inventory-sync` and `inventory-jobs` to the VPC.
+6. API Gateway HTTP API with explicit routes (no `ANY` or `{proxy+}` route), JWT authorizers, and CORS restricted to the environment's CloudFront origins. The eleven Lambda functions each get their own role from the [IAM matrix](backend-api.md#iam), with zips from the artifact bucket (no layer) and environment-scoped configuration. Attach only `inventory-sync` and `inventory-jobs` to the VPC.
 7. Secrets Manager secret containers and scoped access policies. Populate secret values with the out-of-band runbook in [Secrets](infrastructure-development.md#secrets), never through Terraform. Use sandbox credentials in dev.
 8. InvenTree networking, NAT instance, private EC2 host, jumpbox, isolated RDS, S3 media and artifacts, private DNS and Let's Encrypt TLS, SES identity, monitoring, backups, restore capability, and the dev scheduler. Use the modules listed in [InvenTree integration](inventree-integration.md#terraform-modules-and-prerequisites).
    - Both environments run a single node with single-AZ RDS. This is an accepted tradeoff: prod hosting stays under $50/month with a recovery objective measured in hours.
@@ -144,13 +144,13 @@ Build API and data functionality in small, deployable increments:
 
 1. Implement shared response, validation, DynamoDB, Cognito-claim, Secrets Manager, and InvenTree-client utilities in `backend/shared`, bundled into each zip by `scripts/build-lambdas.sh`. The InvenTree client follows [InvenTree client](backend-api.md#inventree-client): named operations only, bounded timeouts, default TLS verification, POSTs never retried after an unknown outcome, sanitized errors, and server-side credentials. Add the import-boundary test with the first shared module.
 2. Implement public catalog reads from DynamoDB. Only individually sellable products receive the catalog index keys; kit-only components remain absent from standalone catalog results.
-3. Implement Cognito-protected cart and order reads with customer ownership checks. Validate all API inputs before database/provider calls.
+3. Implement Cognito-protected cart and order reads with customer ownership checks, and the `account` profile routes ([Account routes](backend-api.md#account-routes)): the version-guarded profile and address book, the Cognito email mirror, and self-service [account deletion](backend-api.md#account-deletion). Validate all API inputs before database/provider calls.
 4. Implement admin catalog and inventory operations. Require `require_admin` in each handler before any mutation. `admin` never calls InvenTree. Stock adjustments, shipping, and sync requests become audited ADJUST and SHIP jobs or `inventory-sync` invocations, and return 202 ([Async job contracts](backend-api.md#async-job-contracts)). `inventory-jobs` performs the movement and then requests a targeted sync. A decrease larger than `available_qty` is rejected with 409, with no admin override. Never directly edit the projection as if it were physical stock.
 5. Implement inventory sync to read eligible physical stock and BOMs, validate mappings, and write a versioned projection without overwriting active checkout reservations. Store source revision/time and last-success time. Make staleness thresholds explicit and observable.
-6. Implement checkout with server-calculated prices and an atomic DynamoDB transaction that validates current availability, reserves all required units/components, and creates a pending order. Reject stale or missing projections. Do not trust submitted price or inventory values.
+6. Implement checkout with server-calculated prices and an atomic DynamoDB transaction that validates current availability, reserves all required units/components, and creates a pending order carrying a snapshot of the chosen profile address (`ship_to`) and the email mirror (`contact_email`). Reject stale or missing projections. Do not trust submitted price or inventory values.
 7. Implement payment-provider session/order creation and verified webhook handlers. Add conditional idempotency markers and conditional order-state transitions. Verify Stripe/PayPal dev sandbox configuration before integration testing.
 8. Implement durable, idempotent InvenTree stock-posting jobs keyed by order/line item. Keep inventory state separate from payment state. Retire each reservation exactly once as physical stock movement is reflected in the projection. Gate fulfillment on successful stock posting or explicit operator resolution.
-9. Implement reservation expiry, payment failure/cancellation release, refund/return policy, bounded retries, dead-letter/operator alerts, and scheduled reconciliation. Never reverse physical stock for a refund unless the business policy and actual movement justify a distinct idempotent stock operation.
+9. Implement reservation expiry, payment failure release, the customer cancel route (`POST /checkout/cancel`, which confirms the provider object is unpayable before it releases), refund/return policy, bounded retries, dead-letter/operator alerts, and scheduled reconciliation. Never reverse physical stock for a refund unless the business policy and actual movement justify a distinct idempotent stock operation.
 
 Treat any uncertainty about external API behavior as a verification task against the pinned InvenTree/provider docs, not an assumed request/response contract.
 
@@ -159,7 +159,7 @@ Treat any uncertainty about external API behavior as a verification task against
 1. Build independent React + Vite applications with isolated package/build/test configuration. Do not import application source between them.
 2. Inject environment-specific public configuration at build time: API URL, Cognito User Pool ID and the respective app client ID. These identifiers are public; credentials and provider secrets are not.
 3. Implement embedded Cognito SRP signup/login/logout, password recovery and supported MFA flows. Refresh sessions safely and use the current JWT for protected API calls. Admin UI checks the Admins claim for navigation but relies on server-side authorization.
-4. Storefront: public catalog/product pages, kit BOM presentation, cart, checkout initiation, payment return states, customer order history, loading/empty/error states, and responsive accessible forms. Keep kit-only components non-purchasable individually.
+4. Storefront: public catalog/product pages, kit BOM presentation, cart, checkout initiation with an address picker, account settings (contact, email change, password, MFA, address book, account deletion), payment return states, customer order history, loading/empty/error states, and responsive accessible forms. Keep kit-only components non-purchasable individually.
 5. Admin: protected catalog/order/inventory workflows, clear validation and authorization errors, audit-relevant adjustment reasons, and confirmation for destructive operations. Never expose raw InvenTree credentials or a generic InvenTree proxy.
 6. Use the API Gateway only for browser-to-backend calls. Keep API/network concerns in a small client layer; validate response shapes and render untrusted text safely.
 7. Build static assets only. Verify SPA routing, content security/cache behavior as configured, keyboard and screen-reader states, mobile/desktop layouts, reduced motion, and absence of secrets in generated bundles.
@@ -179,14 +179,15 @@ Run the following checks before production promotion:
 - **Identity/API checks:** the [Cognito acceptance tests](cognito-authentication.md#acceptance-tests):
   - public catalog without a token;
   - protected routes return 401 for no token, an expired token, and another pool's token, and 403 for an ID token;
-  - customer isolation (404 on others' orders);
+  - customer isolation (404 on others' orders; profile routes touch only the caller's `USER#<sub>` item);
   - non-admin and customer-token rejection from every admin route;
   - admin success with a valid Admins claim, and immediate 403 after group removal;
   - webhook routes reject invalid provider signatures.
 - **Catalog/cart checks:** sellable SKU visibility, kit-only exclusion, missing mapping errors, cart persistence and input validation.
+- **Profile checks:** a stale `version` returns 409; a sixth address returns 409; an email change keeps the old email until verified and the next profile read updates the mirror; an order's `ship_to` is unchanged after a profile edit; account deletion returns 409 with an open checkout and 403 without a recent sign-in, and afterwards the deleted user's still-valid token can neither write a profile nor check out.
 - **Concurrency/payment checks:** two simultaneous attempts for the last unit permit at most one reservation; client-tampered prices are ignored; checkout failures release reservations; duplicate/out-of-order webhooks do not duplicate payment transitions.
 - **Inventory checks:** freshness rejection, excluded stock locations/states, correct kit/component math without double counting, unavailable/missing parts, InvenTree downtime, retry after partial failure, duplicate job delivery, admin adjustment reconciliation, and alerting on stale projection.
-- **Lifecycle checks:** payment succeeds while inventory posting fails (order remains paid but fulfillment blocked); retry posts once; cancellation/expiry releases once; refund does not silently restock; scheduled reconciliation identifies and reports drift.
+- **Lifecycle checks:** payment succeeds while inventory posting fails (order remains paid but fulfillment blocked); retry posts once; customer cancel and expiry each release once, and a customer cancel unlocks the cart; refund does not silently restock; scheduled reconciliation identifies and reports drift.
 - **Operational checks:**
   - InvenTree upgrade in dev, in the [InvenTree rollout](infrastructure-development.md#inventree-rollout) order: plan, snapshot, a single migrate step, apply, then an instance refresh. Confirm that the apply alone replaces no host.
   - The [release-workflow acceptance tests](infrastructure-development.md#acceptance-tests).

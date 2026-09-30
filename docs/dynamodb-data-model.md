@@ -23,7 +23,7 @@ Exceptions:
 | Category | `CATEGORY#<tag>` | `METADATA` | Display label/description/sort order for a browsable tag. |
 | Order header | `ORDER#<orderId>` | `ORDER#<orderId>` | One per order. Stores `user_sub` (the owning customer's Cognito `sub`) for ownership checks. |
 | Order line item | `ORDER#<orderId>` | `ORDER#<orderId>#ITEM#<sku>` | One per SKU in the order; `Query` on `PK` returns the header and all line items together. |
-| User profile | `USER#<sub>` | `PROFILE` | `<sub>` is the Cognito user pool subject claim. |
+| User profile | `USER#<sub>` | `PROFILE` | `<sub>` is the Cognito user pool subject claim. Contact details, the Cognito email mirror, and the address book. See [Profile attributes](#profile-attributes). |
 | Cart | `CART#<sub>` | `CART#<sub>` | In-progress cart, keyed by the caller's Cognito `sub` claim. See [Cart attributes](#cart-attributes). |
 | Order refund | `ORDER#<orderId>` | `REFUND#<providerRefundId>` | One per provider refund; its conditional put makes `refunded_minor` count each refund once. |
 | Payment event | `PAYEVT#<provider>#<eventId>` | `EVENT` | Ledger of verified Stripe/PayPal events and their processing state; see [Payment event](#payment-event-payevtprovidereventid--event) and [Payment processing](payment-processing.md#payment-event-ledger). |
@@ -80,7 +80,52 @@ Lifecycle (proposed, [ADR-019](architecture-decisions.md#adr-019-cart-schema-and
 - Checkout sets `checkout_order_id` in its transaction (see [Checkout reservation](#checkout-reservation-pseudocode)). `GET /cart` returns it, so the storefront can resume the provider redirect or poll the order.
 - The verified-payment transaction ([row 6](payment-processing.md#order-payment-and-inventory-states)) deletes the cart, conditioned on `attribute_not_exists(PK) OR checkout_order_id = :oid`.
 - A release from `HELD` removes `checkout_order_id`, conditioned on `checkout_order_id = :oid`, so the customer can retry with the same lines. Releases after payment and late payments (row 7) do not touch the cart.
-- The cart stays locked while a checkout is open. The only ways to unlock it are payment or release, so without a customer cancel route that means hold expiry. See [OPEN-04](architecture-decisions.md#open-questions).
+- The cart stays locked while a checkout is open. It unlocks only through payment or a release from `HELD`: a customer cancel (`POST /checkout/cancel`, [ADR-022](architecture-decisions.md#adr-022-customer-checkout-cancel)), a payment failure, a session failure, or hold expiry.
+
+### Profile attributes
+
+One item per customer. Addresses are embedded, so the whole profile is one read and one version counter, and changing the default address is atomic (proposed, [ADR-024](architecture-decisions.md#adr-024-customer-profile-and-account-self-service)).
+
+```
+email               string  (mirror of the Cognito email; written only by the account function from AdminGetUser, never from a request body)
+email_verified      bool    (mirror of the Cognito attribute)
+email_synced_at     string  (ISO)
+display_name        string  (optional; 1–80 characters)
+phone               string  (optional; E.164 ^\+[1-9]\d{6,14}$; an unverified contact number, not a Cognito attribute)
+marketing_opt_in    bool    (created as false)
+marketing_opt_in_at string  (ISO; set when opted in, removed when opted out)
+addresses           map<addressId, Address>   # at most 5; addressId is a server-generated UUID
+default_address_id  string  (a key of addresses; removed when that address is deleted)
+version             number  (starts at 1; every write increments it, conditioned on the version the client read)
+created_at          string  (ISO)
+updated_at          string  (ISO)
+deleted_at          string  (ISO; tombstone only, see Lifecycle)
+ttl                 number  (epoch s; tombstone only: deleted_at + 2 days)
+```
+
+`Address`:
+
+```
+label           string  (optional; ≤ 40, e.g. "Home")
+recipient_name  string  (1–100)
+line1           string  (1–100)
+line2           string  (optional; ≤ 100)
+city            string  (1–60)
+region          string  (≤ 60; state or province code; required when country = "US")
+postal_code     string  (≤ 20; US: ^\d{5}(-\d{4})?$)
+country         string  (ISO 3166-1 alpha-2; must be in SHIP_COUNTRIES, default ["US"], OPEN-10)
+phone           string  (optional; E.164, for the courier)
+created_at      string  (ISO)
+updated_at      string  (ISO)
+```
+
+Request schemas are closed: unknown fields are rejected with 400. Strings are NFC-normalized and trimmed, and control characters are rejected. The item stays near 5 KB, well under the 400 KB item limit.
+
+Lifecycle:
+- `GET /account/profile` never creates the item. When it is missing, the handler returns an empty profile with `version: 0`. The first mutation creates it with `attribute_not_exists(PK)`, so no Cognito post-confirmation trigger is needed.
+- Every mutation is conditioned on `version = :client_version AND attribute_not_exists(deleted_at)`. Otherwise it returns 409 `version_conflict`, and the client re-reads.
+- Only the `account` function writes the item. Checkout reads it (see [Checkout reservation](#checkout-reservation-pseudocode)) and copies the chosen address onto the order. A later profile edit never changes a placed order.
+- Account deletion replaces the item with a tombstone (`PK`, `SK`, `deleted_at`, `ttl`). The tombstone outlives the 30 minutes in which API Gateway still accepts the deleted user's access tokens, so those tokens can neither recreate the profile nor check out. See [Account deletion](backend-api.md#account-deletion).
 
 ### Order header attributes
 
@@ -101,6 +146,9 @@ refunded_minor      number  (sum of REFUND# items; created as 0)
 refund_requested    bool    (refund arrived while COMMIT was IN_PROGRESS or FAILED)
 dispute_state       string  ("open" | "won" | "lost"; absent when there is no dispute)
 payment_exception   string  ("amount_mismatch" | "currency_mismatch" | "reference_mismatch" | "payee_mismatch" | "late_unreserved" | "unexpected_payment")
+ship_to             map     (copy of the chosen profile Address without label, created_at, and updated_at; written once at checkout)
+ship_to_address_id  string  (the profile addressId it was copied from; display only, never re-read)
+contact_email       string  (the profile email mirror at checkout)
 GSI2PK / GSI2SK     "USER#<sub>" / "ORDER#<created_at>#<orderId>"
 ```
 
@@ -222,7 +270,7 @@ The job item is the durable record. The SQS message only wakes a worker. If the 
 
 ### TTL
 
-Do not use TTL to expire reservations. TTL deletes expired items "typically within a few days", and expired items still appear in reads until then ([TTL](https://docs.aws.amazon.com/amazondynamodb/latest/developerguide/howitworks-ttl.html)). A deletion would also leave `reserved_qty` unreleased. A scheduled sweeper releases expired holds instead. Enable TTL (attribute `ttl`) only for disposable records: carts, terminal payment events (35 days after processing, beyond the providers' retry and resend windows), and optional sync-run logs. Never set it on orders, refunds, reservations, jobs, or projections.
+Do not use TTL to expire reservations. TTL deletes expired items "typically within a few days", and expired items still appear in reads until then ([TTL](https://docs.aws.amazon.com/amazondynamodb/latest/developerguide/howitworks-ttl.html)). A deletion would also leave `reserved_qty` unreleased. A scheduled sweeper releases expired holds instead. Enable TTL (attribute `ttl`) only for disposable records: carts, profile tombstones (2 days after an account deletion), terminal payment events (35 days after processing, beyond the providers' retry and resend windows), and optional sync-run logs. Never set it on orders, refunds, reservations, jobs, or projections.
 
 ## Global Secondary Indexes
 
@@ -267,6 +315,8 @@ Order volume is small, so a single partition per key is acceptable. Revisit if h
 | Get an order and its line items | `Query` on `PK=ORDER#<orderId>` |
 | List a user's orders | `Query` on `GSI2` with `GSI2PK=USER#<sub>` |
 | Get or update a cart | `GetItem`/`PutItem` on `PK=SK=CART#<sub>` |
+| Get or update a profile | `GetItem`/`UpdateItem` on `PK=USER#<sub>`, `SK=PROFILE` (version guard) |
+| Check for open checkouts before account deletion | `Query` on `GSI2` with `GSI2PK=USER#<sub>`, then a `ConsistentRead` of each candidate `pending` or `payment_pending` header |
 | Reserve stock and create a pending order | one `TransactWriteItems` (see [Checkout reservation](#checkout-reservation-pseudocode)) |
 | Get an order's reservation and jobs | `Query` on `PK=ORDER#<orderId>` (header, lines, `RESERVATION`, `INVJOB#*`) |
 | Read a part's availability | `GetItem` on `PK=STOCK#<partId>`, `SK=PROJECTION` (`ConsistentRead` for writers) |
@@ -289,7 +339,7 @@ Order volume is small, so a single partition per key is acceptable. Revisit if h
 - 1 cart `Update` (version guard)
 - P projection `Update`s, one per distinct part
 
-That is `3 + 2L + P` actions. Enforce **L ≤ 10 lines and P ≤ 75 distinct parts** (at most 98 actions). Reject larger carts with 400 before writing. Adjust these limits only while keeping the total at 100 or less.
+That is `3 + 2L + P` actions. The profile read and the `ship_to` snapshot add no action: the order holds a copy, so a concurrent profile edit is harmless. Enforce **L ≤ 10 lines and P ≤ 75 distinct parts** (at most 98 actions). Reject larger carts with 400 before writing. Adjust these limits only while keeping the total at 100 or less.
 
 ## Dev seed data
 
@@ -345,10 +395,13 @@ def browse_category(tag: str) -> list[dict]:
 This is design pseudocode, not a finished boto3 call. It shows the actions and conditions that the implementation must preserve.
 
 ```python
-def checkout(sub, cart_version, provider):
+def checkout(sub, cart_version, address_id, provider):
     cart = get_cart(sub, consistent=True)                        # 409 if cart.version != cart_version
     if cart.checkout_order_id:                                   # browser retry after success
         return existing_checkout(cart.checkout_order_id)
+    profile = get_profile(sub, consistent=True)                  # 409 "address_required" if missing or tombstoned
+    address = profile.addresses.get(address_id)                  # 409 "address_required" if absent
+    require(address.country in SHIP_COUNTRIES)                   # else 400
     products = batch_get_products(cart.skus, consistent=True)
     for p in products:
         require(p.sellable_individually and p.mapping_status == "OK")   # else 409 "unavailable"
@@ -365,6 +418,8 @@ def checkout(sub, cart_version, provider):
         Put(order_header(order_id, sub, status="pending", inventory_state="reserved",
                          total_minor=sum_of_lines, currency=currency, refunded_minor=0,
                          created_at=iso(now),
+                         ship_to=snapshot(address), ship_to_address_id=address_id,   # copy; later edits never change it
+                         contact_email=profile.email,
                          session_expires_at=iso(now + timedelta(seconds=1860))),  # >= 30 min after session creation (60 s margin); stored for idempotent retries
             cond="attribute_not_exists(PK)"),
         *[Put(order_line(order_id, l, products[l.sku].price)) for l in cart.lines],

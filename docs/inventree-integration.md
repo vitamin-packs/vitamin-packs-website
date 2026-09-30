@@ -570,7 +570,7 @@ Four job kinds, each a DynamoDB job item and an SQS message (standard queue with
 | Job | When | InvenTree call | Projection effect |
 |---|---|---|---|
 | `COMMIT` | verified payment | `POST /api/stock/transfer/` from eligible locations to `Web orders – committed` | observed drops on the next sync, and the reservation retires in the same update |
-| `UNCOMMIT` | refund or cancel after COMMIT and before shipping. If the refund arrived while COMMIT was `IN_PROGRESS` or `FAILED`, the COMMIT completion transaction creates it | transfer back from `committed` to the part's default eligible location | observed rises on the next sync |
+| `UNCOMMIT` | full refund after COMMIT and before shipping. If the refund arrived while COMMIT was `IN_PROGRESS` or `FAILED`, the COMMIT completion transaction creates it | transfer back from `committed` to the part's default eligible location | observed rises on the next sync |
 | `SHIP` | admin marks the order shipped (only when the order is `paid`, COMMIT is `COMPLETED`, no dispute is open, and there is no `payment_exception`) | `POST /api/stock/remove/` from `committed` | none (the location is ineligible) |
 | `ADJUST` | an admin stock adjustment (`ADJ#<adjustmentId>`) | the single stock-adjustment request for its `op` at one eligible location. Verify the endpoint against the 1.5.6 schema in dev | observed changes on the targeted sync that the worker requests on completion |
 
@@ -634,7 +634,7 @@ The defaults above let implementation proceed in dev. These need owner confirmat
    - Stripe offers card and wallet methods only;
    - a PayPal `PENDING` capture holds stock for up to 72 hours.
 5. Late payment after a hold was released: re-reserve, and if that fails, refund automatically, backorder, or leave it to the operator. Default: operator.
-6. Refund or cancel after commit: whether UNCOMMIT is automatic. Also the policy for inspecting and restocking returns.
+6. Full refund after commit: whether UNCOMMIT is automatic. Also the policy for inspecting and restocking returns.
 7. Policy for optional and consumable BOM lines. Defaults: optional lines are a mapping error; consumable lines are not reserved.
 8. Whether trackable, serialized, batch-traced, or expiring parts are sold. Default: trackable parts are rejected.
 9. Cart limits. Default: 10 lines and 75 distinct parts.

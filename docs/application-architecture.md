@@ -30,9 +30,9 @@ const products = await response.json();
 
 ## Backend
 
-Store Lambda function source and backend-specific dependencies in `backend`, one flat subfolder per Lambda function. There are ten functions, all in Python, each with its own execution role (see [Backend API](backend-api.md#functions-and-triggers)):
+Store Lambda function source and backend-specific dependencies in `backend`, one flat subfolder per Lambda function. There are eleven functions, all in Python, each with its own execution role (see [Backend API](backend-api.md#functions-and-triggers)):
 
-- seven HTTP functions behind Amazon API Gateway (HTTP API, `api-lambda` Terraform module): `catalog`, `cart`, `checkout`, `orders`, `admin`, `webhooks-stripe`, `webhooks-paypal`. Every route has a Cognito JWT authorizer except public catalog browsing and provider webhooks.
+- eight HTTP functions behind Amazon API Gateway (HTTP API, `api-lambda` Terraform module): `catalog`, `cart`, `checkout`, `orders`, `account`, `admin`, `webhooks-stripe`, `webhooks-paypal`. Every route has a Cognito JWT authorizer except public catalog browsing and provider webhooks.
 - `sweeper`, run by EventBridge Scheduler. It expires holds, re-drives payment events, and re-enqueues open inventory jobs.
 - `inventory-sync` (scheduled or async-invoked) and `inventory-jobs` (SQS-driven). These are the only functions that call InvenTree.
 
@@ -40,7 +40,7 @@ Keep shared code (DynamoDB, claim/authorization, response, payment-processor, an
 
 Backend work must:
 
-- Validate and authorize API Gateway request data before processing it. Admin-only operations must call `backend/shared/auth.py`'s `require_admin` in the handler itself. It parses `cognito:groups` tolerantly with exact matching and confirms current `Admins` membership with a live admin-pool lookup (see [Cognito authentication](cognito-authentication.md#backend-authorization)). The JWT authorizer only proves the caller holds a valid admin-pool access token, not that they're an admin, and the frontend hiding admin routes is not access control. Customer handlers take identity only from the token's `sub` and enforce ownership of carts and orders.
+- Validate and authorize API Gateway request data before processing it. Admin-only operations must call `backend/shared/auth.py`'s `require_admin` in the handler itself. It parses `cognito:groups` tolerantly with exact matching and confirms current `Admins` membership with a live admin-pool lookup (see [Cognito authentication](cognito-authentication.md#backend-authorization)). The JWT authorizer only proves the caller holds a valid admin-pool access token, not that they're an admin, and the frontend hiding admin routes is not access control. Customer handlers take identity only from the token's `sub` and enforce ownership of carts, profiles, and orders.
 - Read and write the shared DynamoDB single table (see [DynamoDB data model](dynamodb-data-model.md) and the planned `dynamodb` module) using its `PK`/`SK`/`GSI1`/`GSI2` key structure via `backend/shared/dynamodb.py`; do not introduce additional tables without updating that module.
 - When writing a `PRODUCT#<sku>` item, only set `GSI1PK`/`GSI1SK` when the item is sellable individually (`sellable_individually = true`); omit them for kit-only components so they stay out of catalog browsing.
 - Return explicit HTTP status codes and JSON responses that the frontend can handle predictably.

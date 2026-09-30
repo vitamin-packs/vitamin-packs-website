@@ -10,8 +10,9 @@ One flat subfolder per Lambda function under `/backend`, plus `shared/`:
 backend/
   catalog/           HTTP: product/category reads (public)
   cart/              HTTP: cart read/update
-  checkout/          HTTP: reserve stock, create Stripe/PayPal checkout, PayPal capture
+  checkout/          HTTP: reserve stock, create Stripe/PayPal checkout, PayPal capture, customer cancel
   orders/            HTTP: order history, order detail
+  account/           HTTP: customer profile, address book, account deletion
   admin/             HTTP: catalog/order CRUD and inventory job requests (Admins only)
   webhooks-stripe/   HTTP: Stripe webhook receiver (payment-event processor)
   webhooks-paypal/   HTTP: PayPal webhook receiver (payment-event processor)
@@ -20,7 +21,7 @@ backend/
   inventory-jobs/    SQS (VPC): durable, idempotent InvenTree stock movements
   shared/            bundled into every zip; never deployed on its own
     auth.py, responses.py, validation.py, dynamodb.py, secrets.py, logging.py
-    payments/        payment-event processor, decide(), provider clients (payment functions and sweeper only)
+    payments/        payment-event processor, decide(), provider clients, provider "unpayable" confirmation (payment functions and sweeper only)
     inventory/       projection math, job items, SQS message schema
     inventree/       InvenTree client (inventory-sync and inventory-jobs only)
 ```
@@ -35,6 +36,7 @@ Each function folder holds a `handler.py`, a hash-locked `requirements.txt`, and
 | `cart` | HTTP API | `/cart` | no | 10 s |
 | `checkout` | HTTP API | `/checkout/*` | no | 25 s |
 | `orders` | HTTP API | `/orders`, `/orders/{orderId}` | no | 10 s |
+| `account` | HTTP API | `/account/*` | no | 15 s |
 | `admin` | HTTP API | the explicit `/admin/...` routes below | no | 15 s |
 | `webhooks-stripe` | HTTP API | `/webhooks/stripe` | no | 20 s |
 | `webhooks-paypal` | HTTP API | `/webhooks/paypal` | no | 20 s |
@@ -68,11 +70,17 @@ Every protected route sets `authorizationScopes = ["aws.cognito.signin.user.admi
 | GET | `/categories/{tag}` | `catalog` | none (public) |
 | GET | `/cart` | `cart` | `customer-jwt` |
 | PUT | `/cart` | `cart` | `customer-jwt` |
-| POST | `/checkout/stripe` | `checkout` | `customer-jwt` |
-| POST | `/checkout/paypal` | `checkout` | `customer-jwt` |
+| POST | `/checkout/stripe` | `checkout` | `customer-jwt`. The body includes a saved `addressId`, which is copied onto the order ([Checkout reservation](dynamodb-data-model.md#checkout-reservation-pseudocode)) |
+| POST | `/checkout/paypal` | `checkout` | `customer-jwt`. The body includes a saved `addressId`, which is copied onto the order ([Checkout reservation](dynamodb-data-model.md#checkout-reservation-pseudocode)) |
 | POST | `/checkout/paypal/capture` | `checkout` | `customer-jwt` + order ownership check in-handler. Captures and returns 202; never marks paid ([flow](payment-processing.md#paypal)) |
+| POST | `/checkout/cancel` | `checkout` | `customer-jwt` + order ownership check in-handler. Cancels an unpaid (`pending`) checkout and unlocks the cart; 409 for any other state ([flow](payment-processing.md#customer-cancel)) |
 | GET | `/orders` | `orders` | `customer-jwt` |
 | GET | `/orders/{orderId}` | `orders` | `customer-jwt` + order ownership check in-handler |
+| GET | `/account/profile` | `account` | `customer-jwt`. Returns the profile and re-syncs the email mirror from Cognito ([Account routes](#account-routes)) |
+| PUT | `/account/profile` | `account` | `customer-jwt` |
+| POST | `/account/addresses` | `account` | `customer-jwt` |
+| PUT, DELETE | `/account/addresses/{addressId}` | `account` | `customer-jwt` |
+| POST | `/account/delete` | `account` | `customer-jwt` + recent sign-in (`auth_time`) check in-handler ([Account deletion](#account-deletion)) |
 | GET, POST | `/admin/products` | `admin` | `admin-jwt` + `require_admin` (claim + live Cognito check) in-handler, as for every `/admin/...` route |
 | GET, PUT | `/admin/products/{sku}` | `admin` | admin |
 | PUT | `/admin/products/{sku}/mapping` | `admin` | admin. Sets `mapping_status = PENDING` and requests a targeted sync, which validates the mapping |
@@ -89,6 +97,42 @@ Every protected route sets `authorizationScopes = ["aws.cognito.signin.user.admi
 Routes are explicit. There is no `ANY` or `{proxy+}` route. A new admin capability means a new row here, a closed request schema, and route-table tests (see [Async job contracts](#async-job-contracts)).
 
 Webhook routes must skip the Cognito authorizer entirely (the caller is Stripe/PayPal, not a logged-in user) and instead verify the provider's own signature inside the handler, per [Payment processing](payment-processing.md).
+
+## Account routes
+
+The `account` function owns the customer profile (`USER#<sub>` / `PROFILE`; attributes in [Profile attributes](dynamodb-data-model.md#profile-attributes)). It is proposed in [ADR-024](architecture-decisions.md#adr-024-customer-profile-and-account-self-service). It is a separate function so that the customer-pool Cognito permissions stay out of `cart`, `checkout`, and `orders`. Every route calls `require_customer_sub(event)` and uses only that `sub`.
+
+| Route | Closed request body | Result |
+|---|---|---|
+| `GET /account/profile` | none | 200 with the profile. A missing item returns an empty profile with `version: 0` and is not created. |
+| `PUT /account/profile` | `{version, displayName, phone, marketingOptIn, defaultAddressId}` | Replaces the contact fields. `defaultAddressId` must be a saved address (400). |
+| `POST /account/addresses` | `{version, address, makeDefault?}` | 201 `{addressId, version}`. The first address becomes the default. A sixth returns 409 `address_limit`. |
+| `PUT /account/addresses/{addressId}` | `{version, address}` | Replaces the address. 404 if the ID isn't in this profile. |
+| `DELETE /account/addresses/{addressId}` | none; `?version=N` | Removes the address, and `default_address_id` too if it pointed there. |
+| `POST /account/delete` | `{"confirm": "DELETE"}` | See [Account deletion](#account-deletion). |
+
+- Every mutation is conditioned on `version = :v AND attribute_not_exists(deleted_at)`. A version mismatch returns 409 `version_conflict`. A tombstoned profile returns 404.
+- The first mutation creates the item with `attribute_not_exists(PK)` from `version: 0`.
+- `addressId` in the path is looked up only inside the caller's own profile, so another customer's ID is simply 404.
+- **Email mirror:** `GET /account/profile` calls `AdminGetUser` on the **customer** pool with the token's `username` claim. If `email` or `email_verified` differs from the stored mirror, one conditional update refreshes them and `email_synced_at`. No request body can set the email. The storefront calls this route after a Cognito email change (see [Cognito authentication](cognito-authentication.md#email-change)). If Cognito is unreachable, the route returns the stored profile with the old mirror.
+- Never log profile fields. Log `sub`, route, and outcome only.
+
+### Account deletion
+
+`POST /account/delete`, numbered flow:
+
+1. `require_customer_sub(event)` and validate the body. The token's `auth_time` must be within the last 10 minutes; otherwise return 403 `reauth_required`, and the storefront asks for the password (and TOTP code) again before retrying.
+2. Return 409 `checkout_open` if the cart has a `checkout_order_id`, or if a GSI2 `USER#<sub>` query finds an order that a `ConsistentRead` confirms is `pending` or `payment_pending`. Money may be in flight, so the customer must cancel or wait first.
+3. One transaction:
+   - replace the profile with the tombstone `{PK, SK, deleted_at, ttl: now + 2 days}`;
+   - delete the cart, conditioned on `attribute_not_exists(PK) OR attribute_not_exists(checkout_order_id)`.
+   An existing tombstone makes this step a no-op, so the route can be retried.
+4. `AdminUserGlobalSignOut`, then `AdminDeleteUser`, on the customer pool. `UserNotFoundException` counts as done. Any other Cognito failure returns 503, and the storefront retries.
+5. Return 200. The storefront clears its storage and shows a confirmation.
+
+The tombstone blocks the 30-minute window in which API Gateway still accepts the deleted user's access tokens: profile writes and checkout both reject it. A cart written in that window cannot be checked out and expires by its TTL.
+
+Orders are **kept**. Their `user_sub`, `ship_to`, and `contact_email` stay for accounting and provider disputes and refunds. How long that personal data is retained is OPEN-11 (default: retained).
 
 ## Private InvenTree Connectivity
 
@@ -188,8 +232,8 @@ def _response(status_code: int, body: dict) -> dict:
 - Validate and parse input before touching DynamoDB or a payment provider.
 - Return explicit status codes (`400` for bad input, `403` for authorization failures, `404` for missing resources) rather than letting unhandled exceptions produce an opaque `500`.
 - Admin handlers call `require_admin(event)` (see [Cognito authentication](cognito-authentication.md#backend-authorization)) before doing anything else. It checks the token, the `Admins` claim, and live admin-pool membership. It fails closed: 403 when not authorized, 503 when Cognito is unreachable.
-- Customer handlers get the caller's identity only from `require_customer_sub(event)` (the `sub` claim). Never read a user ID from the path, query string, or body. Carts, profiles, and order history are keyed by that `sub`.
-- Order-scoped routes (`GET /orders/{orderId}`, `POST /checkout/paypal/capture`) load the order header and return 404 when it is missing or its `user_sub` is not the caller's `sub`.
+- Customer handlers get the caller's identity only from `require_customer_sub(event)` (the `sub` claim). Never read a user ID from the path, query string, or body. Carts, profiles, and order history are keyed by that `sub`. A path `addressId` is looked up only inside the caller's own profile.
+- Order-scoped routes (`GET /orders/{orderId}`, `POST /checkout/paypal/capture`, `POST /checkout/cancel`) load the order header and return 404 when it is missing or its `user_sub` is not the caller's `sub`.
 - The `401` for missing/invalid/expired tokens comes from the API Gateway authorizer; Lambdas never see those requests.
 - Never log tokens, the `Authorization` header, or full claim sets; log `sub`, route, and the authorization decision.
 
@@ -202,7 +246,8 @@ The backend, not the admin UI, is the security boundary. Prove it with tests tha
 - Dev integration (raw HTTP): the [Cognito acceptance tests](cognito-authentication.md#acceptance-tests), including:
   - customer-token and ID-token rejection on every admin route;
   - immediate 403 after admin group removal;
-  - cross-customer order/capture access returning 404.
+  - cross-customer order, capture, and cancel access returning 404;
+  - `account` routes that read and write only the caller's `USER#<sub>` item.
 
 ## IAM
 
@@ -223,8 +268,9 @@ DynamoDB transactions have no IAM action of their own. `TransactWriteItems` is a
 |---|---|---|---|---|
 | `catalog` | read on the table and `index/GSI1` | – | – | – |
 | `cart` | read; `PutItem`, `UpdateItem`, `DeleteItem` | – | – | – |
-| `checkout` | read + Tx ([reservation](dynamodb-data-model.md#checkout-reservation-pseudocode), provider reference, PayPal capture claim) | – (it never marks an order paid) | Stripe, PayPal | – |
+| `checkout` | read + Tx ([reservation](dynamodb-data-model.md#checkout-reservation-pseudocode), provider reference, PayPal capture claim, [customer-cancel release](payment-processing.md#customer-cancel) of the reservation, order, cart, and projections) | – (it never marks an order paid) | Stripe, PayPal | – |
 | `orders` | read on the table and the index its queries use | – | – | – |
+| `account` | read; `PutItem`, `UpdateItem`, `DeleteItem`, `ConditionCheckItem` on the table (the deletion transaction touches only the caller's profile and cart); `Query` on `index/GSI2` | – | – | `cognito-idp:AdminGetUser`, `cognito-idp:AdminUserGlobalSignOut`, and `cognito-idp:AdminDeleteUser` on the **customer** pool ARN only |
 | `admin` | read + Tx; `Query` on `index/GSI2` | `SendMessage` | – | `cognito-idp:AdminGetUser` and `cognito-idp:AdminListGroupsForUser` on the **admin** pool ARN only (no Cognito writes); `lambda:InvokeFunction` on the `inventory-sync` ARN |
 | `webhooks-stripe` | read + Tx (orders, refunds, reservations, projections, jobs, `PAYEVT#` ledger) | `SendMessage` | Stripe only | – |
 | `webhooks-paypal` | as `webhooks-stripe` | `SendMessage` | PayPal only | – |
@@ -268,7 +314,7 @@ The source of `shared/` exists only once in the repository.
 
   Every function pins `boto3` rather than relying on the runtime's copy, as [AWS recommends](https://docs.aws.amazon.com/lambda/latest/dg/python-package.html#python-package-searchpath). Provider SDKs appear only in the functions that use them; for example, no `stripe` in `catalog`.
 - **Build:** `scripts/build-lambdas.sh` (planned) creates artifacts without changing any AWS resource.
-  - It iterates over the explicit list of ten functions, never `backend/*/`.
+  - It iterates over the explicit list of eleven functions, never `backend/*/`.
   - It leaves out `__pycache__` and `tests/`.
   - It writes deterministic zips (sorted entries, fixed timestamps) that contain a `BUILD_INFO.json` with the git SHA and the sha256 of `shared/` and of the lock file.
   - It also writes a hash manifest, recorded by CI for each commit. The `publish` stage refuses to upload zips whose hashes differ from it.

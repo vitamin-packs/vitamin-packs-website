@@ -14,6 +14,7 @@ Two Cognito **user pools**, both on the **Lite** feature plan (nothing here requ
 | Sign-up | Self-service `SignUp` with email verification | **Disabled** (`AllowAdminCreateUserOnly = true`); users created by the AWS account owner only |
 | MFA | `OPTIONAL`, software token (TOTP) only | **`ON` (required)**, software token (TOTP) only |
 | Account recovery | Verified email | Verified email (TOTP still required at sign-in) |
+| Email change | Keeps the old email until the new one is verified (`attributes_require_verification_before_update = ["email"]`) | Operator only |
 | Groups | none | `Admins` |
 | App client | `storefront` | `admin` |
 | Access/ID token lifetime | 30 minutes | 30 minutes |
@@ -50,7 +51,7 @@ The HTTP API has two JWT authorizers, both with identity source `$request.header
 
 | Authorizer | Issuer | Audience | Routes |
 |---|---|---|---|
-| `customer-jwt` | Customer pool issuer | `[storefront_client_id]` | cart, checkout, PayPal capture, orders |
+| `customer-jwt` | Customer pool issuer | `[storefront_client_id]` | cart, checkout, PayPal capture, orders, account |
 | `admin-jwt` | Admin pool issuer | `[admin_client_id]` | `/admin/*` |
 
 Every protected route sets `authorizationScopes = ["aws.cognito.signin.user.admin"]`.
@@ -233,6 +234,40 @@ export async function disableTotp() {
 ```
 
 Admins cannot disable TOTP: the admin pool requires MFA.
+
+### Email change
+
+The customer pool's `user_attribute_update_settings` sets `attributes_require_verification_before_update = ["email"]`. The old address stays the sign-in and recovery email until the new one is confirmed. Confirm in dev that the Lite tier honors this setting.
+
+```javascript
+import { confirmUserAttribute, updateUserAttributes } from "aws-amplify/auth";
+
+export async function requestEmailChange(newEmail) {
+  const result = await updateUserAttributes({ userAttributes: { email: newEmail } });
+  return result.email.nextStep; // CONFIRM_ATTRIBUTE_WITH_CODE: prompt for the emailed code
+}
+
+export async function confirmEmailChange(code) {
+  await confirmUserAttribute({ userAttributeKey: "email", confirmationCode: code });
+  // Then GET /account/profile, which re-syncs the stored email mirror from Cognito.
+}
+```
+
+Cognito is the email authority. The profile's `email` is a mirror that only the `account` function writes, from a server-side `AdminGetUser` ([Account routes](backend-api.md#account-routes)).
+
+### Change password
+
+```javascript
+import { updatePassword } from "aws-amplify/auth";
+
+export async function changePassword(oldPassword, newPassword) {
+  await updatePassword({ oldPassword, newPassword });
+}
+```
+
+### Account deletion (storefront only)
+
+The storefront never calls Amplify `deleteUser`. It calls `POST /account/delete`, which removes the profile and cart and then deletes the Cognito user server-side, so the checks can't be skipped ([Account deletion](backend-api.md#account-deletion)). The route requires a sign-in within the last 10 minutes (`auth_time`). On 403 `reauth_required`, the storefront runs `startSignIn` again (password and any TOTP code) and retries. On success it runs `clearCognitoStorage()`.
 
 ### Access token for API calls, refresh, and expiry
 
@@ -441,10 +476,11 @@ def require_admin(event: dict) -> str:
 
 Rules:
 
+- **Account handler:** its role gets only `cognito-idp:AdminGetUser`, `AdminUserGlobalSignOut`, and `AdminDeleteUser` on the **customer** pool ARN. It uses the token's `username` claim, and only for the caller's own user.
 - **Admin handlers** call `require_admin(event)` before any other work. The admin function's role gets only `cognito-idp:AdminGetUser` and `cognito-idp:AdminListGroupsForUser` on the admin pool ARN (see [Backend API](backend-api.md#iam)). The live check adds two small Cognito calls per admin request; acceptable at single-staff-user volume. Never cache the result across requests.
 - **Customer handlers** call `require_customer_sub(event)` and derive every key from that `sub` (`CART#<sub>`, `USER#<sub>`, `GSI2PK=USER#<sub>`). Never accept a user ID from the path, query string, or body.
-- **Ownership:** order-scoped reads and actions (`GET /orders/{orderId}`, `POST /checkout/paypal/capture`) load the order header and return **404** when it is missing or its `user_sub` differs from the caller's `sub`. This avoids confirming that another customer's order exists.
-- **Email:** access tokens carry no email. Handlers that need it read the customer's stored profile or call Cognito server-side; never trust an email from the request body for authorization.
+- **Ownership:** order-scoped reads and actions (`GET /orders/{orderId}`, `POST /checkout/paypal/capture`, `POST /checkout/cancel`) load the order header and return **404** when it is missing or its `user_sub` differs from the caller's `sub`. This avoids confirming that another customer's order exists.
+- **Email:** access tokens carry no email. Handlers that need it read the profile's `email` mirror (`USER#<sub>` / `PROFILE`), which only the `account` function writes from Cognito. Checkout copies it onto the order as `contact_email`. Never accept an email from a request body.
 - **Fail closed:** a missing claim or unexpected format is a 403. Cognito being unreachable during an admin check is a 503, never an allow.
 - Log `sub`, route, and allow/deny decision. Never log tokens, the `Authorization` header, or full claim sets.
 
@@ -513,9 +549,11 @@ Run in dev against the deployed API with raw HTTP requests (no UI):
 - Every protected route returns **401** for no token, an expired token, a token from the other pool, and a token with the wrong `client_id`, and **403** for an ID token.
 - Every `/admin/*` route rejects a valid storefront access token and a valid admin-pool token for a user not in `Admins`.
 - An admin succeeds. After `admin-remove-user-from-group`, the **next** admin request returns 403 without waiting for token expiry.
-- Customer A cannot read customer B's order or capture B's PayPal order (404). A's `PUT /cart` only affects `CART#<sub_A>`.
+- Customer A cannot read customer B's order, capture B's PayPal order, or cancel B's checkout (404). A's `PUT /cart` only affects `CART#<sub_A>`.
 - Admin pool rejects `SignUp` via the admin client ID. Admin sign-in without TOTP set up forces TOTP setup.
 - A customer with TOTP enrolled is prompted for a code; one without is not.
+- An email change leaves the old email as the sign-in address until the code is confirmed. The next `GET /account/profile` updates the mirror.
+- `POST /account/delete` returns 403 `reauth_required` when `auth_time` is older than 10 minutes. After a deletion, the deleted user's still-valid access token gets 404 from profile writes and 409 `address_required` from checkout, and refresh fails.
 - Sign-out clears browser storage. Global sign-out prevents refresh.
 - `parse_groups` unit tests cover: a list; a JSON array string; `"[Admins Other]"`; `"Admins,Other"`; empty/`None`/`"[]"`; and near-misses `"NotAdmins"` and `"Admins2"`. The captured real event fixture must also pass.
 

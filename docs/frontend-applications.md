@@ -83,7 +83,7 @@ For dynamic states, expose the state semantically: use `aria-live` for important
 - Keep network calls in a small API client layer so authentication headers, JSON parsing, error handling, and abort behavior are consistent.
 - Abort stale requests where a view can unmount or a newer search supersedes an older one.
 - Handle loading, empty, success, and error states for every API-backed view.
-- Do not log passwords, access tokens, payment details, or full customer records.
+- Do not log passwords, access tokens, payment details, or full customer records. Never send profile fields (names, addresses, emails, phones) to logs, analytics, or error reports.
 - Keep functions focused and names descriptive; do not use one-letter variables except for conventional callback arguments where the meaning is unambiguous.
 
 Example API helper (protected calls go through `authorizedFetch` from [Cognito authentication](cognito-authentication.md#access-token-for-api-calls-refresh-and-expiry), which attaches the Cognito **access token**, refreshes on expiry, and retries a 401 exactly once):
@@ -137,6 +137,7 @@ Preventing script injection is the primary control:
   - If embedded payment UI (Stripe Elements/Payment Element, PayPal Smart Buttons) is adopted later, those SDKs load provider scripts and frames and call provider APIs from the page. Update the CSP with the origins from each provider's published CSP guidance, together with the payment doc.
 - The PayPal return URL carries PayPal's `token` query parameter, a PayPal order ID, not a Cognito token.
   - Read it, then remove it from the address bar with `history.replaceState` before calling `POST /checkout/paypal/capture`.
+  - PayPal's `cancel_url` return carries the same `token`. Strip it the same way before calling `POST /checkout/cancel`.
   - A same-tab redirect to Stripe/PayPal and back keeps `sessionStorage`, so the default session survives checkout. `fetchAuthSession()` refreshes an access token that expired while the customer was on the provider's page.
 - Never put Cognito tokens in URLs, logs, analytics, or error reports. The admin app loads no third-party scripts. Audit dependencies (`npm audit` or equivalent) before each deployment.
 
@@ -148,8 +149,21 @@ The storefront owns public catalog browsing, product details, kit bills of mater
 
 - The login form offers an unticked "Keep me signed in" option that selects `localStorage` instead of `sessionStorage`.
 - Account settings offer optional TOTP enrollment and removal.
+- Account settings also maintain the customer profile ([Account routes](backend-api.md#account-routes), [ADR-024](architecture-decisions.md#adr-024-customer-profile-and-account-self-service)):
+  - **Contact:** display name, phone, and marketing opt-in (`PUT /account/profile`).
+  - **Email:** change and verify through Cognito ([Email change](cognito-authentication.md#email-change)), then re-read the profile.
+  - **Password:** change through Amplify `updatePassword`.
+  - **Addresses:** list, add, edit, delete, and set the default, up to 5. Show a 409 `address_limit` as a clear message.
+  - **Delete account:** a typed "DELETE" confirmation, a statement that past orders are kept, and the re-authentication step on 403 `reauth_required`. A 409 `checkout_open` points the customer to cancel or finish the open checkout.
+  - Every edit sends the `version` it read. On 409 `version_conflict`, re-read the profile and show the fresh data before the customer retries.
+- Checkout shows an address picker that defaults to the profile's default address, with an inline "add address" form (`POST /account/addresses`, then use the returned `addressId`). Checkout sends that `addressId`. On 409 `address_required`, return to the picker.
 - Sign-out offers "Sign out of all devices" (global sign-out).
 - Sign-in handles every challenge step in [Cognito authentication](cognito-authentication.md#sign-in-and-challenge-handling), including a TOTP code prompt for enrolled customers.
+
+Checkout cancel ([Customer Cancel](payment-processing.md#customer-cancel)):
+- The Stripe and PayPal `cancel_url` page reads the open order ID from `GET /cart` (`checkout_order_id`), calls `POST /checkout/cancel` once, and then shows the re-read, unlocked cart.
+- While `GET /cart` returns a `checkout_order_id`, the cart page shows the open checkout with "Resume checkout" (the stored provider URL) and "Cancel checkout" (the same route).
+- Responses: 200 → show the cart. 409 `processing` → poll `GET /orders/{orderId}` as the success page does. 409 `checkout_starting` → wait briefly and retry. 409 with a paid status → show the order. 503 → offer a retry.
 
 Kit-only components must not be presented as standalone products. The API is authoritative and omits them from catalog results; the UI should also treat `sellable_individually: false` items as BOM components rather than purchasable catalog products.
 
