@@ -393,7 +393,7 @@ Integration token overlap procedure:
 
 ## Terraform Modules and Prerequisites
 
-Implement these reusable modules in `infra/modules` and compose them through an `inventree` orchestrator module in `infra/dev`, then `infra/prod`. Keep the `project`, `environment`, and `tags` conventions, and connect modules through outputs.
+Implement these reusable modules in `infra/modules` and compose them through an `inventree` orchestrator module in `infra/dev`, then `infra/prod`. These modules alone make up each environment's first, InvenTree foundation release. Application resources follow in a later release, after InvenTree setup ([ADR-026](architecture-decisions.md#adr-026-inventree-first-location-ids-by-second-apply)). Keep the `project`, `environment`, and `tags` conventions, and connect modules through outputs.
 
 | Module | Key outputs |
 |---|---|
@@ -522,7 +522,10 @@ Proposed on 2026-09-28. InvenTree facts below were verified against the 1.5.6 so
 
 - `status=10` (OK) only *(default)*. Quarantined (75), damaged, returned, attention, lost, destroyed, and rejected stock is never sellable.
 - `in_stock=true`: quantity above 0 and not assigned to a customer, a sales order, a parent item, a build, or consumption (`StockItem.IN_STOCK_FILTER`).
-- Location in an explicit allowlist of InvenTree location IDs, queried with `cascade=false`. The allowlist is a per-environment Terraform variable passed to the inventory Lambdas. Its hash is `eligibility_version`. Never include the `Web orders – committed` or `Returns – inspection` locations. Exclude `external` locations.
+- Location in an explicit allowlist of InvenTree location IDs, queried with `cascade=false`, so every sellable location is listed individually. Its hash is `eligibility_version`. Never include the `Web orders – committed` or `Returns – inspection` locations, or any structural or external location.
+  - The IDs exist only after InvenTree is installed and staff create the locations. They are committed per environment in `infra/<env>/inventree-locations.tf` (`eligible_ids`, `committed_id`, `returns_id`) and set by the application release that follows InvenTree setup ([ADR-026](architecture-decisions.md#adr-026-inventree-first-location-ids-by-second-apply)). A Terraform precondition requires that `committed_id` and `returns_id` are distinct and not in `eligible_ids`.
+  - An empty list or a null ID disables inventory. Sync writes no projections, records `LOCATIONS_UNCONFIGURED` in the sync state, and alarms (a warning in dev, a page in prod). Checkout returns 503 because no `STOCK#` item exists.
+  - Each sync run validates the IDs before reading stock (`GET /api/stock/location/<id>/`). Every eligible ID must exist and be neither structural nor external. The committed and returns IDs must exist and must not be external. If any check fails, the run writes nothing and raises the same alarm, and checkout fails closed once projections pass the freshness limit.
 - `expired=false`, when stock expiry is enabled.
 - Subtract `allocated`, the build, sales, and transfer-order allocations made inside InvenTree, so stock the owner earmarks there isn't sold on the web.
 
@@ -627,8 +630,8 @@ Only projection arithmetic (the first two rows) is auto-repaired. Physical stock
 The defaults above let implementation proceed in dev. These need owner confirmation before prod:
 
 1. Fulfillment mode per kit: finished kits (`STOCKED_PART`) or component-derived (`COMPONENTS`).
-2. The eligible location IDs per environment, and whether any non-OK status (for example ATTENTION) is sellable. Default: OK only.
-3. Two-step movement (commit at payment, remove at shipping) versus removal at payment. Also the names and IDs of the committed and returns locations.
+2. Location policy: which kinds of locations hold sellable stock, and whether any non-OK status (for example ATTENTION) is sellable. Default: OK only. The location IDs themselves are post-install configuration, not an owner decision ([ADR-026](architecture-decisions.md#adr-026-inventree-first-location-ids-by-second-apply)).
+3. Two-step movement (commit at payment, remove at shipping) versus removal at payment. Also the names of the committed and returns locations; their IDs are recorded after install, as in item 2.
 4. Checkout hold duration. **Resolved 2026-09-28** ([Payment processing](payment-processing.md#inventory)):
    - a 31-minute Stripe session and a 35-minute reservation for both providers;
    - Stripe offers card and wallet methods only;

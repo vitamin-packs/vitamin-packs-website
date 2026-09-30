@@ -197,6 +197,8 @@ A flagged dev plan needs an extra confirmation. A prod plan records its flags in
 
 ## Sequencing
 
+**First releases per environment.** Each environment starts with the InvenTree foundation release. Staff then set up InvenTree and commit the location IDs, and the application release follows ([ADR-026](architecture-decisions.md#adr-026-inventree-first-location-ids-by-second-apply), [Delivery plan](development-and-deployment-plan.md#phase-2-inventree-foundation)).
+
 Each release runs, in order:
 1. Publish or promote artifacts. They are inert until an apply references them.
 2. Plan, review, approve (prod only), then apply. This one apply changes infrastructure and Lambda code together.

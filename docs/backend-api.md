@@ -81,10 +81,10 @@ Every protected route sets `authorizationScopes = ["aws.cognito.signin.user.admi
 | POST | `/account/addresses` | `account` | `customer-jwt` |
 | PUT, DELETE | `/account/addresses/{addressId}` | `account` | `customer-jwt` |
 | POST | `/account/delete` | `account` | `customer-jwt` + recent sign-in (`auth_time`) check in-handler ([Account deletion](#account-deletion)) |
-| GET, POST | `/admin/products` | `admin` | `admin-jwt` + `require_admin` (claim + live Cognito check) in-handler, as for every `/admin/...` route |
+| GET, POST | `/admin/products` | `admin` | `admin-jwt` + `require_admin` (claim + live Cognito check) in-handler, as for every `/admin/...` route. GET takes `?cursor=` and pages a filtered Scan ([Admin listing and reporting](dynamodb-data-model.md#admin-listing-and-reporting)) |
 | GET, PUT | `/admin/products/{sku}` | `admin` | admin |
 | PUT | `/admin/products/{sku}/mapping` | `admin` | admin. Sets `mapping_status = PENDING` and requests a targeted sync, which validates the mapping |
-| GET | `/admin/orders` | `admin` | admin |
+| GET | `/admin/orders` | `admin` | admin. `?status=` (one order status, required), `?queue=ready_to_ship\|needs_attention` (optional, only with `status=paid`), `?cursor=`. Queries GSI1 `ORDERS#<status>`, newest first ([Admin order queues](dynamodb-data-model.md#admin-order-queues)) |
 | GET | `/admin/orders/{orderId}` | `admin` | admin |
 | POST | `/admin/orders/{orderId}/ship` | `admin` | admin. Writes a SHIP job and returns 202 |
 | POST | `/admin/inventory/adjustments` | `admin` | admin. Writes an ADJUST job and returns 202 `{adjustmentId}` |
@@ -156,7 +156,7 @@ Do not place RDS in Lambda subnets or allow Lambda security groups direct databa
 
 - **Configuration** (Lambda environment variables from Terraform outputs):
   - `INVENTREE_BASE_URL` (`https://` + `inventree_fqdn`) and `INVENTREE_TOKEN_SECRET_ARN`;
-  - `ELIGIBLE_LOCATION_IDS`, `COMMITTED_LOCATION_ID`, `RETURNS_LOCATION_ID`;
+  - `ELIGIBLE_LOCATION_IDS`, `COMMITTED_LOCATION_ID`, `RETURNS_LOCATION_ID`, from the root's committed `infra/<env>/inventree-locations.tf` locals. An empty list or a missing ID puts sync in `LOCATIONS_UNCONFIGURED` and fails closed ([Eligible stock](inventree-integration.md#eligible-stock), [ADR-026](architecture-decisions.md#adr-026-inventree-first-location-ids-by-second-apply));
   - `APP_ENV`.
   - At cold start the client fails fast if the hostname does not match `APP_ENV`.
 - **Authentication:** `Authorization: Token <token>`, using the integration token from Secrets Manager. The token is cached for 5 minutes; on HTTP 401 the client re-reads it once and retries once, which supports the [overlap rotation](inventree-integration.md#secret-rotation). The integration user's InvenTree roles bound what the token can do, and InvenTree answers 403 outside them ([InvenTree API](https://docs.inventree.org/en/stable/api/)).
@@ -271,7 +271,7 @@ DynamoDB transactions have no IAM action of their own. `TransactWriteItems` is a
 | `checkout` | read + Tx ([reservation](dynamodb-data-model.md#checkout-reservation-pseudocode), provider reference, PayPal capture claim, [customer-cancel release](payment-processing.md#customer-cancel) of the reservation, order, cart, and projections) | – (it never marks an order paid) | Stripe, PayPal | – |
 | `orders` | read on the table and the index its queries use | – | – | – |
 | `account` | read; `PutItem`, `UpdateItem`, `DeleteItem`, `ConditionCheckItem` on the table (the deletion transaction touches only the caller's profile and cart); `Query` on `index/GSI2` | – | – | `cognito-idp:AdminGetUser`, `cognito-idp:AdminUserGlobalSignOut`, and `cognito-idp:AdminDeleteUser` on the **customer** pool ARN only |
-| `admin` | read + Tx; `Query` on `index/GSI2` | `SendMessage` | – | `cognito-idp:AdminGetUser` and `cognito-idp:AdminListGroupsForUser` on the **admin** pool ARN only (no Cognito writes); `lambda:InvokeFunction` on the `inventory-sync` ARN |
+| `admin` | read + Tx; `Query` on `index/GSI1` (order queues) and `index/GSI2`; `Scan` on the table ARN only (product list) | `SendMessage` | – | `cognito-idp:AdminGetUser` and `cognito-idp:AdminListGroupsForUser` on the **admin** pool ARN only (no Cognito writes); `lambda:InvokeFunction` on the `inventory-sync` ARN |
 | `webhooks-stripe` | read + Tx (orders, refunds, reservations, projections, jobs, `PAYEVT#` ledger) | `SendMessage` | Stripe only | – |
 | `webhooks-paypal` | as `webhooks-stripe` | `SendMessage` | PayPal only | – |
 | `sweeper` | read + Tx; `Query` on `index/GSI2` (`INVHOLD`, `PAYEVT#OPEN`, `INVJOB#OPEN`) | `SendMessage` | Stripe, PayPal | – |

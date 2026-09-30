@@ -47,7 +47,7 @@ Each gate's status is recorded once, in the [Architecture decision register](arc
 | 3 | Connectivity proofs: private DNS, security-group-restricted Lambda-to-host and host-to-RDS paths, InvenTree UI reachable only from the jumpbox, no public InvenTree endpoint | Pending the dev acceptance tests | – | [InvenTree acceptance tests](inventree-integration.md#acceptance-tests) |
 | 4 | Stock model: kit modes, eligibility, units, mappings, BOM rules, no double counting | Proposed; owner decisions open | ADR-011, OPEN-01 | [Inventory data contract](inventree-integration.md#inventory-data-contract) |
 | 5 | Order, payment, and inventory lifecycle; provider libraries; the event ledger | Proposed; customer cancel and dashboard-only refunds accepted | ADR-012, ADR-022, ADR-023 | [Payment processing](payment-processing.md#order-payment-and-inventory-states) |
-| 6 | DynamoDB keys, indexes, cart, reservations, jobs, ledger, timestamps | Proposed | ADR-011, ADR-018, ADR-019 | [DynamoDB data model](dynamodb-data-model.md) |
+| 6 | DynamoDB keys, indexes, cart, reservations, jobs, ledger, timestamps, admin listing | Proposed | ADR-011, ADR-018, ADR-019, ADR-025 | [DynamoDB data model](dynamodb-data-model.md) |
 | 7 | Release workflow and approval gates | Accepted | ADR-013 | [Infrastructure development workflow](infrastructure-development.md#release-workflow) |
 
 Rules:
@@ -95,31 +95,22 @@ Rules:
    CI never plans, publishes, or applies ([Approval gates](infrastructure-development.md#approval-gates)).
 4. Document prerequisites, local setup, environment configuration, and the non-production testing process in the README after a runnable vertical slice exists.
 
-## Phase 2: Dev Infrastructure
+## Phase 2: InvenTree Foundation
 
 Implement reusable modules in `infra/modules` and compose them first in `infra/dev`. Follow [Terraform conventions](terraform-conventions.md) and [Infrastructure development workflow](infrastructure-development.md).
 
-Provision in dependency order:
+This is the first release in each environment. It contains InvenTree and its network only, with no application resources ([ADR-026](architecture-decisions.md#adr-026-inventree-first-location-ids-by-second-apply)). Provision in dependency order:
 
 1. State/bootstrap and environment foundations; establish resource tags and outputs.
-2. DNS and certificates, including the CloudFront certificate in `us-east-1` where required.
-3. Cognito customer and admin user pools (the customer pool keeps the old email until a new one is verified: `attributes_require_verification_before_update = ["email"]`), storefront/admin app clients, the admin pool's Admins group, and outputs consumed by API/frontend configuration. Admin users are created by the AWS account owner via CLI, never by Terraform.
-4. DynamoDB table and required indexes, with point-in-time recovery/backups and narrowly scoped Lambda IAM policies.
-5. Private S3 buckets, CloudFront distributions/OAC, SPA fallback, TLS, logging, and cache invalidation strategy for both apps.
-6. API Gateway HTTP API with explicit routes (no `ANY` or `{proxy+}` route), JWT authorizers, and CORS restricted to the environment's CloudFront origins. The eleven Lambda functions each get their own role from the [IAM matrix](backend-api.md#iam), with zips from the artifact bucket (no layer) and environment-scoped configuration. Attach only `inventory-sync` and `inventory-jobs` to the VPC.
-7. Secrets Manager secret containers and scoped access policies. Populate secret values with the out-of-band runbook in [Secrets](infrastructure-development.md#secrets), never through Terraform. Use sandbox credentials in dev.
-8. InvenTree networking, NAT instance, private EC2 host, jumpbox, isolated RDS, S3 media and artifacts, private DNS and Let's Encrypt TLS, SES identity, monitoring, backups, restore capability, and the dev scheduler. Use the modules listed in [InvenTree integration](inventree-integration.md#terraform-modules-and-prerequisites).
+2. InvenTree networking, NAT instance, private EC2 host, jumpbox, isolated RDS, S3 media and artifacts, ECR, private DNS and Let's Encrypt TLS, SES identity, monitoring, backups, restore capability, and the dev scheduler. Use the modules listed in [InvenTree integration](inventree-integration.md#terraform-modules-and-prerequisites).
+   - Create all InvenTree security groups now, including `inv-lambda`. The inventory Lambdas attach to it in Phase 4.
    - Both environments run a single node with single-AZ RDS. This is an accepted tradeoff: prod hosting stays under $50/month with a recovery objective measured in hours.
    - Dev runs on demand and is stopped nightly.
-9. Inventory and maintenance triggers, per [Functions and triggers](backend-api.md#functions-and-triggers):
-   - the `inventory-jobs` SQS queue and DLQ (`maxReceiveCount` 5, visibility timeout 360 s) and its event source mapping (batch size 1, partial batch responses, maximum concurrency 2);
-   - EventBridge Scheduler schedules for `sweeper` (every 5 minutes) and `inventory-sync` (a 5-minute full sync in prod only, and daily reconciliation);
-   - a Scheduler role limited to invoking those two functions;
-   - alarms and operational dashboards.
+3. The InvenTree Secrets Manager secret containers (`inventree_app`, integration token, jumpbox login) with scoped access policies. Populate their values with the out-of-band runbook in [Secrets](infrastructure-development.md#secrets), never through Terraform.
 
 Use outputs to connect modules rather than duplicating identifiers. Review every dev plan for unexpected replacements, public exposure, IAM overreach, secret values, and state changes. Run formatting/validation and plan review; only apply when an operator explicitly authorizes it.
 
-## Phase 3: InvenTree Dev Service
+## Phase 3: InvenTree Dev Service and Setup
 
 1. Pin InvenTree 1.5.6 by immutable image digest. The operator's `deploy-dev.sh publish` stage, run outside the VPC, mirrors it into tag-immutable ECR together with the custom Caddy build that includes the `caddy-dns/route53` module. CI has no AWS credentials. Do not use mutable `latest`/`stable` or an unreviewed floating tag.
 2. Deploy the gunicorn server, django-q2 worker, and Caddy containers on the private EC2 host.
@@ -135,10 +126,30 @@ Use outputs to connect modules rather than duplicating identifiers. Review every
    - Disable exchange-rate updates and update checks: `CURRENCY_UPDATE_INTERVAL=0`, `INVENTREE_UPDATE_CHECK_INTERVAL=0`.
    - Configure SES email through Anymail with the instance role.
    - Create a least-privilege integration identity and rotate its token by the overlap procedure in [Secret rotation](inventree-integration.md#secret-rotation).
-6. Validate version-specific InvenTree APIs/schema against pinned documentation. Build explicit SKU-to-part/BOM mappings with unit tests and fail closed on missing or invalid mappings.
-7. Pass the [InvenTree acceptance tests](inventree-integration.md#acceptance-tests) before connecting checkout, following the README steps for staff access. They cover private DNS/TLS, Lambda-to-host connectivity, jumpbox access and file transfer, worker processing, S3 persistence, email, RDS backup/restore, health checks, and restricted staff/API access.
+6. Create the stock location tree, including the committed and returns locations, and the parts and BOMs the catalog will sell. Follow the location policy in [Eligible stock](inventree-integration.md#eligible-stock): list every sellable location individually, and use no structural or external location as a sellable one.
+   - Commit the resulting IDs to `infra/dev/inventree-locations.tf` (`eligible_ids`, `committed_id`, `returns_id`; [ADR-026](architecture-decisions.md#adr-026-inventree-first-location-ids-by-second-apply)).
+   - Record the part IDs in the dev part map used by the seed script ([Dev seed data](dynamodb-data-model.md#dev-seed-data)).
+7. Validate version-specific InvenTree APIs/schema against pinned documentation. Build explicit SKU-to-part/BOM mappings with unit tests and fail closed on missing or invalid mappings.
+8. Pass the [InvenTree acceptance tests](inventree-integration.md#acceptance-tests) before connecting checkout, following the README steps for staff access. The Lambda-to-host checks run after the application release in Phase 4, because the inventory Lambdas don't exist before then. They cover private DNS/TLS, Lambda-to-host connectivity, jumpbox access and file transfer, worker processing, S3 persistence, email, RDS backup/restore, health checks, and restricted staff/API access.
 
-## Phase 4: Backend and Inventory Vertical Slice
+## Phase 4: Application Infrastructure
+
+The second release ([ADR-026](architecture-decisions.md#adr-026-inventree-first-location-ids-by-second-apply)). Run it after Phase 3, once the location IDs are committed in `infra/dev/inventree-locations.tf`. If the IDs are still empty, the release still applies, but inventory stays disabled (`LOCATIONS_UNCONFIGURED`) and checkout returns 503. The review rules from Phase 2 apply. Provision in dependency order:
+
+1. DNS and certificates for the two sites, including the CloudFront certificate in `us-east-1`.
+2. Cognito customer and admin user pools (the customer pool keeps the old email until a new one is verified: `attributes_require_verification_before_update = ["email"]`), storefront/admin app clients, the admin pool's Admins group, and outputs consumed by API/frontend configuration. Admin users are created by the AWS account owner via CLI, never by Terraform.
+3. DynamoDB table and required indexes, with point-in-time recovery/backups and narrowly scoped Lambda IAM policies.
+4. Private S3 buckets, CloudFront distributions/OAC, SPA fallback, TLS, logging, and cache invalidation strategy for both apps.
+5. The Stripe and PayPal secret containers and scoped access policies, populated out of band by the [Secrets](infrastructure-development.md#secrets) runbook. Use sandbox credentials in dev.
+6. API Gateway HTTP API with explicit routes (no `ANY` or `{proxy+}` route), JWT authorizers, and CORS restricted to the environment's CloudFront origins. The eleven Lambda functions each get their own role from the [IAM matrix](backend-api.md#iam), with zips from the artifact bucket (no layer) and environment-scoped configuration. Attach only `inventory-sync` and `inventory-jobs` to the VPC. They take the location IDs from `infra/dev/inventree-locations.tf`.
+7. Inventory and maintenance triggers, per [Functions and triggers](backend-api.md#functions-and-triggers):
+   - the `inventory-jobs` SQS queue and DLQ (`maxReceiveCount` 5, visibility timeout 360 s) and its event source mapping (batch size 1, partial batch responses, maximum concurrency 2);
+   - EventBridge Scheduler schedules for `sweeper` (every 5 minutes) and `inventory-sync` (a 5-minute full sync in prod only, and daily reconciliation);
+   - a Scheduler role limited to invoking those two functions;
+   - alarms and operational dashboards.
+8. Run the Lambda-to-host [InvenTree acceptance tests](inventree-integration.md#acceptance-tests) deferred from Phase 3.
+
+## Phase 5: Backend and Inventory Vertical Slice
 
 Build API and data functionality in small, deployable increments:
 
@@ -154,7 +165,7 @@ Build API and data functionality in small, deployable increments:
 
 Treat any uncertainty about external API behavior as a verification task against the pinned InvenTree/provider docs, not an assumed request/response contract.
 
-## Phase 5: Storefront and Admin Applications
+## Phase 6: Storefront and Admin Applications
 
 1. Build independent React + Vite applications with isolated package/build/test configuration. Do not import application source between them.
 2. Inject environment-specific public configuration at build time: API URL, Cognito User Pool ID and the respective app client ID. These identifiers are public; credentials and provider secrets are not.
@@ -164,7 +175,7 @@ Treat any uncertainty about external API behavior as a verification task against
 6. Use the API Gateway only for browser-to-backend calls. Keep API/network concerns in a small client layer; validate response shapes and render untrusted text safely.
 7. Build static assets only. Verify SPA routing, content security/cache behavior as configured, keyboard and screen-reader states, mobile/desktop layouts, reduced motion, and absence of secrets in generated bundles.
 
-## Phase 6: Integrated Dev Verification
+## Phase 7: Integrated Dev Verification
 
 Run the following checks before production promotion:
 
@@ -198,9 +209,10 @@ Run the following checks before production promotion:
 
 Record test evidence and unresolved limitations. Do not use production customer, payment, inventory, or secret data in dev tests.
 
-## Phase 7: Production Promotion and Operations
+## Phase 8: Production Promotion and Operations
 
 1. Freeze and review the tested dev change set. Promote the same intended Terraform/module/application configuration to `infra/prod`, changing only reviewed environment-specific values and secrets.
+   - Prod follows the same first-release order as dev: the InvenTree foundation release, then InvenTree setup with the prod location IDs committed in `infra/prod/inventree-locations.tf`, then the application release ([ADR-026](architecture-decisions.md#adr-026-inventree-first-location-ids-by-second-apply)). Prod IDs differ from dev's and are never copied from them.
 2. Use separate production credentials and payment-provider live secrets. Verify DNS, certificates, CloudFront origins, Cognito clients, API authorization, database/network restrictions, monitoring, backup retention, and restore readiness before release. InvenTree go-live gates:
    - The t4g EC2 Instance Savings Plan is purchased.
    - The SNS alert subscription is confirmed.

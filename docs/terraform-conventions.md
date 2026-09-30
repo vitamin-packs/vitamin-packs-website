@@ -8,6 +8,7 @@
 - Keep provider constraints and `.terraform.lock.hcl` files consistent across root configurations. Every root sets `required_version = "~> 1.16.0"` and pins the provider major version. Commit lock files with hashes for every operator and CI platform (`terraform providers lock -platform=linux_amd64 …`).
 - Every root except `bootstrap` uses the S3 backend with `use_lockfile = true` and its own key (`dev/`, `prod/`). See [State, plans and artifacts](infrastructure-development.md#state-plans-and-artifacts).
 - Never hardcode AWS account IDs. Take them as per-environment inputs so prod can move to another account.
+- Put non-secret, environment-specific configuration that needs review, such as InvenTree location IDs, in a committed `locals` file in the root (`infra/<env>/inventree-locations.tf`), never in `*.tfvars` ([ADR-026](architecture-decisions.md#adr-026-inventree-first-location-ids-by-second-apply)).
 - Application data stores timestamps as fixed-format UTC ISO 8601 strings, except the DynamoDB `ttl` attribute ([ADR-018](architecture-decisions.md#adr-018-timestamp-format)). Keep Terraform-produced configuration, such as schedule expressions, consistent with that.
 
 ## Safety

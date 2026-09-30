@@ -20,7 +20,7 @@ Exceptions:
 | Entity | PK | SK | Notes |
 |---|---|---|---|
 | Product | `PRODUCT#<sku>` | `PRODUCT#<sku>` | Kits and individual components share this shape. |
-| Category | `CATEGORY#<tag>` | `METADATA` | Display label/description/sort order for a browsable tag. |
+| Category | `CATEGORY#<tag>` | `METADATA` | Display label/description/sort order for a browsable tag. Carries `GSI1PK = CATEGORIES`, `GSI1SK = SORT#<sort_order zero-padded to 4>#<tag>` so the category list is one `Query`. |
 | Order header | `ORDER#<orderId>` | `ORDER#<orderId>` | One per order. Stores `user_sub` (the owning customer's Cognito `sub`) for ownership checks. |
 | Order line item | `ORDER#<orderId>` | `ORDER#<orderId>#ITEM#<sku>` | One per SKU in the order; `Query` on `PK` returns the header and all line items together. |
 | User profile | `USER#<sub>` | `PROFILE` | `<sub>` is the Cognito user pool subject claim. Contact details, the Cognito email mirror, and the address book. See [Profile attributes](#profile-attributes). |
@@ -31,7 +31,7 @@ Exceptions:
 | Order reservation | `ORDER#<orderId>` | `RESERVATION` | One per order: every part quantity the order holds against the projection. |
 | Inventory job | `ORDER#<orderId>` | `INVJOB#<kind>` | One per order per movement kind (`COMMIT`, `UNCOMMIT`, `SHIP`). Durable, idempotent InvenTree stock movement. |
 | Admin stock adjustment job | `ADJ#<adjustmentId>` | `INVJOB#ADJUST` | One per admin stock adjustment. Same job lifecycle; see [Inventory job](#inventory-job-orderorderid--invjobkind). |
-| Inventory sync state | `SYNC#inventory` | `STATE` | Last start, last success, and error counts for the sync. |
+| Inventory sync state | `SYNC#inventory` | `STATE` | Last start, last success, error counts, and `status` (`OK`, `ERROR`, or `LOCATIONS_UNCONFIGURED`; see [Eligible stock](inventree-integration.md#eligible-stock)). |
 
 `<partId>` is the InvenTree part primary key in that environment. Dev and prod InvenTree have different keys, so part mappings are environment data and are never promoted from dev to prod.
 
@@ -150,7 +150,10 @@ ship_to             map     (copy of the chosen profile Address without label, c
 ship_to_address_id  string  (the profile addressId it was copied from; display only, never re-read)
 contact_email       string  (the profile email mirror at checkout)
 GSI2PK / GSI2SK     "USER#<sub>" / "ORDER#<created_at>#<orderId>"
+GSI1PK / GSI1SK     "ORDERS#<status>" / "ORDER#<created_at>#<orderId>"   # admin order queues; see GSI1
 ```
+
+`GSI1PK` always equals `ORDERS#` + the current `status`. Every write that sets `status`, whether the checkout `Put` or a conditional transition update, sets `GSI1PK` in the same expression. It is never a separate action, so no transaction budget changes. `GSI1SK` is written once at checkout.
 
 Only the payment-event processor writes `status` payment transitions, `payment_ref`, `paid_at`, `refunded_minor`, `dispute_state`, and `payment_exception` (see [Payment processing](payment-processing.md#order-payment-and-inventory-states)). The admin fulfillment gate reads `status`, `inventory_state`, `dispute_state`, and `payment_exception`.
 
@@ -274,7 +277,17 @@ Do not use TTL to expire reservations. TTL deletes expired items "typically with
 
 ## Global Secondary Indexes
 
-### GSI1 — catalog browsing by category/tag, sorted by price
+### GSI1 — catalog browsing and admin order queues
+
+GSI1 carries three sparse key families. None collides with another:
+
+| GSI1PK | GSI1SK | On | Used by |
+|---|---|---|---|
+| `CATEGORY#<tag>` | `PRICE#<price>#SKU#<sku>` | sellable products | category browsing, sorted by price |
+| `CATEGORIES` | `SORT#<sort_order>#<tag>` | category items | the category list, and `GET /products` |
+| `ORDERS#<status>` | `ORDER#<created_at>#<orderId>` | order headers | admin order lists and work queues |
+
+#### Catalog
 
 - `GSI1PK = CATEGORY#<tag>`
 - `GSI1SK = PRICE#<price>#SKU#<sku>`
@@ -282,6 +295,20 @@ Do not use TTL to expire reservations. TTL deletes expired items "typically with
 Only set `GSI1PK`/`GSI1SK` on a product item when `sellable_individually = true`. DynamoDB GSIs are sparse: an item that omits the GSI's key attributes simply does not appear in that index. Kit-only components therefore never show up in category browsing, while remaining fully reachable via `GetItem` on `PK`/`SK` for BOM lookups.
 
 The current design supports one primary `category_tag` per product. If a product needs to appear under multiple tags later, add extra `CATEGORY#<tag>` marker items with the same `GSI1PK`/`GSI1SK` shape that point back to the product's `PK`/`SK` — don't duplicate the full product record.
+
+`GET /products` (all sellable products) queries `GSI1PK = CATEGORIES`, then queries each `CATEGORY#<tag>` partition. Because every product has exactly one primary tag, the union has no duplicates. The response is public and cacheable, so serve it behind CloudFront caching.
+
+#### Admin order queues
+
+- `GSI1PK = ORDERS#<status>`
+- `GSI1SK = ORDER#<created_at>#<orderId>`
+
+Set on order header items only, and moved with every `status` change (see [Order header attributes](#order-header-attributes)). A `Query` on one status, newest first, gives the admin order list. The work queues are status partitions narrowed by a filter on the header:
+- **Ready to ship:** `ORDERS#paid`, filtered on `inventory_state = committed`, `dispute_state` not `open`, and no `payment_exception` (the row-14 guard; the ship route re-checks it with a consistent read).
+- **Needs attention:** `ORDERS#paid`, filtered on `inventory_state = needs_attention` or `attribute_exists(payment_exception)`.
+- **Open checkouts:** `ORDERS#pending` and `ORDERS#payment_pending`.
+
+Moving an item between partitions is one GSI delete and one put, both charged as GSI writes. GSI results are eventually consistent, so an admin action re-reads the header with `ConsistentRead=True` before acting. At this order volume a single partition per status is fine. The same 1,000-writes-per-second note as GSI2 applies.
 
 ### GSI2 — a user's order history
 
@@ -312,6 +339,10 @@ Order volume is small, so a single partition per key is acceptable. Revisit if h
 |---|---|
 | Get a product by SKU | `GetItem` on `PK=SK=PRODUCT#<sku>` |
 | Browse a category, sorted by price | `Query` on `GSI1` with `GSI1PK=CATEGORY#<tag>` |
+| List categories | `Query` on `GSI1` with `GSI1PK=CATEGORIES` |
+| List all sellable products (`GET /products`) | list categories, then `Query` each `GSI1PK=CATEGORY#<tag>` |
+| List all products, including kit-only components (admin) | paginated `Scan` with `FilterExpression begins_with(PK, "PRODUCT#")`; see [Admin listing and reporting](#admin-listing-and-reporting) |
+| Admin order list / work queue by status | `Query` on `GSI1` with `GSI1PK=ORDERS#<status>`, `ScanIndexForward=False`, plus the queue filter |
 | Get an order and its line items | `Query` on `PK=ORDER#<orderId>` |
 | List a user's orders | `Query` on `GSI2` with `GSI2PK=USER#<sub>` |
 | Get or update a cart | `GetItem`/`PutItem` on `PK=SK=CART#<sub>` |
@@ -341,9 +372,23 @@ Order volume is small, so a single partition per key is acceptable. Revisit if h
 
 That is `3 + 2L + P` actions. The profile read and the `ship_to` snapshot add no action: the order holds a copy, so a concurrent profile edit is harmless. Enforce **L ≤ 10 lines and P ≤ 75 distinct parts** (at most 98 actions). Reject larger carts with 400 before writing. Adjust these limits only while keeping the total at 100 or less.
 
+## Admin listing and reporting
+
+DynamoDB stays the only application database ([ADR-025](architecture-decisions.md#adr-025-dynamodb-remains-the-application-database)). The admin app's list and report needs are met like this:
+
+- **Orders:** the `ORDERS#<status>` partitions on GSI1 (see [Admin order queues](#admin-order-queues)), paginated with `LastEvaluatedKey` returned as an opaque cursor.
+- **Products:** a paginated `Scan` filtered on `begins_with(PK, "PRODUCT#")`. A Scan reads, and is charged for, every item in the table. At a few thousand items that is a few cents a month for one admin user. Replace it with a sparse key if the table grows past about 50 MB or the page takes more than about a second.
+- **Reports** (sales by SKU or month, refund totals, dispute counts): not built yet. The first version is an admin route that queries the `ORDERS#paid`, `ORDERS#fulfilled`, and `ORDERS#refunded` partitions for a `created_at` range (a `GSI1SK` `BETWEEN`), and aggregates in Lambda. If reporting later needs ad-hoc queries, use DynamoDB incremental export to S3 and query it with Athena. That needs point-in-time recovery, which the delivery plan already requires for the table ([Phase 4](development-and-deployment-plan.md#phase-4-application-infrastructure)), and no change to the table design. It is **not built**.
+
+Never add a SQL copy of the table for reporting without a new decision: see ADR-025.
+
+## Cost drivers
+
+On-demand billing charges per request. Storage stays inside the free 25 GB. At the expected volume, the table costs a few dollars a month in prod and about nothing in idle dev. The main driver is the [inventory sync](#inventory-sync-pseudocode): every run writes every projection, because each write refreshes `source_snapshot_at` for the checkout freshness check. That is one write per part per run, or about 8,640 × (number of parts) writes a month. GSI2 doubles it when its projection includes the changed attributes. Watch the per-run write count in the sync metrics. A transactional write costs two write units per item. Checkout, payment, and release volumes are too small to matter.
+
 ## Dev seed data
 
-`scripts/seed-dev.py` is planned; it does not exist in the repository yet. When written, it loads the development catalog only after the dev table exists. It creates a small catalog, categories, kit display BOMs, and kit-only components, and deliberately omits `GSI1PK`/`GSI1SK` for the kit-only records so they cannot appear in the public catalog.
+`scripts/seed-dev.py` is planned; it does not exist in the repository yet. When written, it loads the development catalog only after the dev table exists. It creates a small catalog, categories (with their `CATEGORIES` GSI1 keys), kit display BOMs, and kit-only components, and deliberately omits `GSI1PK`/`GSI1SK` for the kit-only records so they cannot appear in the public catalog.
 
 - It must not write `inventory_count`, `STOCK#` projections, reservations, or jobs. Projections come only from an inventory sync against dev InvenTree.
 - It writes `fulfillment_mode` and `inventree_part_id` for dev InvenTree parts that the operator created. Those IDs are dev-specific and passed in as a mapping file, never guessed from names.
@@ -418,6 +463,7 @@ def checkout(sub, cart_version, address_id, provider):
         Put(order_header(order_id, sub, status="pending", inventory_state="reserved",
                          total_minor=sum_of_lines, currency=currency, refunded_minor=0,
                          created_at=iso(now),
+                         GSI1PK="ORDERS#pending", GSI1SK=f"ORDER#{iso(now)}#{order_id}",
                          ship_to=snapshot(address), ship_to_address_id=address_id,   # copy; later edits never change it
                          contact_email=profile.email,
                          session_expires_at=iso(now + timedelta(seconds=1860))),  # >= 30 min after session creation (60 s margin); stored for idempotent retries
@@ -552,7 +598,8 @@ def release(order_id, reason, from_states=("HELD",), ledger=None):
                cond="#s IN (:from_states) AND (attribute_not_exists(capture_claim_until) "
                     "OR capture_claim_until < :now)"),          # exactly once; never under a live PayPal capture
         *([ledger_update(ledger, "SUCCEEDED")] if ledger else []),   # when a payment event drives the release
-        Update(order_key(order_id), "SET #status = :cancelled_or_refunded, inventory_state = :released"),
+        Update(order_key(order_id), "SET #status = :cancelled_or_refunded, GSI1PK = :orders_status, "
+                                    "inventory_state = :released"),       # GSI1PK tracks status
         *[Update(stock_key(p), "SET reserved_qty = reserved_qty - :q, available_qty = available_qty + :q")
           for p, q in res.parts.items()],
     ])

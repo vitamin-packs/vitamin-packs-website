@@ -22,6 +22,7 @@ Everything below is **design**. As of 2026-09-28 the repository holds only docum
 | Cognito pools, tokens, claims, `require_admin` | [Cognito authentication](cognito-authentication.md) |
 | Browser session storage and CSP | [Cognito: Session storage and XSS](cognito-authentication.md#session-storage-and-xss), [Frontend applications](frontend-applications.md#session-security-and-content-security-policy) |
 | DynamoDB keys, indexes, cart, reservations, jobs, timestamps | [DynamoDB data model](dynamodb-data-model.md) |
+| Admin order queues, product listing, reporting, table cost drivers | [DynamoDB data model: Admin listing and reporting](dynamodb-data-model.md#admin-listing-and-reporting), [ADR-025](#adr-025-dynamodb-remains-the-application-database) |
 | Stock authority, eligibility, kits, sync, movements, reconciliation | [InvenTree integration: Inventory data contract](inventree-integration.md#inventory-data-contract) |
 | Order, payment, and inventory state table | [Payment processing](payment-processing.md#order-payment-and-inventory-states) |
 | Customer checkout cancel | [Payment processing: Customer Cancel](payment-processing.md#customer-cancel) |
@@ -33,6 +34,7 @@ Everything below is **design**. As of 2026-09-28 the repository holds only docum
 | Release workflow, approval gates, credentials, secrets, InvenTree rollout | [Infrastructure development workflow](infrastructure-development.md) |
 | Terraform structure, naming, safety | [Terraform conventions](terraform-conventions.md) |
 | Implementation order and release checklist | [Delivery plan](development-and-deployment-plan.md) |
+| First-release order per environment, InvenTree location configuration | [ADR-026](#adr-026-inventree-first-location-ids-by-second-apply), [Eligible stock](inventree-integration.md#eligible-stock) |
 
 ## Decisions
 
@@ -232,13 +234,63 @@ Everything below is **design**. As of 2026-09-28 the repository holds only docum
   - Amplify `deleteUser` from the browser, which could skip the checkout and cleanup checks.
 - **Consequences:** ADR-007 grows to eleven functions. The `account` role gets customer-pool `AdminGetUser`, `AdminUserGlobalSignOut`, and `AdminDeleteUser`. The checkout transaction budget is unchanged. Orders keep personal data after an account is deleted until OPEN-11 is answered.
 
+### ADR-025: DynamoDB remains the application database
+- **Status:** Proposed, 2026-09-29. Owner: project owner.
+- **Context:** A review asked whether SQL, or a mix of SQL and DynamoDB, would perform better or make storefront and admin features easier. The review excluded the InvenTree database. It found that `GET /admin/orders`, `GET /admin/products`, and `GET /products` had no defined access pattern.
+- **Decision:**
+  - The single DynamoDB table stays the only store for catalog, cart, profile, order, payment, reservation, and job data.
+  - The missing access patterns are added on GSI1: `ORDERS#<status>` on order headers and `CATEGORIES` on category items. The admin product list is a filtered Scan. Reports aggregate over the order partitions in Lambda.
+  
+  → [Admin listing and reporting](dynamodb-data-model.md#admin-listing-and-reporting), [GSI1](dynamodb-data-model.md#gsi1--catalog-browsing-and-admin-order-queues)
+- **Rejected:**
+  - RDS PostgreSQL for the application: about $14/month (the prod total goes over $50), and every DB-using function would need the VPC, so checkout, webhooks, and `account` would depend on the NAT instance (contradicts ADR-003 and ADR-007).
+  - Aurora Serverless v2 with the Data API: about $44/month at the 0.5 ACU minimum. The 5-minute sync keeps it from pausing.
+  - Splitting the data across SQL and DynamoDB: checkout, payment, release, and commit completion each rely on one atomic transaction across cart, order, reservation, projection, and ledger.
+  - A read-only SQL copy (Streams to SQL) for the admin app: the SQL cost plus a pipeline, for needs that GSI1 and Lambda aggregation meet.
+  - A database on the InvenTree RDS instance: it breaks the rule that no Lambda has a network path to PostgreSQL.
+- **Consequences:**
+  - SQL gave no performance gain at this volume. The table stays at a few dollars a month, and the main cost is the inventory sync ([Cost drivers](dynamodb-data-model.md#cost-drivers)).
+  - Every `status` write also sets `GSI1PK`. There is no new transaction action.
+  - `admin` gets `Query` on GSI1 and `Scan` on the table.
+  - Revisit if ad-hoc admin reporting becomes a core need, or if order volume makes Lambda aggregation slow. Evaluate DynamoDB export to S3 with Athena first, then Aurora DSQL (serverless, no VPC). Measure DSQL's cost and check its limits before choosing it.
+
+### ADR-026: InvenTree first, location IDs by second apply
+- **Status:** Accepted, 2026-09-30. Owner: project owner.
+- **Context:** The inventory Lambdas need InvenTree location IDs: the sellable locations and the committed and returns locations. Those IDs only exist once InvenTree is installed and staff have created the locations, and they differ between dev and prod.
+- **Decision:** Each environment is released in three steps, all in its existing Terraform root:
+  1. **InvenTree foundation release.**
+     - It contains bootstrap and network, the NAT instance, and all InvenTree security groups. That includes `inv-lambda`, which is created now and used later.
+     - It also contains the private zone, ECR, S3 media and artifacts, the InvenTree secret containers, the EC2 host, RDS, the jumpbox, SES, monitoring, and the dev scheduler.
+     - There are no application resources.
+  2. **InvenTree setup.** Staff work in the InvenTree UI through the jumpbox:
+     - users and MFA, and the integration user and its token;
+     - the location tree, including the committed and returns locations;
+     - parts and BOMs.
+     
+     The operator records the location IDs and the part map.
+  3. **Application release.** It contains Cognito, DynamoDB, the sites, the API and Lambdas, queues and schedules, and the committed locals file `infra/<env>/inventree-locations.tf`, which holds `eligible_ids`, `committed_id`, and `returns_id`.
+
+  Prod follows the same order: prod InvenTree is live and configured before the first prod application release.
+
+  → [Delivery plan](development-and-deployment-plan.md#phase-2-inventree-foundation), [Eligible stock](inventree-integration.md#eligible-stock), [InvenTree client](backend-api.md#inventree-client)
+- **Rejected:**
+  - An SSM parameter set out of band: location changes would skip git and plan review.
+  - Resolving locations by name at sync time: renaming a location in InvenTree would silently change what is sellable.
+  - An admin-app setting: it would need a new route and UI.
+  - A `*.tfvars` file: those are gitignored and never committed, and the IDs are not secret.
+- **Consequences:**
+  - An empty list or a null ID disables inventory. Sync writes no projections, records `LOCATIONS_UNCONFIGURED`, and alarms. Checkout returns 503 for every part.
+  - Every sync run checks the IDs against InvenTree first. If a check fails, the run writes nothing. Projections then go stale, and checkout fails closed after the 20-minute freshness limit.
+  - Changing a location ID changes `eligibility_version` and therefore `mapping_version`. Carts priced against the old mapping are asked to review.
+  - The location IDs are configuration, not an owner decision. OPEN-01 keeps only the location *policy*.
+
 ## Open questions
 
 Each question has a default that applies in dev. Prod needs an answer.
 
 | ID | Question | Default until decided | Blocks |
 |---|---|---|---|
-| OPEN-01 | Inventory owner decisions 1–3 and 5–15 ([list](inventree-integration.md#inventory-owner-decisions)): kit modes, eligible locations and statuses, the two-step movement and location IDs, late-payment handling, automatic UNCOMMIT and returns, optional and consumable BOM lines, trackable parts, cart limits, the SKU-to-part rule, sync and freshness intervals, allocation subtraction, partial refunds and disputes, legacy `inventory_count`, storefront availability display | As listed there | Prod go-live; the dev mapping data |
+| OPEN-01 | Inventory owner decisions 1–3 and 5–15 ([list](inventree-integration.md#inventory-owner-decisions)): kit modes, the location policy and sellable statuses (the IDs are post-install configuration, [ADR-026](#adr-026-inventree-first-location-ids-by-second-apply)), the two-step movement and location names, late-payment handling, automatic UNCOMMIT and returns, optional and consumable BOM lines, trackable parts, cart limits, the SKU-to-part rule, sync and freshness intervals, allocation subtraction, partial refunds and disputes, legacy `inventory_count`, storefront availability display | As listed there | Prod go-live; the dev mapping data |
 | OPEN-02 | Which ADJUST operations the admin app offers | Add, remove, and count at one eligible location; transfers stay in InvenTree | The admin inventory UI and ADJUST worker |
 | OPEN-05 | Abandoned-cart TTL duration | 30 days after the last write | Cart implementation (the value only) |
 | OPEN-06 | Which Identity Center permission set may create, disable, and re-group Cognito admin users? | The account owner's own administrator access | Admin onboarding runbook, least privilege |
@@ -257,7 +309,7 @@ These are not design decisions. They must be done before prod go-live ([Open Own
 
 ## Implementation-blocker checklist
 
-**Before the first dev Terraform apply:**
+**Before the first dev Terraform apply (the InvenTree foundation release, [ADR-026](#adr-026-inventree-first-location-ids-by-second-apply)):**
 - [ ] Remote-state bootstrap exists and the permission sets are created.
 - [ ] S3 bucket names are confirmed available (OPEN-09).
 - [ ] CI runs the credential-free checks ([Approval gates](infrastructure-development.md#approval-gates)).
@@ -265,7 +317,7 @@ These are not design decisions. They must be done before prod go-live ([Open Own
 **Before backend code that depends on a contract:**
 - [ ] `backend/shared` provides `iso()` and `now_iso()` helpers, with tests for the fixed format (ADR-018).
 - [x] The customer profile (`USER#<sub>` / `PROFILE`) contract is defined ([ADR-024](#adr-024-customer-profile-and-account-self-service)). Implement the `account` function before checkout, which needs a saved address.
-- [ ] Record the dev defaults for OPEN-01, OPEN-02, and OPEN-07 in the dev part-map and location configuration.
+- [ ] Before the application release: InvenTree setup is complete, and the location IDs are committed in `infra/<env>/inventree-locations.tf` along with the part map. The dev defaults for OPEN-01, OPEN-02, and OPEN-07 are applied in that configuration ([ADR-026](#adr-026-inventree-first-location-ids-by-second-apply)).
 
 **To verify in dev (evidence required before prod):**
 - [ ] Capture a real admin-route event and commit it as the `cognito:groups` test fixture ([Cognito](cognito-authentication.md#cognitogroups-in-the-lambda-event)).

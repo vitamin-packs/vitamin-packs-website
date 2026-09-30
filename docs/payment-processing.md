@@ -86,7 +86,7 @@ Money-only facts live in separate attributes and never change `status`:
 - `dispute_state` (`open`, `won`, `lost`);
 - `payment_exception` (a payment that could not be applied automatically).
 
-Every payment transition is a conditional update inside the processor's transaction, guarded by the prior `status` (for example, `#status IN (:pending, :payment_pending)`). A duplicate or out-of-order event therefore can't re-apply it. The one exception is a late payment on an order whose hold was released (`cancelled` with `release_reason = expired`). It is handled by row 7 below, never by the normal transition.
+Every payment transition is a conditional update inside the processor's transaction, guarded by the prior `status` (for example, `#status IN (:pending, :payment_pending)`). The same update sets `GSI1PK = ORDERS#<new status>`, which drives the admin order queues ([Order header attributes](dynamodb-data-model.md#order-header-attributes)). A duplicate or out-of-order event therefore can't re-apply it. The one exception is a late payment on an order whose hold was released (`cancelled` with `release_reason = expired`). It is handled by row 7 below, never by the normal transition.
 
 ## Order, Payment and Inventory States
 
