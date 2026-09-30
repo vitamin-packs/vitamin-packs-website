@@ -273,9 +273,10 @@ Stripe caches the outcome of a request that began executing, including a 500. Tr
 
 Numbered flow:
 
-1. `POST /checkout/stripe` runs the [checkout reservation](dynamodb-data-model.md#checkout-reservation-pseudocode) (row 1). It then creates the Checkout Session with:
+1. `POST /checkout/stripe` (body `{cartVersion, addressId}`) runs the [checkout reservation](dynamodb-data-model.md#checkout-reservation-pseudocode) (row 1), which copies the chosen profile address onto the order as `ship_to`. It then creates the Checkout Session with:
    - `mode=payment`, `ui_mode=hosted_page`, `payment_method_types=["card"]` (cards plus card-based wallets; no delayed-notification methods);
    - `line_items` built from server-side prices;
+   - `payment_intent_data.shipping` from the order's `ship_to` (for fraud signals). There is no `shipping_address_collection`: the address comes from the profile ([ADR-024](architecture-decisions.md#adr-024-customer-profile-and-account-self-service));
    - `client_reference_id=orderId`, and `metadata.order_id=orderId` on both the session and `payment_intent_data`;
    - `expires_at` = the order's ISO `session_expires_at` converted to epoch seconds (checkout time + 31 minutes, so it stays at least 30 minutes after the session is created);
    - `success_url` and `cancel_url` on the storefront;
@@ -316,10 +317,11 @@ API Gateway may base64-encode the body (`isBase64Encoded`). Decode it to the exa
 
 Numbered flow:
 
-1. `POST /checkout/paypal` runs the checkout reservation (row 1). It gets an OAuth token (`POST /v1/oauth2/token`, `client_credentials`, cached until shortly before `expires_in`), then calls `POST /v2/checkout/orders` with:
+1. `POST /checkout/paypal` (body `{cartVersion, addressId}`) runs the checkout reservation (row 1), which copies the chosen profile address onto the order as `ship_to`. It gets an OAuth token (`POST /v1/oauth2/token`, `client_credentials`, cached until shortly before `expires_in`), then calls `POST /v2/checkout/orders` with:
    - `intent=CAPTURE`;
    - one purchase unit (`reference_id`, `custom_id`, `invoice_id`, amount from server-side prices);
-   - `payment_source.paypal.experience_context` with `return_url`, `cancel_url`, and `user_action=PAY_NOW`;
+   - `payment_source.paypal.experience_context` with `return_url`, `cancel_url`, `user_action=PAY_NOW`, and `shipping_preference=SET_PROVIDED_ADDRESS`;
+   - `purchase_units[0].shipping` (name and address) from the order's `ship_to`, so the buyer cannot change it at PayPal and Seller Protection covers the shipped-to address. Verify the field shapes in the sandbox;
    - `PayPal-Request-Id` and `Prefer: return=representation`.
    It stores `provider = "paypal"` and `provider_ref` (the PayPal order ID) conditionally, and returns the `payer-action` link (`approve` on older responses).
 2. The buyer approves on PayPal and returns to `return_url?token=<PayPal order ID>`. The storefront removes `token` from the address bar (see [Frontend applications](frontend-applications.md)) and calls the capture route.
@@ -525,10 +527,15 @@ Run in dev with sandbox credentials only. Never use live credentials or real pay
   - a `payment_pending` or `paid` order returns 409, and another customer's order returns 404;
   - a stubbed provider 5xx or timeout returns 503 and releases nothing;
   - a `checkout.session.expired` event after a cancel is a no-op.
+- **Ship-to address:**
+  - checkout with a missing, unknown, or another customer's `addressId` returns 409 `address_required` and writes nothing;
+  - a country outside `SHIP_COUNTRIES` returns 400;
+  - the Stripe PaymentIntent and the PayPal order carry the order's `ship_to`, and PayPal does not let the buyer change it;
+  - editing or deleting the profile address after checkout leaves the order's `ship_to` unchanged.
 - **Pending:** a PayPal sandbox `PENDING` capture holds stock as `payment_pending`. Completion follows row 6; a decline or the 72-hour expiry releases it.
 - **Idempotent creation:** a checkout Lambda retried after the provider call reuses the same Stripe session or PayPal order.
 - **Refunds and disputes:** a partial refund changes only `refunded_minor`. A full refund in each inventory state follows its row. An opened dispute blocks shipping, and a lost one follows 15c.
-- **Redaction:** scan the dev log group after the suite for emails, names, `whsec_`, `sk_`/`rk_`, `Bearer`, and signature header values. There must be none.
+- **Redaction:** scan the dev log group after the suite for emails, names, street addresses, phone numbers, `whsec_`, `sk_`/`rk_`, `Bearer`, and signature header values. There must be none.
 - **Timeouts:** a stubbed provider that hangs makes the Lambda respond within API Gateway's 30 s limit, and the order stays recoverable.
 
 ## References

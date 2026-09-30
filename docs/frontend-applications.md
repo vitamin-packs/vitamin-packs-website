@@ -83,7 +83,7 @@ For dynamic states, expose the state semantically: use `aria-live` for important
 - Keep network calls in a small API client layer so authentication headers, JSON parsing, error handling, and abort behavior are consistent.
 - Abort stale requests where a view can unmount or a newer search supersedes an older one.
 - Handle loading, empty, success, and error states for every API-backed view.
-- Do not log passwords, access tokens, payment details, or full customer records.
+- Do not log passwords, access tokens, payment details, or full customer records. Never send profile fields (names, addresses, emails, phones) to logs, analytics, or error reports.
 - Keep functions focused and names descriptive; do not use one-letter variables except for conventional callback arguments where the meaning is unambiguous.
 
 Example API helper (protected calls go through `authorizedFetch` from [Cognito authentication](cognito-authentication.md#access-token-for-api-calls-refresh-and-expiry), which attaches the Cognito **access token**, refreshes on expiry, and retries a 401 exactly once):
@@ -149,6 +149,14 @@ The storefront owns public catalog browsing, product details, kit bills of mater
 
 - The login form offers an unticked "Keep me signed in" option that selects `localStorage` instead of `sessionStorage`.
 - Account settings offer optional TOTP enrollment and removal.
+- Account settings also maintain the customer profile ([Account routes](backend-api.md#account-routes), [ADR-024](architecture-decisions.md#adr-024-customer-profile-and-account-self-service)):
+  - **Contact:** display name, phone, and marketing opt-in (`PUT /account/profile`).
+  - **Email:** change and verify through Cognito ([Email change](cognito-authentication.md#email-change)), then re-read the profile.
+  - **Password:** change through Amplify `updatePassword`.
+  - **Addresses:** list, add, edit, delete, and set the default, up to 5. Show a 409 `address_limit` as a clear message.
+  - **Delete account:** a typed "DELETE" confirmation, a statement that past orders are kept, and the re-authentication step on 403 `reauth_required`. A 409 `checkout_open` points the customer to cancel or finish the open checkout.
+  - Every edit sends the `version` it read. On 409 `version_conflict`, re-read the profile and show the fresh data before the customer retries.
+- Checkout shows an address picker that defaults to the profile's default address, with an inline "add address" form (`POST /account/addresses`, then use the returned `addressId`). Checkout sends that `addressId`. On 409 `address_required`, return to the picker.
 - Sign-out offers "Sign out of all devices" (global sign-out).
 - Sign-in handles every challenge step in [Cognito authentication](cognito-authentication.md#sign-in-and-challenge-handling), including a TOTP code prompt for enrolled customers.
 

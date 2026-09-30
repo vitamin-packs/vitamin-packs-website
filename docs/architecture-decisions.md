@@ -25,6 +25,7 @@ Everything below is **design**. As of 2026-09-28 the repository holds only docum
 | Stock authority, eligibility, kits, sync, movements, reconciliation | [InvenTree integration: Inventory data contract](inventree-integration.md#inventory-data-contract) |
 | Order, payment, and inventory state table | [Payment processing](payment-processing.md#order-payment-and-inventory-states) |
 | Customer checkout cancel | [Payment processing: Customer Cancel](payment-processing.md#customer-cancel) |
+| Customer profile, address book, email mirror, account deletion | [DynamoDB data model: Profile attributes](dynamodb-data-model.md#profile-attributes), [Backend API: Account routes](backend-api.md#account-routes), [ADR-024](#adr-024-customer-profile-and-account-self-service) |
 | Refunds and cancelling paid orders | [Payment processing: state table](payment-processing.md#order-payment-and-inventory-states), [ADR-023](#adr-023-refunds-through-the-provider-dashboard) |
 | Provider libraries, ledger, idempotency, webhooks | [Payment processing](payment-processing.md) |
 | InvenTree hosting, VPC, staff access, DNS/TLS, RDS, cost | [InvenTree integration](inventree-integration.md) |
@@ -75,7 +76,7 @@ Everything below is **design**. As of 2026-09-28 the repository holds only docum
 
 ### ADR-007: Backend functions and VPC attachment
 - **Status:** Proposed, 2026-09-28. Owner: project owner.
-- **Decision:** Ten flat Python functions: seven HTTP functions, `sweeper`, `inventory-sync`, and `inventory-jobs`. Only the two inventory functions attach to the VPC. Routes are explicit, with no proxy route. → [Functions and triggers](backend-api.md#functions-and-triggers)
+- **Decision:** Eleven flat Python functions: eight HTTP functions, `sweeper`, `inventory-sync`, and `inventory-jobs`. The eighth HTTP function, `account`, was added by [ADR-024](#adr-024-customer-profile-and-account-self-service) on 2026-09-29. Only the two inventory functions attach to the VPC. Routes are explicit, with no proxy route. → [Functions and triggers](backend-api.md#functions-and-triggers)
 - **Rejected:** Seven "domains" with inventory nested under webhooks, VPC-attached payment functions, and a generic InvenTree proxy.
 - **Consequences:** Payment and Cognito calls never depend on the NAT instance. `admin` reaches InvenTree only through jobs.
 
@@ -214,6 +215,23 @@ Everything below is **design**. As of 2026-09-28 the repository holds only docum
 - **Rejected:** An admin refund or cancel route. It would need `admin` access to the provider secrets, IAM changes, and a refund idempotency key.
 - **Consequences:** No admin code touches the provider secrets. The Stripe restricted key needs only read access to Refunds. Every operator refund, including rows 6d and 7 and `unexpected_payment`, goes through the dashboard. Automatic refunds of late payments (OPEN-01 item 5) would need a new decision.
 
+### ADR-024: Customer profile and account self-service
+- **Status:** Proposed, 2026-09-29. The owner chose the scope (contact details and an address book), the ship-to snapshot, and self-service deletion. The contract details await confirmation. Owner: project owner.
+- **Context:** `USER#<sub>` / `PROFILE` had no attributes or writer. Access tokens carry no email, and no document said how an order gets a shipping address.
+- **Decision:**
+  - One profile item holds display name, phone, marketing opt-in, a mirror of the Cognito email, and up to 5 embedded addresses with a default. Every write is version-guarded.
+  - Cognito is the email authority. Only the new `account` function writes the mirror, from `AdminGetUser`. The customer pool keeps the old email until a new one is verified.
+  - Checkout takes a saved `addressId` and copies the address and email onto the order (`ship_to`, `contact_email`). Stripe and PayPal do not collect shipping. PayPal gets `SET_PROVIDED_ADDRESS`.
+  - `POST /account/delete` requires a sign-in within 10 minutes and no open checkout. It tombstones the profile, deletes the cart, then deletes the Cognito user. Orders are kept.
+
+  → [Profile attributes](dynamodb-data-model.md#profile-attributes), [Account routes](backend-api.md#account-routes), [Account deletion](backend-api.md#account-deletion)
+- **Rejected:**
+  - Separate address items, which need a second read and cannot switch the default atomically.
+  - Provider-collected shipping, which leaves the address outside our order record until the webhook.
+  - A Cognito post-confirmation trigger to create profiles; the profile is created lazily on the first write.
+  - Amplify `deleteUser` from the browser, which could skip the checkout and cleanup checks.
+- **Consequences:** ADR-007 grows to eleven functions. The `account` role gets customer-pool `AdminGetUser`, `AdminUserGlobalSignOut`, and `AdminDeleteUser`. The checkout transaction budget is unchanged. Orders keep personal data after an account is deleted until OPEN-11 is answered.
+
 ## Open questions
 
 Each question has a default that applies in dev. Prod needs an answer.
@@ -227,6 +245,8 @@ Each question has a default that applies in dev. Prod needs an answer.
 | OPEN-07 | Is SHIP stock fungible within the committed location, or must it follow batch or serial traceability? | Fungible (see [Physical movements](inventree-integration.md#physical-movements)) | The SHIP job plan |
 | OPEN-08 | InvenTree sender addresses (`inventree@`, `inventree-dev@`) | As documented | SES setup |
 | OPEN-09 | If a `vitamin-packs-<env>-*` S3 bucket name is taken globally, what naming fallback applies? | None chosen. Confirm availability at the first dev plan | The first dev apply |
+| OPEN-10 | Which countries can orders ship to (`SHIP_COUNTRIES`)? | US only | Prod go-live; address validation beyond US formats |
+| OPEN-11 | How long are an order's `ship_to` and `contact_email` kept after the customer deletes their account, and are they then scrubbed? | Kept with the order indefinitely | Prod go-live; the privacy notice |
 
 ## Owner actions
 
@@ -244,7 +264,7 @@ These are not design decisions. They must be done before prod go-live ([Open Own
 
 **Before backend code that depends on a contract:**
 - [ ] `backend/shared` provides `iso()` and `now_iso()` helpers, with tests for the fixed format (ADR-018).
-- [ ] The customer profile (`USER#<sub>` / `PROFILE`) has no defined attributes or writer. Define them before any handler needs customer email, because access tokens carry none.
+- [x] The customer profile (`USER#<sub>` / `PROFILE`) contract is defined ([ADR-024](#adr-024-customer-profile-and-account-self-service)). Implement the `account` function before checkout, which needs a saved address.
 - [ ] Record the dev defaults for OPEN-01, OPEN-02, and OPEN-07 in the dev part-map and location configuration.
 
 **To verify in dev (evidence required before prod):**
@@ -252,11 +272,13 @@ These are not design decisions. They must be done before prod go-live ([Open Own
 - [ ] Check InvenTree 1.5.6 `/api-doc/` shapes for the ADJUST endpoint, transfer and remove, and tracking search ([InvenTree client](backend-api.md#inventree-client)).
 - [ ] Confirm the host health timer works. It calls `https://localhost/api/system/health/`, but Caddy's certificate is issued for the InvenTree FQDN, so the timer must either call the FQDN (resolved to the host) or send the right Host/SNI. Record the working form in the [Health](inventree-integration.md#health-deployment-and-persistence) section.
 - [ ] Confirm the GSI2 projection includes the attributes the sweepers read ([GSI2 overloads](dynamodb-data-model.md#gsi2-overloads-for-inventory-operations)).
+- [ ] Confirm the Lite-tier customer pool honors `attributes_require_verification_before_update = ["email"]` ([Email change](cognito-authentication.md#email-change)).
+- [ ] Confirm the PayPal sandbox accepts `shipping_preference=SET_PROVIDED_ADDRESS` with `purchase_units[0].shipping`, and that the buyer cannot change it ([PayPal](payment-processing.md#paypal)).
 - [ ] Confirm package installs and ECR layer pulls succeed with 443-only S3 egress (ADR-021).
 - [ ] Confirm the exact SES action set, and that `subst` drives appear in `mstsc`.
 - [ ] Run every acceptance-test list: [InvenTree](inventree-integration.md#acceptance-tests), [inventory](payment-processing.md#inventory-acceptance-tests), [payment](payment-processing.md#payment-acceptance-tests), [Cognito](cognito-authentication.md#acceptance-tests), and [release workflow](infrastructure-development.md#acceptance-tests).
 
 **Before prod go-live:**
-- [ ] OPEN-01 answered, and OPEN-08 answered or its default explicitly accepted.
+- [ ] OPEN-01 answered, and OPEN-08, OPEN-10, and OPEN-11 answered or their defaults explicitly accepted.
 - [ ] Owner actions complete.
 - [ ] Prod run rate under $50/month after one week.
