@@ -137,6 +137,7 @@ Preventing script injection is the primary control:
   - If embedded payment UI (Stripe Elements/Payment Element, PayPal Smart Buttons) is adopted later, those SDKs load provider scripts and frames and call provider APIs from the page. Update the CSP with the origins from each provider's published CSP guidance, together with the payment doc.
 - The PayPal return URL carries PayPal's `token` query parameter, a PayPal order ID, not a Cognito token.
   - Read it, then remove it from the address bar with `history.replaceState` before calling `POST /checkout/paypal/capture`.
+  - PayPal's `cancel_url` return carries the same `token`. Strip it the same way before calling `POST /checkout/cancel`.
   - A same-tab redirect to Stripe/PayPal and back keeps `sessionStorage`, so the default session survives checkout. `fetchAuthSession()` refreshes an access token that expired while the customer was on the provider's page.
 - Never put Cognito tokens in URLs, logs, analytics, or error reports. The admin app loads no third-party scripts. Audit dependencies (`npm audit` or equivalent) before each deployment.
 
@@ -150,6 +151,11 @@ The storefront owns public catalog browsing, product details, kit bills of mater
 - Account settings offer optional TOTP enrollment and removal.
 - Sign-out offers "Sign out of all devices" (global sign-out).
 - Sign-in handles every challenge step in [Cognito authentication](cognito-authentication.md#sign-in-and-challenge-handling), including a TOTP code prompt for enrolled customers.
+
+Checkout cancel ([Customer Cancel](payment-processing.md#customer-cancel)):
+- The Stripe and PayPal `cancel_url` page reads the open order ID from `GET /cart` (`checkout_order_id`), calls `POST /checkout/cancel` once, and then shows the re-read, unlocked cart.
+- While `GET /cart` returns a `checkout_order_id`, the cart page shows the open checkout with "Resume checkout" (the stored provider URL) and "Cancel checkout" (the same route).
+- Responses: 200 → show the cart. 409 `processing` → poll `GET /orders/{orderId}` as the success page does. 409 `checkout_starting` → wait briefly and retry. 409 with a paid status → show the order. 503 → offer a retry.
 
 Kit-only components must not be presented as standalone products. The API is authoritative and omits them from catalog results; the UI should also treat `sellable_individually: false` items as BOM components rather than purchasable catalog products.
 

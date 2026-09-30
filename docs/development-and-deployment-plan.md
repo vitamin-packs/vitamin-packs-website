@@ -46,7 +46,7 @@ Each gate's status is recorded once, in the [Architecture decision register](arc
 | 2 | Per-environment VPC, CIDRs, NAT instance, subnets and routes, jumpbox staff access, private DNS and TLS | Accepted | ADR-003, ADR-004, ADR-005 | [InvenTree integration](inventree-integration.md#vpc) |
 | 3 | Connectivity proofs: private DNS, security-group-restricted Lambda-to-host and host-to-RDS paths, InvenTree UI reachable only from the jumpbox, no public InvenTree endpoint | Pending the dev acceptance tests | – | [InvenTree acceptance tests](inventree-integration.md#acceptance-tests) |
 | 4 | Stock model: kit modes, eligibility, units, mappings, BOM rules, no double counting | Proposed; owner decisions open | ADR-011, OPEN-01 | [Inventory data contract](inventree-integration.md#inventory-data-contract) |
-| 5 | Order, payment, and inventory lifecycle; provider libraries; the event ledger | Proposed; cancel and refund routes open | ADR-012, OPEN-03, OPEN-04 | [Payment processing](payment-processing.md#order-payment-and-inventory-states) |
+| 5 | Order, payment, and inventory lifecycle; provider libraries; the event ledger | Proposed; customer cancel accepted, admin refund route open | ADR-012, ADR-022, OPEN-03 | [Payment processing](payment-processing.md#order-payment-and-inventory-states) |
 | 6 | DynamoDB keys, indexes, cart, reservations, jobs, ledger, timestamps | Proposed | ADR-011, ADR-018, ADR-019 | [DynamoDB data model](dynamodb-data-model.md) |
 | 7 | Release workflow and approval gates | Accepted | ADR-013 | [Infrastructure development workflow](infrastructure-development.md#release-workflow) |
 
@@ -150,7 +150,7 @@ Build API and data functionality in small, deployable increments:
 6. Implement checkout with server-calculated prices and an atomic DynamoDB transaction that validates current availability, reserves all required units/components, and creates a pending order. Reject stale or missing projections. Do not trust submitted price or inventory values.
 7. Implement payment-provider session/order creation and verified webhook handlers. Add conditional idempotency markers and conditional order-state transitions. Verify Stripe/PayPal dev sandbox configuration before integration testing.
 8. Implement durable, idempotent InvenTree stock-posting jobs keyed by order/line item. Keep inventory state separate from payment state. Retire each reservation exactly once as physical stock movement is reflected in the projection. Gate fulfillment on successful stock posting or explicit operator resolution.
-9. Implement reservation expiry, payment failure/cancellation release, refund/return policy, bounded retries, dead-letter/operator alerts, and scheduled reconciliation. Never reverse physical stock for a refund unless the business policy and actual movement justify a distinct idempotent stock operation.
+9. Implement reservation expiry, payment failure release, the customer cancel route (`POST /checkout/cancel`, which confirms the provider object is unpayable before it releases), refund/return policy, bounded retries, dead-letter/operator alerts, and scheduled reconciliation. Never reverse physical stock for a refund unless the business policy and actual movement justify a distinct idempotent stock operation.
 
 Treat any uncertainty about external API behavior as a verification task against the pinned InvenTree/provider docs, not an assumed request/response contract.
 
@@ -186,7 +186,7 @@ Run the following checks before production promotion:
 - **Catalog/cart checks:** sellable SKU visibility, kit-only exclusion, missing mapping errors, cart persistence and input validation.
 - **Concurrency/payment checks:** two simultaneous attempts for the last unit permit at most one reservation; client-tampered prices are ignored; checkout failures release reservations; duplicate/out-of-order webhooks do not duplicate payment transitions.
 - **Inventory checks:** freshness rejection, excluded stock locations/states, correct kit/component math without double counting, unavailable/missing parts, InvenTree downtime, retry after partial failure, duplicate job delivery, admin adjustment reconciliation, and alerting on stale projection.
-- **Lifecycle checks:** payment succeeds while inventory posting fails (order remains paid but fulfillment blocked); retry posts once; cancellation/expiry releases once; refund does not silently restock; scheduled reconciliation identifies and reports drift.
+- **Lifecycle checks:** payment succeeds while inventory posting fails (order remains paid but fulfillment blocked); retry posts once; customer cancel and expiry each release once, and a customer cancel unlocks the cart; refund does not silently restock; scheduled reconciliation identifies and reports drift.
 - **Operational checks:**
   - InvenTree upgrade in dev, in the [InvenTree rollout](infrastructure-development.md#inventree-rollout) order: plan, snapshot, a single migrate step, apply, then an instance refresh. Confirm that the apply alone replaces no host.
   - The [release-workflow acceptance tests](infrastructure-development.md#acceptance-tests).

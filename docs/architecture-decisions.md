@@ -24,6 +24,7 @@ Everything below is **design**. As of 2026-09-28 the repository holds only docum
 | DynamoDB keys, indexes, cart, reservations, jobs, timestamps | [DynamoDB data model](dynamodb-data-model.md) |
 | Stock authority, eligibility, kits, sync, movements, reconciliation | [InvenTree integration: Inventory data contract](inventree-integration.md#inventory-data-contract) |
 | Order, payment, and inventory state table | [Payment processing](payment-processing.md#order-payment-and-inventory-states) |
+| Customer checkout cancel | [Payment processing: Customer Cancel](payment-processing.md#customer-cancel) |
 | Provider libraries, ledger, idempotency, webhooks | [Payment processing](payment-processing.md) |
 | InvenTree hosting, VPC, staff access, DNS/TLS, RDS, cost | [InvenTree integration](inventree-integration.md) |
 | Staff access procedure | [README](../README.md#staff-access-to-inventree-windows-jumpbox) |
@@ -115,7 +116,7 @@ Everything below is **design**. As of 2026-09-28 the repository holds only docum
   
   → [Payment processing](payment-processing.md)
 - **Rejected:** Standard-library HTTP, `paypal-server-sdk`, `paypalrestsdk`, and a separate "processed" marker.
-- **Consequences:** Only a verified provider object can set `paid`. The cancel and refund routes are open: see OPEN-03 and OPEN-04.
+- **Consequences:** Only a verified provider object can set `paid`. The customer cancel route is decided in [ADR-022](#adr-022-customer-checkout-cancel). An admin refund or cancel route is open: see OPEN-03.
 
 ### ADR-013: Release workflow and approval gates
 - **Status:** Accepted, 2026-09-28. Owner: project owner.
@@ -177,7 +178,7 @@ Everything below is **design**. As of 2026-09-28 the repository holds only docum
   
   → [Cart attributes](dynamodb-data-model.md#cart-attributes)
 - **Rejected:** Clearing the cart at checkout time, which loses the lines if payment fails.
-- **Consequences:** Row 6 grows to 5 transaction items, and a release to at most 5 + P. The cart stays locked until expiry unless [OPEN-04](#open-questions) adds a cancel route.
+- **Consequences:** Row 6 grows to 5 transaction items, and a release to at most 5 + P. The cart stays locked until payment, a customer cancel ([ADR-022](#adr-022-customer-checkout-cancel)), or hold expiry.
 
 ### ADR-020: InvenTree DB host parameter
 - **Status:** Accepted, 2026-09-28. Owner: project owner.
@@ -189,6 +190,18 @@ Everything below is **design**. As of 2026-09-28 the repository holds only docum
 - **Decision:** The `inventree` security group allows only TCP 443 to the S3 prefix list. Port 80 is removed, and is re-added only on a demonstrated need as a new decision. → [Security Groups](inventree-integration.md#security-groups)
 - **Consequences:** If AL2023 package installs or ECR layer pulls fail over the S3 gateway endpoint during dev acceptance, record the evidence and revisit.
 
+### ADR-022: Customer checkout cancel
+- **Status:** Accepted, 2026-09-29 (resolves the former OPEN-04). Owner: project owner.
+- **Decision:**
+  - `POST /checkout/cancel` on the `checkout` function (`customer-jwt` plus the order ownership check) cancels an unpaid checkout and unlocks the cart.
+  - Only an order in `pending` with a `HELD` reservation can be cancelled. `payment_pending` and every later state return 409.
+  - The route first makes the provider object unpayable, using the same confirmation as the hold-expiry sweeper. Only then does it run the existing release with `release_reason = customer_cancelled`.
+  - The storefront calls it on the provider `cancel_url` return and from a "Cancel checkout" action on the locked cart.
+
+  → [Customer Cancel](payment-processing.md#customer-cancel)
+- **Rejected:** Cancelling `payment_pending`, because a PayPal pending capture has money in flight. Putting the route on `orders`, which is read-only and holds no provider secrets. Cancelling implicitly on any cart edit.
+- **Consequences:** Customer cancel is its own state-table row (4a), separate from row 4's payment failure. Row 7 is unchanged: a payment after a customer cancel is `unexpected_payment`, alerted, and refunded by the operator. Cancelling a paid order is still a provider-dashboard refund (OPEN-03).
+
 ## Open questions
 
 Each question has a default that applies in dev. Prod needs an answer.
@@ -198,7 +211,6 @@ Each question has a default that applies in dev. Prod needs an answer.
 | OPEN-01 | Inventory owner decisions 1–3 and 5–15 ([list](inventree-integration.md#inventory-owner-decisions)): kit modes, eligible locations and statuses, the two-step movement and location IDs, late-payment handling, automatic UNCOMMIT and returns, optional and consumable BOM lines, trackable parts, cart limits, the SKU-to-part rule, sync and freshness intervals, allocation subtraction, partial refunds and disputes, legacy `inventory_count`, storefront availability display | As listed there | Prod go-live; the dev mapping data |
 | OPEN-02 | Which ADJUST operations the admin app offers | Add, remove, and count at one eligible location; transfers stay in InvenTree | The admin inventory UI and ADJUST worker |
 | OPEN-03 | Should the admin app issue refunds or cancel paid orders? It would need a route, `admin` access to the provider secrets, and IAM changes. | No. Refund in the provider dashboard; the provider event drives state | Admin refund UI; rows 11–13 "cancel" wording |
-| OPEN-04 | Should customers be able to cancel an unpaid checkout (`customer_cancelled`, row 4) and unlock their cart? | No route. The hold and cart lock end at expiry (35 minutes) | The storefront return-from-cancel UX |
 | OPEN-05 | Abandoned-cart TTL duration | 30 days after the last write | Cart implementation (the value only) |
 | OPEN-06 | Which Identity Center permission set may create, disable, and re-group Cognito admin users? | The account owner's own administrator access | Admin onboarding runbook, least privilege |
 | OPEN-07 | Is SHIP stock fungible within the committed location, or must it follow batch or serial traceability? | Fungible (see [Physical movements](inventree-integration.md#physical-movements)) | The SHIP job plan |
@@ -234,6 +246,6 @@ These are not design decisions. They must be done before prod go-live ([Open Own
 - [ ] Run every acceptance-test list: [InvenTree](inventree-integration.md#acceptance-tests), [inventory](payment-processing.md#inventory-acceptance-tests), [payment](payment-processing.md#payment-acceptance-tests), [Cognito](cognito-authentication.md#acceptance-tests), and [release workflow](infrastructure-development.md#acceptance-tests).
 
 **Before prod go-live:**
-- [ ] OPEN-01 answered, and OPEN-03, OPEN-04, and OPEN-08 answered or their defaults explicitly accepted.
+- [ ] OPEN-01 answered, and OPEN-03 and OPEN-08 answered or their defaults explicitly accepted.
 - [ ] Owner actions complete.
 - [ ] Prod run rate under $50/month after one week.

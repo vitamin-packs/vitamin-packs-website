@@ -10,7 +10,7 @@ One flat subfolder per Lambda function under `/backend`, plus `shared/`:
 backend/
   catalog/           HTTP: product/category reads (public)
   cart/              HTTP: cart read/update
-  checkout/          HTTP: reserve stock, create Stripe/PayPal checkout, PayPal capture
+  checkout/          HTTP: reserve stock, create Stripe/PayPal checkout, PayPal capture, customer cancel
   orders/            HTTP: order history, order detail
   admin/             HTTP: catalog/order CRUD and inventory job requests (Admins only)
   webhooks-stripe/   HTTP: Stripe webhook receiver (payment-event processor)
@@ -20,7 +20,7 @@ backend/
   inventory-jobs/    SQS (VPC): durable, idempotent InvenTree stock movements
   shared/            bundled into every zip; never deployed on its own
     auth.py, responses.py, validation.py, dynamodb.py, secrets.py, logging.py
-    payments/        payment-event processor, decide(), provider clients (payment functions and sweeper only)
+    payments/        payment-event processor, decide(), provider clients, provider "unpayable" confirmation (payment functions and sweeper only)
     inventory/       projection math, job items, SQS message schema
     inventree/       InvenTree client (inventory-sync and inventory-jobs only)
 ```
@@ -71,6 +71,7 @@ Every protected route sets `authorizationScopes = ["aws.cognito.signin.user.admi
 | POST | `/checkout/stripe` | `checkout` | `customer-jwt` |
 | POST | `/checkout/paypal` | `checkout` | `customer-jwt` |
 | POST | `/checkout/paypal/capture` | `checkout` | `customer-jwt` + order ownership check in-handler. Captures and returns 202; never marks paid ([flow](payment-processing.md#paypal)) |
+| POST | `/checkout/cancel` | `checkout` | `customer-jwt` + order ownership check in-handler. Cancels an unpaid (`pending`) checkout and unlocks the cart; 409 for any other state ([flow](payment-processing.md#customer-cancel)) |
 | GET | `/orders` | `orders` | `customer-jwt` |
 | GET | `/orders/{orderId}` | `orders` | `customer-jwt` + order ownership check in-handler |
 | GET, POST | `/admin/products` | `admin` | `admin-jwt` + `require_admin` (claim + live Cognito check) in-handler, as for every `/admin/...` route |
@@ -189,7 +190,7 @@ def _response(status_code: int, body: dict) -> dict:
 - Return explicit status codes (`400` for bad input, `403` for authorization failures, `404` for missing resources) rather than letting unhandled exceptions produce an opaque `500`.
 - Admin handlers call `require_admin(event)` (see [Cognito authentication](cognito-authentication.md#backend-authorization)) before doing anything else. It checks the token, the `Admins` claim, and live admin-pool membership. It fails closed: 403 when not authorized, 503 when Cognito is unreachable.
 - Customer handlers get the caller's identity only from `require_customer_sub(event)` (the `sub` claim). Never read a user ID from the path, query string, or body. Carts, profiles, and order history are keyed by that `sub`.
-- Order-scoped routes (`GET /orders/{orderId}`, `POST /checkout/paypal/capture`) load the order header and return 404 when it is missing or its `user_sub` is not the caller's `sub`.
+- Order-scoped routes (`GET /orders/{orderId}`, `POST /checkout/paypal/capture`, `POST /checkout/cancel`) load the order header and return 404 when it is missing or its `user_sub` is not the caller's `sub`.
 - The `401` for missing/invalid/expired tokens comes from the API Gateway authorizer; Lambdas never see those requests.
 - Never log tokens, the `Authorization` header, or full claim sets; log `sub`, route, and the authorization decision.
 
@@ -202,7 +203,7 @@ The backend, not the admin UI, is the security boundary. Prove it with tests tha
 - Dev integration (raw HTTP): the [Cognito acceptance tests](cognito-authentication.md#acceptance-tests), including:
   - customer-token and ID-token rejection on every admin route;
   - immediate 403 after admin group removal;
-  - cross-customer order/capture access returning 404.
+  - cross-customer order, capture, and cancel access returning 404.
 
 ## IAM
 
@@ -223,7 +224,7 @@ DynamoDB transactions have no IAM action of their own. `TransactWriteItems` is a
 |---|---|---|---|---|
 | `catalog` | read on the table and `index/GSI1` | – | – | – |
 | `cart` | read; `PutItem`, `UpdateItem`, `DeleteItem` | – | – | – |
-| `checkout` | read + Tx ([reservation](dynamodb-data-model.md#checkout-reservation-pseudocode), provider reference, PayPal capture claim) | – (it never marks an order paid) | Stripe, PayPal | – |
+| `checkout` | read + Tx ([reservation](dynamodb-data-model.md#checkout-reservation-pseudocode), provider reference, PayPal capture claim, [customer-cancel release](payment-processing.md#customer-cancel) of the reservation, order, cart, and projections) | – (it never marks an order paid) | Stripe, PayPal | – |
 | `orders` | read on the table and the index its queries use | – | – | – |
 | `admin` | read + Tx; `Query` on `index/GSI2` | `SendMessage` | – | `cognito-idp:AdminGetUser` and `cognito-idp:AdminListGroupsForUser` on the **admin** pool ARN only (no Cognito writes); `lambda:InvokeFunction` on the `inventory-sync` ARN |
 | `webhooks-stripe` | read + Tx (orders, refunds, reservations, projections, jobs, `PAYEVT#` ledger) | `SendMessage` | Stripe only | – |

@@ -80,7 +80,7 @@ Lifecycle (proposed, [ADR-019](architecture-decisions.md#adr-019-cart-schema-and
 - Checkout sets `checkout_order_id` in its transaction (see [Checkout reservation](#checkout-reservation-pseudocode)). `GET /cart` returns it, so the storefront can resume the provider redirect or poll the order.
 - The verified-payment transaction ([row 6](payment-processing.md#order-payment-and-inventory-states)) deletes the cart, conditioned on `attribute_not_exists(PK) OR checkout_order_id = :oid`.
 - A release from `HELD` removes `checkout_order_id`, conditioned on `checkout_order_id = :oid`, so the customer can retry with the same lines. Releases after payment and late payments (row 7) do not touch the cart.
-- The cart stays locked while a checkout is open. The only ways to unlock it are payment or release, so without a customer cancel route that means hold expiry. See [OPEN-04](architecture-decisions.md#open-questions).
+- The cart stays locked while a checkout is open. It unlocks only through payment or a release from `HELD`: a customer cancel (`POST /checkout/cancel`, [ADR-022](architecture-decisions.md#adr-022-customer-checkout-cancel)), a payment failure, a session failure, or hold expiry.
 
 ### Order header attributes
 

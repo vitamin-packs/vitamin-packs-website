@@ -102,7 +102,8 @@ In the table:
 | 1 | Checkout succeeds | the transaction's conditions (fresh, `avail ≥ q`, price, mapping, cart version) | — → `pending` / `reserved` | — → `HELD` | none | `res += q`, `avail -= q` |
 | 2 | Checkout rejected (insufficient, stale, missing, `ERROR`, changed cart) | transaction cancelled | no order written | none | none | none |
 | 3 | Provider session/order creation fails permanently | reservation `HELD` | `pending` → `cancelled` / `released` | `HELD` → `RELEASED` (`session_failed`) | none | `res -= q`, `avail += q` |
-| 4 | Customer cancels, or a verified payment failure (Stripe `checkout.session.async_payment_failed`, PayPal capture `DECLINED`/`FAILED`) | `HELD`, order `pending` or `payment_pending` | → `cancelled` / `released` | → `RELEASED` (`customer_cancelled` or `payment_failed`) | none | release |
+| 4 | Verified payment failure (Stripe `checkout.session.async_payment_failed`, PayPal capture `DECLINED`/`FAILED`) | `HELD`, order `pending` or `payment_pending` | → `cancelled` / `released` | → `RELEASED` (`payment_failed`) | none | release |
+| 4a | Customer cancels (`POST /checkout/cancel`, see [Customer Cancel](#customer-cancel)) | order `pending`, `HELD`, no live `capture_claim_until`, provider object confirmed unpayable first | → `cancelled` / `released` | → `RELEASED` (`customer_cancelled`) | none | release |
 | 5 | Hold expires (sweeper) | `HELD`, `expires_at < now`, no live `capture_claim_until`, provider object confirmed unpayable first | → `cancelled` / `released` | → `RELEASED` (`expired`) | none | release |
 | 6 | Verified payment | order `pending` or `payment_pending`, reservation `HELD` | → `paid` / `commit_pending` | → `COMMITTING` | COMMIT `QUEUED` and message sent | none (still reserved) |
 | 6a | PayPal capture reports `PENDING` | order `pending`, reservation `HELD` | → `payment_pending` / `reserved` | stays `HELD`; `expires_at` = now + 72 h (INVHOLD key updated) | none | none |
@@ -132,9 +133,9 @@ Transaction sizes stay within the 100-action limit:
 - row 6 uses 5 items (ledger, order, reservation, job, cart);
 - a release uses at most 5 + P (the cart action applies only to a release from `HELD`), and a late payment (row 7) at most 4 + P, with P ≤ 75 distinct parts.
 
-Routes not yet defined:
-- Row 4's "customer cancels" and rows 11–13's "cancel after payment" have no API route in [Backend API](backend-api.md#api-gateway). Adding one is an open owner decision: see [OPEN-03 and OPEN-04](architecture-decisions.md#open-questions).
-- Until those are decided, an unpaid hold ends only by expiry (row 5). Cancelling after payment means a full refund through the provider dashboard, which arrives as a refund event (rows 11–13, 15).
+Cancel routes:
+- Row 4a's customer cancel of an unpaid checkout is `POST /checkout/cancel` ([ADR-022](architecture-decisions.md#adr-022-customer-checkout-cancel), [Customer Cancel](#customer-cancel)).
+- Rows 11–13's "cancel after payment" has no API route. Adding an admin one is an open owner decision: see [OPEN-03](architecture-decisions.md#open-questions). Until then, cancelling after payment means a full refund through the provider dashboard, which arrives as a refund event (rows 11–13, 15).
 
 ## Payment Validation
 
@@ -259,7 +260,7 @@ Keys are deterministic, so a retry after a crash reuses the same key. `expires_a
 | Call | Key | Provider retention |
 |---|---|---|
 | Stripe create Checkout Session | `Idempotency-Key: vp-<env>-<orderId>-session` | ≥ 24 h |
-| Stripe expire session | none; retrieve the session and act on its `status` | — |
+| Stripe expire session (hold sweeper and [customer cancel](#customer-cancel)) | none; retrieve the session and act on its `status` | — |
 | Stripe refund (admin; only if [OPEN-03](architecture-decisions.md#open-questions) adds an admin refund route) | `vp-<env>-<orderId>-refund-<n>`, where `n` is the admin's refund sequence | ≥ 24 h |
 | PayPal create order | `PayPal-Request-Id: uuid5(VP_NAMESPACE, "<env>:<orderId>:create")` | 6 h |
 | PayPal capture | `PayPal-Request-Id: uuid5(VP_NAMESPACE, "<env>:<orderId>:capture")` | 6 h |
@@ -369,6 +370,41 @@ def verify_paypal(session: requests.Session, token: str, raw_body: str, headers:
 ```
 
 A missing header or a status other than `SUCCESS` returns 400. PayPal's self-verification (CRC32 of the body plus the certificate at `paypal-cert-url`) is a later latency optimization. If it is adopted, it must validate the certificate chain and that the certificate host is a PayPal domain. Because of fetch-then-act, verification is defense in depth: a forged event can at most make us re-read PayPal's real state.
+
+## Customer Cancel
+
+A customer can cancel an unpaid checkout, which releases the hold and unlocks the cart ([ADR-022](architecture-decisions.md#adr-022-customer-checkout-cancel), row 4a). A paid order cannot be cancelled this way: see [OPEN-03](architecture-decisions.md#open-questions).
+
+`POST /checkout/cancel` (`customer-jwt`, `checkout` function) takes the closed body `{"orderId": "<uuid>"}`. Numbered flow:
+
+1. `require_customer_sub(event)`, then validate the body before any read (400).
+2. Load the order header with a consistent read. Return 404 if it is missing or its `user_sub` is not the caller's `sub`, exactly as the capture route does.
+3. Branch on `status`:
+   - `cancelled` → 200 with the current status. Repeated calls are harmless.
+   - `payment_pending`, `paid`, `fulfilled`, or `refunded` → 409 with the current status.
+   - Only `pending` continues.
+4. Load the reservation with a consistent read:
+   - `RELEASED` → 200;
+   - any other state that is not `HELD` → 409;
+   - a live `capture_claim_until` → 409 `{"status": "processing"}`;
+   - no `provider_ref` on the order yet (the provider create is still in flight, or crashed) → 409 `{"status": "checkout_starting"}`. Expiry or row 3 resolves it.
+5. **Make the provider object unpayable first.** This uses the same confirmation as the hold sweeper, kept in one `shared/payments/` helper:
+   - **Stripe:** retrieve the session.
+     - `open` → `POST /v1/checkout/sessions/{id}/expire`. If the expire fails because the session is no longer open, retrieve it again and act on the new status.
+     - `expired` → continue.
+     - `complete` → 409 `{"status": "processing"}`. `checkout` never calls `process()`: the webhook or the payment sweeper applies row 6.
+   - **PayPal:** GET the order.
+     - No capture (`CREATED`, `APPROVED`, `VOIDED`) → continue. After the release the capture route refuses, because the reservation is no longer `HELD`. A capture that started before the release holds a claim for 120 s, which is longer than this Lambda's 25 s timeout, so the release condition (no live claim) fails and nothing is released.
+     - A capture that is `COMPLETED` or `PENDING` → 409 `{"status": "processing"}`.
+   - A provider timeout or 5xx → 503. Nothing is released, and the customer may retry.
+6. Run [`release(order_id, "customer_cancelled", from_states=("HELD",))`](dynamodb-data-model.md#release-pseudocode). It releases the projections and unlocks the cart in one transaction, with no ledger item.
+   - If only the cart condition fails, retry without it, as for every release.
+   - A `ConditionalCheckFailed` on the reservation means another writer won. Re-read the order and return 200 if it is `cancelled`, or 409 with its status otherwise (for example, `paid` after a payment raced the cancel).
+7. Return 200 `{"status": "cancelled"}`. The storefront re-reads `GET /cart`, which now has no `checkout_order_id` and still has the same lines.
+
+After a cancel:
+- A Stripe `checkout.session.expired` event arrives for the session the route expired. Row 5 applies only while the reservation is `HELD`, so the event is a no-op and `release_reason` stays `customer_cancelled`.
+- A payment for a customer-cancelled order is impossible in the normal flows: the Stripe session is expired before the release, and PayPal can only be captured by our route. If a provider edge case produces one anyway, row 7 does **not** apply, because it requires `release_reason = expired`. The payment is recorded as `payment_exception = unexpected_payment` and alerted, and the operator refunds it.
 
 ## Inventory
 
@@ -481,6 +517,15 @@ Run in dev with sandbox credentials only. Never use live credentials or real pay
   - `INSTRUMENT_DECLINED` returns 402 with the approval link;
   - a capture after release returns 409 without calling PayPal;
   - the sweeper racing a live capture claim does not release.
+- **Customer cancel** ([flow](#customer-cancel)):
+  - cancelling with an open Stripe session expires the session, then releases. The projection is restored once and the cart is unlocked with its lines intact;
+  - a cancel racing a `complete` Stripe session returns 409, and the order still becomes `paid` through the webhook;
+  - a cancel during a live PayPal capture claim returns 409 and releases nothing;
+  - a PayPal capture after a cancel returns 409 without calling PayPal;
+  - a repeated cancel returns 200 each time and releases only once;
+  - a `payment_pending` or `paid` order returns 409, and another customer's order returns 404;
+  - a stubbed provider 5xx or timeout returns 503 and releases nothing;
+  - a `checkout.session.expired` event after a cancel is a no-op.
 - **Pending:** a PayPal sandbox `PENDING` capture holds stock as `payment_pending`. Completion follows row 6; a decline or the 72-hour expiry releases it.
 - **Idempotent creation:** a checkout Lambda retried after the provider call reuses the same Stripe session or PayPal order.
 - **Refunds and disputes:** a partial refund changes only `refunded_minor`. A full refund in each inventory state follows its row. An opened dispute blocks shipping, and a lost one follows 15c.

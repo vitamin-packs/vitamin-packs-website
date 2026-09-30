@@ -443,7 +443,7 @@ Rules:
 
 - **Admin handlers** call `require_admin(event)` before any other work. The admin function's role gets only `cognito-idp:AdminGetUser` and `cognito-idp:AdminListGroupsForUser` on the admin pool ARN (see [Backend API](backend-api.md#iam)). The live check adds two small Cognito calls per admin request; acceptable at single-staff-user volume. Never cache the result across requests.
 - **Customer handlers** call `require_customer_sub(event)` and derive every key from that `sub` (`CART#<sub>`, `USER#<sub>`, `GSI2PK=USER#<sub>`). Never accept a user ID from the path, query string, or body.
-- **Ownership:** order-scoped reads and actions (`GET /orders/{orderId}`, `POST /checkout/paypal/capture`) load the order header and return **404** when it is missing or its `user_sub` differs from the caller's `sub`. This avoids confirming that another customer's order exists.
+- **Ownership:** order-scoped reads and actions (`GET /orders/{orderId}`, `POST /checkout/paypal/capture`, `POST /checkout/cancel`) load the order header and return **404** when it is missing or its `user_sub` differs from the caller's `sub`. This avoids confirming that another customer's order exists.
 - **Email:** access tokens carry no email. Handlers that need it read the customer's stored profile or call Cognito server-side; never trust an email from the request body for authorization.
 - **Fail closed:** a missing claim or unexpected format is a 403. Cognito being unreachable during an admin check is a 503, never an allow.
 - Log `sub`, route, and allow/deny decision. Never log tokens, the `Authorization` header, or full claim sets.
@@ -513,7 +513,7 @@ Run in dev against the deployed API with raw HTTP requests (no UI):
 - Every protected route returns **401** for no token, an expired token, a token from the other pool, and a token with the wrong `client_id`, and **403** for an ID token.
 - Every `/admin/*` route rejects a valid storefront access token and a valid admin-pool token for a user not in `Admins`.
 - An admin succeeds. After `admin-remove-user-from-group`, the **next** admin request returns 403 without waiting for token expiry.
-- Customer A cannot read customer B's order or capture B's PayPal order (404). A's `PUT /cart` only affects `CART#<sub_A>`.
+- Customer A cannot read customer B's order, capture B's PayPal order, or cancel B's checkout (404). A's `PUT /cart` only affects `CART#<sub_A>`.
 - Admin pool rejects `SignUp` via the admin client ID. Admin sign-in without TOTP set up forces TOTP setup.
 - A customer with TOTP enrolled is prompted for a code; one without is not.
 - Sign-out clears browser storage. Global sign-out prevents refresh.
