@@ -25,6 +25,7 @@ Everything below is **design**. As of 2026-09-28 the repository holds only docum
 | Stock authority, eligibility, kits, sync, movements, reconciliation | [InvenTree integration: Inventory data contract](inventree-integration.md#inventory-data-contract) |
 | Order, payment, and inventory state table | [Payment processing](payment-processing.md#order-payment-and-inventory-states) |
 | Customer checkout cancel | [Payment processing: Customer Cancel](payment-processing.md#customer-cancel) |
+| Refunds and cancelling paid orders | [Payment processing: state table](payment-processing.md#order-payment-and-inventory-states), [ADR-023](#adr-023-refunds-through-the-provider-dashboard) |
 | Provider libraries, ledger, idempotency, webhooks | [Payment processing](payment-processing.md) |
 | InvenTree hosting, VPC, staff access, DNS/TLS, RDS, cost | [InvenTree integration](inventree-integration.md) |
 | Staff access procedure | [README](../README.md#staff-access-to-inventree-windows-jumpbox) |
@@ -116,7 +117,7 @@ Everything below is **design**. As of 2026-09-28 the repository holds only docum
   
   → [Payment processing](payment-processing.md)
 - **Rejected:** Standard-library HTTP, `paypal-server-sdk`, `paypalrestsdk`, and a separate "processed" marker.
-- **Consequences:** Only a verified provider object can set `paid`. The customer cancel route is decided in [ADR-022](#adr-022-customer-checkout-cancel). An admin refund or cancel route is open: see OPEN-03.
+- **Consequences:** Only a verified provider object can set `paid`. The customer cancel route is decided in [ADR-022](#adr-022-customer-checkout-cancel). Refunds and cancelling a paid order go through the provider dashboard: see [ADR-023](#adr-023-refunds-through-the-provider-dashboard).
 
 ### ADR-013: Release workflow and approval gates
 - **Status:** Accepted, 2026-09-28. Owner: project owner.
@@ -200,7 +201,18 @@ Everything below is **design**. As of 2026-09-28 the repository holds only docum
 
   → [Customer Cancel](payment-processing.md#customer-cancel)
 - **Rejected:** Cancelling `payment_pending`, because a PayPal pending capture has money in flight. Putting the route on `orders`, which is read-only and holds no provider secrets. Cancelling implicitly on any cart edit.
-- **Consequences:** Customer cancel is its own state-table row (4a), separate from row 4's payment failure. Row 7 is unchanged: a payment after a customer cancel is `unexpected_payment`, alerted, and refunded by the operator. Cancelling a paid order is still a provider-dashboard refund (OPEN-03).
+- **Consequences:** Customer cancel is its own state-table row (4a), separate from row 4's payment failure. Row 7 is unchanged: a payment after a customer cancel is `unexpected_payment`, alerted, and refunded by the operator. Cancelling a paid order is still a provider-dashboard refund ([ADR-023](#adr-023-refunds-through-the-provider-dashboard)).
+
+### ADR-023: Refunds through the provider dashboard
+- **Status:** Accepted, 2026-09-29 (resolves the former OPEN-03). Owner: project owner.
+- **Decision:**
+  - The admin app has no refund route and no route to cancel a paid order.
+  - The operator refunds in the Stripe or PayPal dashboard. Cancelling a paid order means a full refund.
+  - The provider's refund event drives the order and inventory state (rows 11–13, 15, and 15a).
+
+  → [Payment processing: state table](payment-processing.md#order-payment-and-inventory-states)
+- **Rejected:** An admin refund or cancel route. It would need `admin` access to the provider secrets, IAM changes, and a refund idempotency key.
+- **Consequences:** No admin code touches the provider secrets. The Stripe restricted key needs only read access to Refunds. Every operator refund, including rows 6d and 7 and `unexpected_payment`, goes through the dashboard. Automatic refunds of late payments (OPEN-01 item 5) would need a new decision.
 
 ## Open questions
 
@@ -210,7 +222,6 @@ Each question has a default that applies in dev. Prod needs an answer.
 |---|---|---|---|
 | OPEN-01 | Inventory owner decisions 1–3 and 5–15 ([list](inventree-integration.md#inventory-owner-decisions)): kit modes, eligible locations and statuses, the two-step movement and location IDs, late-payment handling, automatic UNCOMMIT and returns, optional and consumable BOM lines, trackable parts, cart limits, the SKU-to-part rule, sync and freshness intervals, allocation subtraction, partial refunds and disputes, legacy `inventory_count`, storefront availability display | As listed there | Prod go-live; the dev mapping data |
 | OPEN-02 | Which ADJUST operations the admin app offers | Add, remove, and count at one eligible location; transfers stay in InvenTree | The admin inventory UI and ADJUST worker |
-| OPEN-03 | Should the admin app issue refunds or cancel paid orders? It would need a route, `admin` access to the provider secrets, and IAM changes. | No. Refund in the provider dashboard; the provider event drives state | Admin refund UI; rows 11–13 "cancel" wording |
 | OPEN-05 | Abandoned-cart TTL duration | 30 days after the last write | Cart implementation (the value only) |
 | OPEN-06 | Which Identity Center permission set may create, disable, and re-group Cognito admin users? | The account owner's own administrator access | Admin onboarding runbook, least privilege |
 | OPEN-07 | Is SHIP stock fungible within the committed location, or must it follow batch or serial traceability? | Fungible (see [Physical movements](inventree-integration.md#physical-movements)) | The SHIP job plan |
@@ -246,6 +257,6 @@ These are not design decisions. They must be done before prod go-live ([Open Own
 - [ ] Run every acceptance-test list: [InvenTree](inventree-integration.md#acceptance-tests), [inventory](payment-processing.md#inventory-acceptance-tests), [payment](payment-processing.md#payment-acceptance-tests), [Cognito](cognito-authentication.md#acceptance-tests), and [release workflow](infrastructure-development.md#acceptance-tests).
 
 **Before prod go-live:**
-- [ ] OPEN-01 answered, and OPEN-03 and OPEN-08 answered or their defaults explicitly accepted.
+- [ ] OPEN-01 answered, and OPEN-08 answered or its default explicitly accepted.
 - [ ] Owner actions complete.
 - [ ] Prod run rate under $50/month after one week.

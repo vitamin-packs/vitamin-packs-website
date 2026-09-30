@@ -46,7 +46,7 @@ Each gate's status is recorded once, in the [Architecture decision register](arc
 | 2 | Per-environment VPC, CIDRs, NAT instance, subnets and routes, jumpbox staff access, private DNS and TLS | Accepted | ADR-003, ADR-004, ADR-005 | [InvenTree integration](inventree-integration.md#vpc) |
 | 3 | Connectivity proofs: private DNS, security-group-restricted Lambda-to-host and host-to-RDS paths, InvenTree UI reachable only from the jumpbox, no public InvenTree endpoint | Pending the dev acceptance tests | – | [InvenTree acceptance tests](inventree-integration.md#acceptance-tests) |
 | 4 | Stock model: kit modes, eligibility, units, mappings, BOM rules, no double counting | Proposed; owner decisions open | ADR-011, OPEN-01 | [Inventory data contract](inventree-integration.md#inventory-data-contract) |
-| 5 | Order, payment, and inventory lifecycle; provider libraries; the event ledger | Proposed; customer cancel accepted, admin refund route open | ADR-012, ADR-022, OPEN-03 | [Payment processing](payment-processing.md#order-payment-and-inventory-states) |
+| 5 | Order, payment, and inventory lifecycle; provider libraries; the event ledger | Proposed; customer cancel and dashboard-only refunds accepted | ADR-012, ADR-022, ADR-023 | [Payment processing](payment-processing.md#order-payment-and-inventory-states) |
 | 6 | DynamoDB keys, indexes, cart, reservations, jobs, ledger, timestamps | Proposed | ADR-011, ADR-018, ADR-019 | [DynamoDB data model](dynamodb-data-model.md) |
 | 7 | Release workflow and approval gates | Accepted | ADR-013 | [Infrastructure development workflow](infrastructure-development.md#release-workflow) |
 

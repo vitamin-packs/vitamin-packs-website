@@ -51,7 +51,7 @@ Stripe secret `${project}-${environment}-stripe`:
 {"api_key":"rk_test_...","webhook_secret":"whsec_...","webhook_secret_previous":null}
 ```
 
-- Prefer a restricted key (`rk_`) with write access to Checkout Sessions and Refunds, and read access to PaymentIntents, Charges, and Disputes.
+- Prefer a restricted key (`rk_`) with write access to Checkout Sessions, and read access to Refunds, PaymentIntents, Charges, and Disputes. Refunds are issued only in the dashboard ([ADR-023](architecture-decisions.md#adr-023-refunds-through-the-provider-dashboard)).
 - `webhook_secret_previous` holds the old secret during a Stripe secret roll (up to 24 hours). Verification tries the current secret, then the previous one.
 
 PayPal secret `${project}-${environment}-paypal`:
@@ -114,9 +114,9 @@ In the table:
 | 8 | COMMIT succeeds | job `IN_PROGRESS` with a matching lease; tracking evidence present | `paid` / `committed` | → `COMMITTED` | job → `COMPLETED`; transfer to the committed location | `pending_retire` entry added |
 | 9 | Sync observes the commit | entry `completed_at` before the snapshot started | unchanged | → `RETIRED` | none | `obs -= q`, `res -= q`, `avail` unchanged |
 | 10 | COMMIT fails permanently (shortfall, mapping error, mismatch) | retries exhausted or a discrepancy | `paid` / `needs_attention`; fulfillment blocked | stays `COMMITTING` (still counted) | `NEEDS_ATTENTION`; alert | none until the operator retries or cancels |
-| 11 | Full refund or cancel after payment, COMMIT not started | job `QUEUED` | → `refunded` / `released` | `COMMITTING` → `RELEASED` (`refunded_before_commit`) | job → `CANCELLED` (same transaction) | release |
-| 12 | Full refund or cancel after payment, COMMIT outcome not yet known | job `IN_PROGRESS` or `FAILED` (a `FAILED` job may have moved stock) | → `refunded`, `refund_requested = true`; `inventory_state` unchanged | unchanged | COMMIT continues; its completion transaction creates the UNCOMMIT job (row 13). `NEEDS_ATTENTION` → operator | none |
-| 13 | Full refund or cancel after commit, not shipped | `committed` | → `refunded` / `uncommit_pending`, then `restocked` | unchanged (`COMMITTED` or `RETIRED`) | UNCOMMIT: transfer back | `obs` rises on the next sync |
+| 11 | Full refund after payment, COMMIT not started | job `QUEUED` | → `refunded` / `released` | `COMMITTING` → `RELEASED` (`refunded_before_commit`) | job → `CANCELLED` (same transaction) | release |
+| 12 | Full refund after payment, COMMIT outcome not yet known | job `IN_PROGRESS` or `FAILED` (a `FAILED` job may have moved stock) | → `refunded`, `refund_requested = true`; `inventory_state` unchanged | unchanged | COMMIT continues; its completion transaction creates the UNCOMMIT job (row 13). `NEEDS_ATTENTION` → operator | none |
+| 13 | Full refund after commit, not shipped | `committed` | → `refunded` / `uncommit_pending`, then `restocked` | unchanged (`COMMITTED` or `RETIRED`) | UNCOMMIT: transfer back | `obs` rises on the next sync |
 | 14 | Admin ships | `status = paid`, `inventory_state = committed`, `dispute_state` not `open`, no `payment_exception` | → `ship_pending`, then `fulfilled` / `shipped` | unchanged | SHIP: remove from the committed location | none |
 | 15 | Full refund or chargeback after shipping | `shipped` | → `refunded` / `shipped` | unchanged | none (no restock) | none |
 | 15a | Partial refund | any paid state | unchanged; `refunded_minor` increases | unchanged | none (money only) | none |
@@ -135,7 +135,7 @@ Transaction sizes stay within the 100-action limit:
 
 Cancel routes:
 - Row 4a's customer cancel of an unpaid checkout is `POST /checkout/cancel` ([ADR-022](architecture-decisions.md#adr-022-customer-checkout-cancel), [Customer Cancel](#customer-cancel)).
-- Rows 11–13's "cancel after payment" has no API route. Adding an admin one is an open owner decision: see [OPEN-03](architecture-decisions.md#open-questions). Until then, cancelling after payment means a full refund through the provider dashboard, which arrives as a refund event (rows 11–13, 15).
+- A paid order has no cancel route ([ADR-023](architecture-decisions.md#adr-023-refunds-through-the-provider-dashboard)). Cancelling one means a full refund through the provider dashboard, which arrives as a refund event (rows 11–13, 15).
 
 ## Payment Validation
 
@@ -261,7 +261,6 @@ Keys are deterministic, so a retry after a crash reuses the same key. `expires_a
 |---|---|---|
 | Stripe create Checkout Session | `Idempotency-Key: vp-<env>-<orderId>-session` | ≥ 24 h |
 | Stripe expire session (hold sweeper and [customer cancel](#customer-cancel)) | none; retrieve the session and act on its `status` | — |
-| Stripe refund (admin; only if [OPEN-03](architecture-decisions.md#open-questions) adds an admin refund route) | `vp-<env>-<orderId>-refund-<n>`, where `n` is the admin's refund sequence | ≥ 24 h |
 | PayPal create order | `PayPal-Request-Id: uuid5(VP_NAMESPACE, "<env>:<orderId>:create")` | 6 h |
 | PayPal capture | `PayPal-Request-Id: uuid5(VP_NAMESPACE, "<env>:<orderId>:capture")` | 6 h |
 | PayPal order fields | `reference_id = custom_id = orderId`; `invoice_id = vp-<env>-<orderId>` (unique per merchant, so a second payment for the order is refused with `DUPLICATE_INVOICE_ID`) | permanent |
@@ -373,7 +372,7 @@ A missing header or a status other than `SUCCESS` returns 400. PayPal's self-ver
 
 ## Customer Cancel
 
-A customer can cancel an unpaid checkout, which releases the hold and unlocks the cart ([ADR-022](architecture-decisions.md#adr-022-customer-checkout-cancel), row 4a). A paid order cannot be cancelled this way: see [OPEN-03](architecture-decisions.md#open-questions).
+A customer can cancel an unpaid checkout, which releases the hold and unlocks the cart ([ADR-022](architecture-decisions.md#adr-022-customer-checkout-cancel), row 4a). A paid order cannot be cancelled this way. It is refunded in the provider dashboard: see [ADR-023](architecture-decisions.md#adr-023-refunds-through-the-provider-dashboard).
 
 `POST /checkout/cancel` (`customer-jwt`, `checkout` function) takes the closed body `{"orderId": "<uuid>"}`. Numbered flow:
 
@@ -480,7 +479,7 @@ Stripe also emails the account owner when an endpoint keeps failing.
 1. **Re-drive an event:** set its ledger item to `FAILED` with `next_attempt_at = now`. The sweeper processes it with a fresh provider fetch.
 2. **Missing event:** resend it from the Stripe Dashboard (up to 15 days) or `stripe events resend` (up to 30 days), or with PayPal `POST /v1/notifications/webhooks-events/{id}/resend`.
 3. **Order-level reconcile:** run `process()` for the order's `provider_ref`. It is idempotent.
-4. **Refund** through the provider dashboard. An admin refund action is an open decision ([OPEN-03](architecture-decisions.md#open-questions)). The resulting provider event drives the state change.
+4. **Refund** through the provider dashboard ([ADR-023](architecture-decisions.md#adr-023-refunds-through-the-provider-dashboard)). The resulting provider event drives the state change.
 5. **Consistency uncertain:** disable checkout, keep all order, payment, and ledger records, and reconcile before resuming (see [InvenTree integration](inventree-integration.md#reconciliation-and-operations)).
 
 ## Inventory Acceptance Tests
