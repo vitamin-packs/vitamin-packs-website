@@ -102,18 +102,18 @@ Everything below is **design**. As of 2026-09-28 the repository holds only docum
 - **Consequences:** Two Cognito calls per admin request, which is acceptable at single-user volume.
 
 ### ADR-011: Inventory data contract
-- **Status:** Proposed, 2026-09-28. The owner accepted the hold durations. Treating SHIP stock as fungible within the committed location is accepted, 2026-09-30 (resolves the former OPEN-07). Selling no trackable, serialized, batch-traced, or expiring parts is accepted, 2026-09-30 (resolves OPEN-01 item 8). Kits being `COMPONENTS` by default, with `STOCKED_PART` as a deliberate per-kit exception, is accepted, 2026-09-30 (resolves OPEN-01 item 1). Selling only `OK`-status stock from individually allowlisted locations is accepted, 2026-09-30 (resolves OPEN-01 item 2). Owner decisions remain open: see [OPEN-01](#open-questions). Owner: project owner.
+- **Status:** Proposed, 2026-09-28. The owner accepted the hold durations. Treating SHIP stock as fungible within the committed location is accepted, 2026-09-30 (resolves the former OPEN-07). Selling no trackable, serialized, batch-traced, or expiring parts is accepted, 2026-09-30 (resolves OPEN-01 item 8). Kits being `COMPONENTS` by default, with `STOCKED_PART` as a deliberate per-kit exception, is accepted, 2026-09-30 (resolves OPEN-01 item 1). Selling only `OK`-status stock from individually allowlisted locations is accepted, 2026-09-30 (resolves OPEN-01 item 2). The two-step movement (COMMIT at payment, SHIP at shipping) and the location names `Web orders – committed` and `Returns – inspection` are accepted, 2026-09-30 (resolves OPEN-01 item 3). Owner decisions remain open: see [OPEN-01](#open-questions). Owner: project owner.
 - **Decision:**
   - InvenTree is the sole physical-stock authority.
   - DynamoDB holds a per-part derived projection (`observed_qty`, `reserved_qty`, `available_qty`) and a reservation ledger. Products carry no quantity.
-  - Movements run as idempotent COMMIT, UNCOMMIT, and SHIP jobs.
+  - Movements run as idempotent COMMIT, UNCOMMIT, and SHIP jobs. The movement is two-step: COMMIT transfers stock to `Web orders – committed` at verified payment, and SHIP removes it from there at shipping. Returns go to `Returns – inspection`.
   - SHIP stock is fungible: SHIP removes any stock of the part in the committed location. It does not target the stock items that the order's COMMIT moved there.
   - No sold part is trackable, serialized, batch-traced, or expiring. A trackable part is a mapping error.
   - Kits are fulfilled from component stock (`COMPONENTS`) by default. A kit is `STOCKED_PART` only by a deliberate per-kit mapping.
   - Only `OK`-status stock in individually allowlisted locations is sellable. Structural, external, committed, and returns locations are never sellable.
   
   → [Inventory data contract](inventree-integration.md#inventory-data-contract), [Physical movements](inventree-integration.md#physical-movements), [Inventory projection and reservations](dynamodb-data-model.md#inventory-projection-and-reservations)
-- **Rejected:** A product `inventory_count` with a decrement, synchronous InvenTree calls at checkout, and TTL-based hold expiry.
+- **Rejected:** A product `inventory_count` with a decrement, synchronous InvenTree calls at checkout, TTL-based hold expiry, and removing stock at payment.
 - **Consequences:** Checkout fails closed when a projection is stale (20 minutes). Fulfillment is blocked until COMMIT completes. InvenTree records how many units shipped for an order, not which batch or serial went to which order. Per-order batch or serial traceability needs a new decision. So does selling a trackable, serialized, batch-traced, or expiring part: it would need serial selection in COMMIT and SHIP, and it conflicts with fungible SHIP stock.
 
 ### ADR-012: Payment lifecycle
@@ -312,7 +312,7 @@ Each question has a default that applies in dev. Prod needs an answer.
 
 | ID | Question | Default until decided | Blocks |
 |---|---|---|---|
-| OPEN-01 | Inventory owner decisions 3, 5–7, and 9–15 ([list](inventree-integration.md#inventory-owner-decisions)): the two-step movement and location names, late-payment handling, automatic UNCOMMIT and returns, optional and consumable BOM lines, cart limits, the SKU-to-part rule, sync and freshness intervals, allocation subtraction, partial refunds and disputes, legacy `inventory_count`, storefront availability display | As listed there | Prod go-live; the dev mapping data |
+| OPEN-01 | Inventory owner decisions 5–7 and 9–15 ([list](inventree-integration.md#inventory-owner-decisions)): late-payment handling, automatic UNCOMMIT and returns, optional and consumable BOM lines, cart limits, the SKU-to-part rule, sync and freshness intervals, allocation subtraction, partial refunds and disputes, legacy `inventory_count`, storefront availability display | As listed there | Prod go-live; the dev mapping data |
 
 ## Owner actions
 

@@ -631,7 +631,7 @@ The defaults above let implementation proceed in dev. These need owner confirmat
 
 1. Fulfillment mode per kit. **Resolved 2026-09-30:** kits are `COMPONENTS` by default. A kit is `STOCKED_PART` only when the owner deliberately maps that kit as a pre-bagged finished kit ([ADR-011](architecture-decisions.md#adr-011-inventory-data-contract)).
 2. Location policy and sellable statuses. **Resolved 2026-09-30:** only `OK` stock is sellable. Every sellable location is allowlisted individually; structural, external, committed, and returns locations are never sellable ([ADR-011](architecture-decisions.md#adr-011-inventory-data-contract)). The location IDs themselves are post-install configuration, not an owner decision ([ADR-026](architecture-decisions.md#adr-026-inventree-first-location-ids-by-second-apply)).
-3. Two-step movement (commit at payment, remove at shipping) versus removal at payment. Also the names of the committed and returns locations; their IDs are recorded after install, as in item 2.
+3. Two-step movement versus removal at payment, and the location names. **Resolved 2026-09-30:** the movement is two-step: COMMIT transfers stock to the committed location at verified payment, and SHIP removes it at shipping. The locations are named `Web orders – committed` and `Returns – inspection`. Their IDs are post-install configuration, as in item 2 ([ADR-011](architecture-decisions.md#adr-011-inventory-data-contract)).
 4. Checkout hold duration. **Resolved 2026-09-28** ([Payment processing](payment-processing.md#inventory)):
    - a 31-minute Stripe session and a 35-minute reservation for both providers;
    - Stripe offers card and wallet methods only;
