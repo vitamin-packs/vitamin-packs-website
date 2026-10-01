@@ -395,7 +395,7 @@ Do not run this script against production: it is sample data and uses unconditio
 5. Run a full sync and reconciliation.
 6. Re-enable checkout.
 
-Never load old `inventory_count` values into InvenTree or the projection unless the owner confirms they are physical counts, and then only as an audited InvenTree stock count.
+Old `inventory_count` values are never loaded into InvenTree or the projection ([ADR-011](architecture-decisions.md#adr-011-inventory-data-contract)). Opening stock is entered in InvenTree by staff from a physical count.
 
 ### Example: fetch a product (boto3)
 
