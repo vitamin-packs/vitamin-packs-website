@@ -86,7 +86,7 @@ Money-only facts live in separate attributes and never change `status`:
 - `dispute_state` (`open`, `won`, `lost`);
 - `payment_exception` (a payment that could not be applied automatically).
 
-Every payment transition is a conditional update inside the processor's transaction, guarded by the prior `status` (for example, `#status IN (:pending, :payment_pending)`). A duplicate or out-of-order event therefore can't re-apply it. The one exception is a late payment on an order whose hold was released (`cancelled` with `release_reason = expired`). It is handled by row 7 below, never by the normal transition.
+Every payment transition is a conditional update inside the processor's transaction, guarded by the prior `status` (for example, `#status IN (:pending, :payment_pending)`). The same update sets `GSI1PK = ORDERS#<new status>`, which drives the admin order queues ([Order header attributes](dynamodb-data-model.md#order-header-attributes)). A duplicate or out-of-order event therefore can't re-apply it. The one exception is a late payment on an order whose hold was released (`cancelled` with `release_reason = expired`). It is handled by row 7 below, never by the normal transition.
 
 ## Order, Payment and Inventory States
 
@@ -490,7 +490,7 @@ Run these in dev against sandbox providers and dev InvenTree:
 
 - Two concurrent checkouts for the last unit: exactly one order is created, and the other gets 409. Repeat with a kit and a separately sold component that share the last unit of one part.
 - A kit with N components where one is short: no order is written and no projection changes.
-- A stale projection (sync stopped for more than 20 minutes) returns 503, and a missing `STOCK#` item or mapping `ERROR` returns 503 or 409, never success.
+- A stale projection (sync stopped for longer than the [freshness limit](inventree-integration.md#sync-and-freshness): 20 minutes in prod, 60 in dev) returns 503, and a missing `STOCK#` item or mapping `ERROR` returns 503 or 409, never success.
 - A sync running concurrently with checkouts, releases, and commit completion keeps `available_qty = observed_qty - reserved_qty` after every step, with no negative `available_qty` in any sampled state.
 - Kill the COMMIT worker after the InvenTree request but before completion: the retry finds the tracking entry by `job_key` and never moves stock twice.
 - Request a movement larger than the stock held: the job reaches `NEEDS_ATTENTION`, and InvenTree never clamps it into a partial transfer.
@@ -529,7 +529,7 @@ Run in dev with sandbox credentials only. Never use live credentials or real pay
   - a `checkout.session.expired` event after a cancel is a no-op.
 - **Ship-to address:**
   - checkout with a missing, unknown, or another customer's `addressId` returns 409 `address_required` and writes nothing;
-  - a country outside `SHIP_COUNTRIES` returns 400;
+  - a country outside `SHIP_COUNTRIES`, or a region outside `SHIP_REGIONS` (for example `PR` or `AE`), returns 400;
   - the Stripe PaymentIntent and the PayPal order carry the order's `ship_to`, and PayPal does not let the buyer change it;
   - editing or deleting the profile address after checkout leaves the order's `ship_to` unchanged.
 - **Pending:** a PayPal sandbox `PENDING` capture holds stock as `payment_pending`. Completion follows row 6; a decline or the 72-hour expiry releases it.

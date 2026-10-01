@@ -20,7 +20,7 @@ Exceptions:
 | Entity | PK | SK | Notes |
 |---|---|---|---|
 | Product | `PRODUCT#<sku>` | `PRODUCT#<sku>` | Kits and individual components share this shape. |
-| Category | `CATEGORY#<tag>` | `METADATA` | Display label/description/sort order for a browsable tag. |
+| Category | `CATEGORY#<tag>` | `METADATA` | Display label/description/sort order for a browsable tag. Carries `GSI1PK = CATEGORIES`, `GSI1SK = SORT#<sort_order zero-padded to 4>#<tag>` so the category list is one `Query`. |
 | Order header | `ORDER#<orderId>` | `ORDER#<orderId>` | One per order. Stores `user_sub` (the owning customer's Cognito `sub`) for ownership checks. |
 | Order line item | `ORDER#<orderId>` | `ORDER#<orderId>#ITEM#<sku>` | One per SKU in the order; `Query` on `PK` returns the header and all line items together. |
 | User profile | `USER#<sub>` | `PROFILE` | `<sub>` is the Cognito user pool subject claim. Contact details, the Cognito email mirror, and the address book. See [Profile attributes](#profile-attributes). |
@@ -30,15 +30,14 @@ Exceptions:
 | Stock projection | `STOCK#<partId>` | `PROJECTION` | One per InvenTree part that any SKU consumes. Derived from InvenTree; written only by inventory sync, checkout, release, and job completion. See [Inventory projection and reservations](#inventory-projection-and-reservations). |
 | Order reservation | `ORDER#<orderId>` | `RESERVATION` | One per order: every part quantity the order holds against the projection. |
 | Inventory job | `ORDER#<orderId>` | `INVJOB#<kind>` | One per order per movement kind (`COMMIT`, `UNCOMMIT`, `SHIP`). Durable, idempotent InvenTree stock movement. |
-| Admin stock adjustment job | `ADJ#<adjustmentId>` | `INVJOB#ADJUST` | One per admin stock adjustment. Same job lifecycle; see [Inventory job](#inventory-job-orderorderid--invjobkind). |
-| Inventory sync state | `SYNC#inventory` | `STATE` | Last start, last success, and error counts for the sync. |
+| Inventory sync state | `SYNC#inventory` | `STATE` | Last start, last success, error counts, and `status` (`OK`, `ERROR`, or `LOCATIONS_UNCONFIGURED`; see [Eligible stock](inventree-integration.md#eligible-stock)). |
 
 `<partId>` is the InvenTree part primary key in that environment. Dev and prod InvenTree have different keys, so part mappings are environment data and are never promoted from dev to prod.
 
 ### Product attributes
 
 ```
-sku                     string  (also embedded in PK/SK)
+sku                     string  (also embedded in PK/SK; starts with "vp-dev-" in dev, no environment marker in prod)
 name                    string
 description             string
 price                   number  (integer cents)
@@ -63,7 +62,7 @@ updated_at              string  (ISO 8601)
 
 `sellable_individually` and the GSI1 attributes work together (see below) to hide kit-only components from catalog browsing while keeping them directly retrievable for a kit's bill of materials.
 
-Products carry **no stock quantity**. The former `inventory_count` attribute is removed: physical stock belongs to InvenTree, and sellable availability lives on the part-keyed stock projection. Admin product forms must not accept or write quantities. `availability_hint` is a display convenience written by sync and is never read by checkout.
+Products carry **no stock quantity**. The former `inventory_count` attribute is removed: physical stock belongs to InvenTree, and sellable availability lives on the part-keyed stock projection. Admin product forms must not accept or write quantities. `availability_hint` is a display convenience written by sync and is never read by checkout. Its `state` is `out` at 0 or fewer sellable units, `low` at 1 to 10, `in_stock` at 11 or more, and `unknown` when the mapping is not `OK` or a required part has no projection. `as_of` is the oldest `source_snapshot_at` among the product's parts. The rules, including sellable units for a kit, are in [Storefront availability](inventree-integration.md#storefront-availability).
 
 ### Cart attributes
 
@@ -72,7 +71,7 @@ lines              list<{ sku: string, quantity: number }>   # at most 10 lines;
 version            number  (starts at 1; every cart write increments it, conditioned on the version the client read)
 checkout_order_id  string  (set by the checkout transaction; absent otherwise)
 updated_at         string  (ISO)
-ttl                number  (epoch s: last write + 30 days; abandoned-cart expiry, duration is an open owner question)
+ttl                number  (epoch s: last write + 15 days; abandoned-cart expiry, ADR-019)
 ```
 
 Lifecycle (proposed, [ADR-019](architecture-decisions.md#adr-019-cart-schema-and-lifecycle)):
@@ -111,15 +110,15 @@ recipient_name  string  (1–100)
 line1           string  (1–100)
 line2           string  (optional; ≤ 100)
 city            string  (1–60)
-region          string  (≤ 60; state or province code; required when country = "US")
-postal_code     string  (≤ 20; US: ^\d{5}(-\d{4})?$)
-country         string  (ISO 3166-1 alpha-2; must be in SHIP_COUNTRIES, default ["US"], OPEN-10)
+region          string  (required; two-letter USPS code in SHIP_REGIONS: the 50 states and DC; no territories or APO/FPO; ADR-024)
+postal_code     string  (^\d{5}(-\d{4})?$)
+country         string  (ISO 3166-1 alpha-2; must be in SHIP_COUNTRIES = ["US"], ADR-024)
 phone           string  (optional; E.164, for the courier)
 created_at      string  (ISO)
 updated_at      string  (ISO)
 ```
 
-Request schemas are closed: unknown fields are rejected with 400. Strings are NFC-normalized and trimmed, and control characters are rejected. The item stays near 5 KB, well under the 400 KB item limit.
+Request schemas are closed: unknown fields are rejected with 400. Strings are NFC-normalized and trimmed, and control characters are rejected. `region` is uppercased before the `SHIP_REGIONS` check. The item stays near 5 KB, well under the 400 KB item limit.
 
 Lifecycle:
 - `GET /account/profile` never creates the item. When it is missing, the handler returns an empty profile with `version: 0`. The first mutation creates it with `attribute_not_exists(PK)`, so no Cognito post-confirmation trigger is needed.
@@ -150,7 +149,10 @@ ship_to             map     (copy of the chosen profile Address without label, c
 ship_to_address_id  string  (the profile addressId it was copied from; display only, never re-read)
 contact_email       string  (the profile email mirror at checkout)
 GSI2PK / GSI2SK     "USER#<sub>" / "ORDER#<created_at>#<orderId>"
+GSI1PK / GSI1SK     "ORDERS#<status>" / "ORDER#<created_at>#<orderId>"   # admin order queues; see GSI1
 ```
+
+`GSI1PK` always equals `ORDERS#` + the current `status`. Every write that sets `status`, whether the checkout `Put` or a conditional transition update, sets `GSI1PK` in the same expression. It is never a separate action, so no transaction budget changes. `GSI1SK` is written once at checkout.
 
 Only the payment-event processor writes `status` payment transitions, `payment_ref`, `paid_at`, `refunded_minor`, `dispute_state`, and `payment_exception` (see [Payment processing](payment-processing.md#order-payment-and-inventory-states)). The admin fulfillment gate reads `status`, `inventory_state`, `dispute_state`, and `payment_exception`.
 
@@ -185,7 +187,7 @@ The projection is keyed by InvenTree part, not by SKU. A component sold individu
 
 ```
 part_id              number
-part_ipn             string   (cross-check only)
+part_ipn             string   (cross-check only: equals the SKU for STOCKED_PART mappings)
 units                string   (InvenTree part units; quantities below are in these units)
 observed_qty         number   # eligible physical quantity InvenTree reported in the snapshot
 reserved_qty         number   # sum of this part across reservations that are HELD, COMMITTING, or COMMITTED and not yet retired
@@ -253,19 +255,6 @@ created_at, completed_at  string  (ISO)
 GSI2PK / GSI2SK    "INVJOB#OPEN" / "<created_at>#<orderId>#<kind>"  (only while not terminal)
 ```
 
-An admin stock adjustment uses the same attributes with `PK = ADJ#<adjustmentId>`, `SK = INVJOB#ADJUST`, and these differences:
-
-```
-kind               "ADJUST"
-job_key            "vp-<env>-adj-<adjustmentId>"
-op                 string  (default "ADD" | "REMOVE" | "COUNT"; the offered set is an open owner decision)
-part_id, location_id, quantity   (location in the environment's eligible allowlist)
-actor_sub, reason  string  (audit: the admin's Cognito sub and the stated reason)
-GSI2SK             "<created_at>#ADJ#<adjustmentId>#ADJUST"
-```
-
-A decrease larger than the part's `available_qty` is rejected with 409 before the item is written, and the worker checks it again when it plans. There is no admin override. See [Async job contracts](backend-api.md#async-job-contracts).
-
 The job item is the durable record. The SQS message only wakes a worker. If the queue loses or delays a message, the job is still listed under `INVJOB#OPEN`, and a sweeper re-enqueues it.
 
 ### TTL
@@ -274,7 +263,17 @@ Do not use TTL to expire reservations. TTL deletes expired items "typically with
 
 ## Global Secondary Indexes
 
-### GSI1 — catalog browsing by category/tag, sorted by price
+### GSI1 — catalog browsing and admin order queues
+
+GSI1 carries three sparse key families. None collides with another:
+
+| GSI1PK | GSI1SK | On | Used by |
+|---|---|---|---|
+| `CATEGORY#<tag>` | `PRICE#<price>#SKU#<sku>` | sellable products | category browsing, sorted by price |
+| `CATEGORIES` | `SORT#<sort_order>#<tag>` | category items | the category list, and `GET /products` |
+| `ORDERS#<status>` | `ORDER#<created_at>#<orderId>` | order headers | admin order lists and work queues |
+
+#### Catalog
 
 - `GSI1PK = CATEGORY#<tag>`
 - `GSI1SK = PRICE#<price>#SKU#<sku>`
@@ -282,6 +281,20 @@ Do not use TTL to expire reservations. TTL deletes expired items "typically with
 Only set `GSI1PK`/`GSI1SK` on a product item when `sellable_individually = true`. DynamoDB GSIs are sparse: an item that omits the GSI's key attributes simply does not appear in that index. Kit-only components therefore never show up in category browsing, while remaining fully reachable via `GetItem` on `PK`/`SK` for BOM lookups.
 
 The current design supports one primary `category_tag` per product. If a product needs to appear under multiple tags later, add extra `CATEGORY#<tag>` marker items with the same `GSI1PK`/`GSI1SK` shape that point back to the product's `PK`/`SK` — don't duplicate the full product record.
+
+`GET /products` (all sellable products) queries `GSI1PK = CATEGORIES`, then queries each `CATEGORY#<tag>` partition. Because every product has exactly one primary tag, the union has no duplicates. The response is public and cacheable, so serve it behind CloudFront caching.
+
+#### Admin order queues
+
+- `GSI1PK = ORDERS#<status>`
+- `GSI1SK = ORDER#<created_at>#<orderId>`
+
+Set on order header items only, and moved with every `status` change (see [Order header attributes](#order-header-attributes)). A `Query` on one status, newest first, gives the admin order list. The work queues are status partitions narrowed by a filter on the header:
+- **Ready to ship:** `ORDERS#paid`, filtered on `inventory_state = committed`, `dispute_state` not `open`, and no `payment_exception` (the row-14 guard; the ship route re-checks it with a consistent read).
+- **Needs attention:** `ORDERS#paid`, filtered on `inventory_state = needs_attention` or `attribute_exists(payment_exception)`.
+- **Open checkouts:** `ORDERS#pending` and `ORDERS#payment_pending`.
+
+Moving an item between partitions is one GSI delete and one put, both charged as GSI writes. GSI results are eventually consistent, so an admin action re-reads the header with `ConsistentRead=True` before acting. At this order volume a single partition per status is fine. The same 1,000-writes-per-second note as GSI2 applies.
 
 ### GSI2 — a user's order history
 
@@ -299,7 +312,7 @@ GSI2 also carries five sparse, fixed-partition keys. None of them collides with 
 | `INVMAP` | `SKU#<sku>` | sellable products | sync enumerates mapped SKUs |
 | `INVSTOCK` | `PART#<partId>` | projections | sync and reconciliation enumerate parts |
 | `INVHOLD` | `EXP#<expires_at>#<orderId>` | reservations while `HELD` | expiry sweeper |
-| `INVJOB#OPEN` | `<created_at>#<orderId>#<kind>`, or `<created_at>#ADJ#<adjustmentId>#ADJUST` | non-terminal jobs | re-enqueue sweeper and reconciliation |
+| `INVJOB#OPEN` | `<created_at>#<orderId>#<kind>` | non-terminal jobs | re-enqueue sweeper and reconciliation |
 | `PAYEVT#OPEN` | `<next_attempt_at>#<provider>#<eventId>` | payment events while `RECEIVED`, `PROCESSING`, or `FAILED` | payment sweeper re-drive and alarms |
 
 GSI reads are eventually consistent. Sweepers treat index results only as candidates. They re-read the base item with `ConsistentRead=True`, and their conditional writes enforce the state.
@@ -312,6 +325,10 @@ Order volume is small, so a single partition per key is acceptable. Revisit if h
 |---|---|
 | Get a product by SKU | `GetItem` on `PK=SK=PRODUCT#<sku>` |
 | Browse a category, sorted by price | `Query` on `GSI1` with `GSI1PK=CATEGORY#<tag>` |
+| List categories | `Query` on `GSI1` with `GSI1PK=CATEGORIES` |
+| List all sellable products (`GET /products`) | list categories, then `Query` each `GSI1PK=CATEGORY#<tag>` |
+| List all products, including kit-only components (admin) | paginated `Scan` with `FilterExpression begins_with(PK, "PRODUCT#")`; see [Admin listing and reporting](#admin-listing-and-reporting) |
+| Admin order list / work queue by status | `Query` on `GSI1` with `GSI1PK=ORDERS#<status>`, `ScanIndexForward=False`, plus the queue filter |
 | Get an order and its line items | `Query` on `PK=ORDER#<orderId>` |
 | List a user's orders | `Query` on `GSI2` with `GSI2PK=USER#<sub>` |
 | Get or update a cart | `GetItem`/`PutItem` on `PK=SK=CART#<sub>` |
@@ -341,11 +358,26 @@ Order volume is small, so a single partition per key is acceptable. Revisit if h
 
 That is `3 + 2L + P` actions. The profile read and the `ship_to` snapshot add no action: the order holds a copy, so a concurrent profile edit is harmless. Enforce **L ≤ 10 lines and P ≤ 75 distinct parts** (at most 98 actions). Reject larger carts with 400 before writing. Adjust these limits only while keeping the total at 100 or less.
 
+## Admin listing and reporting
+
+DynamoDB stays the only application database ([ADR-025](architecture-decisions.md#adr-025-dynamodb-remains-the-application-database)). The admin app's list and report needs are met like this:
+
+- **Orders:** the `ORDERS#<status>` partitions on GSI1 (see [Admin order queues](#admin-order-queues)), paginated with `LastEvaluatedKey` returned as an opaque cursor.
+- **Products:** a paginated `Scan` filtered on `begins_with(PK, "PRODUCT#")`. A Scan reads, and is charged for, every item in the table. At a few thousand items that is a few cents a month for one admin user. Replace it with a sparse key if the table grows past about 50 MB or the page takes more than about a second.
+- **Reports** (sales by SKU or month, refund totals, dispute counts): not built yet. The first version is an admin route that queries the `ORDERS#paid`, `ORDERS#fulfilled`, and `ORDERS#refunded` partitions for a `created_at` range (a `GSI1SK` `BETWEEN`), and aggregates in Lambda. If reporting later needs ad-hoc queries, use DynamoDB incremental export to S3 and query it with Athena. That needs point-in-time recovery, which the delivery plan already requires for the table ([Phase 4](development-and-deployment-plan.md#phase-4-application-infrastructure)), and no change to the table design. It is **not built**.
+
+Never add a SQL copy of the table for reporting without a new decision: see ADR-025.
+
+## Cost drivers
+
+On-demand billing charges per request. Storage stays inside the free 25 GB. At the expected volume, the table costs a few dollars a month in prod and about nothing in idle dev. The main driver is the [inventory sync](#inventory-sync-pseudocode): every run writes every projection, because each write refreshes `source_snapshot_at` for the checkout freshness check. That is one write per part per run, or about 8,640 × (number of parts) writes a month in prod at the 5-minute interval. Dev syncs every 30 minutes, and only while it is started. GSI2 doubles it when its projection includes the changed attributes. Watch the per-run write count in the sync metrics. A transactional write costs two write units per item. Checkout, payment, and release volumes are too small to matter.
+
 ## Dev seed data
 
-`scripts/seed-dev.py` is planned; it does not exist in the repository yet. When written, it loads the development catalog only after the dev table exists. It creates a small catalog, categories, kit display BOMs, and kit-only components, and deliberately omits `GSI1PK`/`GSI1SK` for the kit-only records so they cannot appear in the public catalog.
+`scripts/seed-dev.py` is planned; it does not exist in the repository yet. When written, it loads the development catalog only after the dev table exists. It creates a small catalog, categories (with their `CATEGORIES` GSI1 keys), kit display BOMs, and kit-only components, and deliberately omits `GSI1PK`/`GSI1SK` for the kit-only records so they cannot appear in the public catalog.
 
 - It must not write `inventory_count`, `STOCK#` projections, reservations, or jobs. Projections come only from an inventory sync against dev InvenTree.
+- Every SKU it writes starts with `vp-dev-`, including kit-only components and display-BOM entries ([Eligible stock](inventree-integration.md#eligible-stock)).
 - It writes `fulfillment_mode` and `inventree_part_id` for dev InvenTree parts that the operator created. Those IDs are dev-specific and passed in as a mapping file, never guessed from names.
 - It leaves `stock_requirements`, `mapping_version`, and `mapping_status` to the sync. The first sync validates them.
 
@@ -363,7 +395,7 @@ Do not run this script against production: it is sample data and uses unconditio
 5. Run a full sync and reconciliation.
 6. Re-enable checkout.
 
-Never load old `inventory_count` values into InvenTree or the projection unless the owner confirms they are physical counts, and then only as an audited InvenTree stock count.
+Old `inventory_count` values are never loaded into InvenTree or the projection ([ADR-011](architecture-decisions.md#adr-011-inventory-data-contract)). Opening stock is entered in InvenTree by staff from a physical count.
 
 ### Example: fetch a product (boto3)
 
@@ -401,7 +433,8 @@ def checkout(sub, cart_version, address_id, provider):
         return existing_checkout(cart.checkout_order_id)
     profile = get_profile(sub, consistent=True)                  # 409 "address_required" if missing or tombstoned
     address = profile.addresses.get(address_id)                  # 409 "address_required" if absent
-    require(address.country in SHIP_COUNTRIES)                   # else 400
+    require(address.country in SHIP_COUNTRIES                    # else 400
+            and address.region in SHIP_REGIONS)
     products = batch_get_products(cart.skus, consistent=True)
     for p in products:
         require(p.sellable_individually and p.mapping_status == "OK")   # else 409 "unavailable"
@@ -413,11 +446,12 @@ def checkout(sub, cart_version, address_id, provider):
 
     order_id, now = new_uuid(), utc_now()                        # iso() formats YYYY-MM-DDTHH:MM:SSZ
     expires_at = iso(now + HOLD)                                 # 35 min; see Payment processing
-    fresh_after = iso(now - FRESHNESS)                           # 20 min in prod
+    fresh_after = iso(now - FRESHNESS)                           # 20 min in prod, 60 min in dev
     actions = [
         Put(order_header(order_id, sub, status="pending", inventory_state="reserved",
                          total_minor=sum_of_lines, currency=currency, refunded_minor=0,
                          created_at=iso(now),
+                         GSI1PK="ORDERS#pending", GSI1SK=f"ORDER#{iso(now)}#{order_id}",
                          ship_to=snapshot(address), ship_to_address_id=address_id,   # copy; later edits never change it
                          contact_email=profile.email,
                          session_expires_at=iso(now + timedelta(seconds=1860))),  # >= 30 min after session creation (60 s margin); stored for idempotent retries
@@ -428,7 +462,7 @@ def checkout(sub, cart_version, address_id, provider):
         Put(reservation(order_id, state="HELD", parts=need, expires_at=expires_at,
                         GSI2PK="INVHOLD", GSI2SK=f"EXP#{expires_at}#{order_id}"),
             cond="attribute_not_exists(PK)"),
-        Update(cart_key(sub), "SET checkout_order_id = :oid, #ttl = :cart_ttl",
+        Update(cart_key(sub), "SET checkout_order_id = :oid, #ttl = :cart_ttl",   # :cart_ttl = epoch(now + 15 days)
                cond="version = :v AND attribute_not_exists(checkout_order_id)"),
         *[Update(stock_key(part_id),
                  "SET reserved_qty = reserved_qty + :q, available_qty = available_qty - :q",
@@ -496,6 +530,8 @@ def sync():
     write_availability_hints()
 ```
 
+`write_availability_hints()` sets each mapped product's `availability_hint` from the projections of its parts, using `LOW_STOCK_THRESHOLD` = 10 ([Storefront availability](inventree-integration.md#storefront-availability)).
+
 No transient oversell window:
 
 - **Snapshot started before the movement:** `observed_qty` still includes the units, and the reservation still subtracts them.
@@ -552,7 +588,8 @@ def release(order_id, reason, from_states=("HELD",), ledger=None):
                cond="#s IN (:from_states) AND (attribute_not_exists(capture_claim_until) "
                     "OR capture_claim_until < :now)"),          # exactly once; never under a live PayPal capture
         *([ledger_update(ledger, "SUCCEEDED")] if ledger else []),   # when a payment event drives the release
-        Update(order_key(order_id), "SET #status = :cancelled_or_refunded, inventory_state = :released"),
+        Update(order_key(order_id), "SET #status = :cancelled_or_refunded, GSI1PK = :orders_status, "
+                                    "inventory_state = :released"),       # GSI1PK tracks status
         *[Update(stock_key(p), "SET reserved_qty = reserved_qty - :q, available_qty = available_qty + :q")
           for p, q in res.parts.items()],
     ])

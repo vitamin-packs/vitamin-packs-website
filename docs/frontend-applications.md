@@ -153,7 +153,7 @@ The storefront owns public catalog browsing, product details, kit bills of mater
   - **Contact:** display name, phone, and marketing opt-in (`PUT /account/profile`).
   - **Email:** change and verify through Cognito ([Email change](cognito-authentication.md#email-change)), then re-read the profile.
   - **Password:** change through Amplify `updatePassword`.
-  - **Addresses:** list, add, edit, delete, and set the default, up to 5. Show a 409 `address_limit` as a clear message.
+  - **Addresses:** list, add, edit, delete, and set the default, up to 5. Show a 409 `address_limit` as a clear message. The address form offers a state `<select>` of the 50 states and DC and no country field; the client sends `country: "US"`. The server remains the authority.
   - **Delete account:** a typed "DELETE" confirmation, a statement that past orders are kept, and the re-authentication step on 403 `reauth_required`. A 409 `checkout_open` points the customer to cancel or finish the open checkout.
   - Every edit sends the `version` it read. On 409 `version_conflict`, re-read the profile and show the fresh data before the customer retries.
 - Checkout shows an address picker that defaults to the profile's default address, with an inline "add address" form (`POST /account/addresses`, then use the returned `addressId`). Checkout sends that `addressId`. On 409 `address_required`, return to the picker.
@@ -164,6 +164,11 @@ Checkout cancel ([Customer Cancel](payment-processing.md#customer-cancel)):
 - The Stripe and PayPal `cancel_url` page reads the open order ID from `GET /cart` (`checkout_order_id`), calls `POST /checkout/cancel` once, and then shows the re-read, unlocked cart.
 - While `GET /cart` returns a `checkout_order_id`, the cart page shows the open checkout with "Resume checkout" (the stored provider URL) and "Cancel checkout" (the same route).
 - Responses: 200 → show the cart. 409 `processing` → poll `GET /orders/{orderId}` as the success page does. 409 `checkout_starting` → wait briefly and retry. 409 with a paid status → show the order. 503 → offer a retry.
+
+Availability ([Storefront availability](inventree-integration.md#storefront-availability)):
+- Show the API's `availability` state as "In stock", "Low stock", "Out of stock", or "Currently unavailable" (`unknown`). Never show a count.
+- Disable add-to-cart for `out` and `unknown`.
+- The state is advisory. Checkout is the authority, so show its rejection even when the product page said in stock.
 
 Kit-only components must not be presented as standalone products. The API is authoritative and omits them from catalog results; the UI should also treat `sellable_individually: false` items as BOM components rather than purchasable catalog products.
 

@@ -500,7 +500,7 @@ Rules:
 
 ## Admin onboarding, audit, revocation, and recovery
 
-The **AWS account owner**, using an IAM principal with MFA, is the only operator. Which Identity Center permission set carries the `cognito-idp:Admin*` user-management actions is not yet defined ([OPEN-06](architecture-decisions.md#open-questions)). Do not create Cognito users with Terraform: `aws_cognito_user` would place temporary passwords in state. There is no standing break-glass admin user. Recovery is re-provisioning by the account owner.
+The **AWS account owner**, using an IAM principal with MFA, is the only operator. The `cognito-idp:Admin*` user-management actions below run under the account owner's own administrator access; no Identity Center permission set carries them ([ADR-009](architecture-decisions.md#adr-009-cognito-pools-and-tokens)). Do not create Cognito users with Terraform: `aws_cognito_user` would place temporary passwords in state. There is no standing break-glass admin user. Recovery is re-provisioning by the account owner.
 
 **Onboard** (targeting the environment's admin pool explicitly):
 

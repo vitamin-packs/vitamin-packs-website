@@ -8,6 +8,7 @@ Everything below is **design**. As of 2026-09-28 the repository holds only docum
 - **Accepted:** the owner approved it, or it records a verified fact.
 - **Proposed:** architect-resolved design waiting for owner confirmation or dev verification. Implementation may proceed in dev.
 - **Open:** needs an owner answer. Do not implement a policy for it beyond the default named here.
+- **Superseded:** replaced by the decision named in its status. Kept as history; do not implement it.
 
 **Owner:** the project owner. They are the sole approver and the only holder of prod deploy rights.
 
@@ -22,6 +23,7 @@ Everything below is **design**. As of 2026-09-28 the repository holds only docum
 | Cognito pools, tokens, claims, `require_admin` | [Cognito authentication](cognito-authentication.md) |
 | Browser session storage and CSP | [Cognito: Session storage and XSS](cognito-authentication.md#session-storage-and-xss), [Frontend applications](frontend-applications.md#session-security-and-content-security-policy) |
 | DynamoDB keys, indexes, cart, reservations, jobs, timestamps | [DynamoDB data model](dynamodb-data-model.md) |
+| Admin order queues, product listing, reporting, table cost drivers | [DynamoDB data model: Admin listing and reporting](dynamodb-data-model.md#admin-listing-and-reporting), [ADR-025](#adr-025-dynamodb-remains-the-application-database) |
 | Stock authority, eligibility, kits, sync, movements, reconciliation | [InvenTree integration: Inventory data contract](inventree-integration.md#inventory-data-contract) |
 | Order, payment, and inventory state table | [Payment processing](payment-processing.md#order-payment-and-inventory-states) |
 | Customer checkout cancel | [Payment processing: Customer Cancel](payment-processing.md#customer-cancel) |
@@ -33,6 +35,7 @@ Everything below is **design**. As of 2026-09-28 the repository holds only docum
 | Release workflow, approval gates, credentials, secrets, InvenTree rollout | [Infrastructure development workflow](infrastructure-development.md) |
 | Terraform structure, naming, safety | [Terraform conventions](terraform-conventions.md) |
 | Implementation order and release checklist | [Delivery plan](development-and-deployment-plan.md) |
+| First-release order per environment, InvenTree location configuration | [ADR-026](#adr-026-inventree-first-location-ids-by-second-apply), [Eligible stock](inventree-integration.md#eligible-stock) |
 
 ## Decisions
 
@@ -44,17 +47,17 @@ Everything below is **design**. As of 2026-09-28 the repository holds only docum
 - **Consequences:** Docs say "planned" for modules. Implementers confirm repository and AWS state before relying on anything.
 
 ### ADR-002: InvenTree hosting
-- **Status:** Accepted, 2026-09-28. Owner: project owner.
+- **Status:** Accepted, 2026-09-28. The InvenTree sender address `contact@vitamin-packs.com` for both environments is accepted, 2026-09-30 (resolves the former OPEN-08). Owner: project owner.
 - **Context:** One staff user, a prod budget under $50/month, and RTO/RPO measured in hours.
-- **Decision:** InvenTree 1.5.6 pinned by digest, on one EC2 host per environment (an Auto Scaling group of one). It runs gunicorn, a django-q2 worker with a PostgreSQL broker, and Caddy. There is no Redis, media is in S3, and email goes through the SES API. → [InvenTree Host](inventree-integration.md#inventree-host)
+- **Decision:** InvenTree 1.5.6 pinned by digest, on one EC2 host per environment (an Auto Scaling group of one). It runs gunicorn, a django-q2 worker with a PostgreSQL broker, and Caddy. There is no Redis, media is in S3, and email goes through the SES API from `contact@vitamin-packs.com` in both dev and prod. → [InvenTree Host](inventree-integration.md#inventree-host)
 - **Rejected:** ECS or multiple nodes, an internal ALB, Redis or ElastiCache, and Celery.
-- **Consequences:** A few minutes of downtime during upgrades, inside the 20-minute freshness limit. Scale-out is documented but not built.
+- **Consequences:** A few minutes of downtime during upgrades, inside the freshness limit. Scale-out is documented but not built.
 
 ### ADR-003: Network and egress
 - **Status:** Accepted, 2026-09-28 (the owner approved the CIDRs and rejected interface endpoints for cost). Owner: project owner.
 - **Decision:** One VPC per environment (dev `192.168.0.0/19`, prod `192.168.32.0/19`), holding only the InvenTree resources and the two inventory Lambdas. A t4g.nano NAT instance, S3 and DynamoDB gateway endpoints, and no interface endpoints. → [VPC](inventree-integration.md#vpc), [Subnets, Routes and Egress](inventree-integration.md#subnets-routes-and-egress)
 - **Rejected:** A shared application VPC, a NAT gateway, interface endpoints, and Transit Gateway or peering.
-- **Consequences:** If the NAT fails, sync and jobs stop, and checkout fails closed after 20 minutes. `192.168.x` rules out a future site-to-site VPN without readdressing.
+- **Consequences:** If the NAT fails, sync and jobs stop, and checkout fails closed after the freshness limit. `192.168.x` rules out a future site-to-site VPN without readdressing.
 
 ### ADR-004: Staff access
 - **Status:** Accepted, 2026-09-28. Owner: project owner.
@@ -87,10 +90,10 @@ Everything below is **design**. As of 2026-09-28 the repository holds only docum
 - **Consequences:** A `shared/` change redeploys every function, which is intended.
 
 ### ADR-009: Cognito pools and tokens
-- **Status:** Proposed, 2026-09-28. The owner accepted two parts: HTTP APIs answering an ID token with 403, and 90-day CloudTrail Event history instead of a dedicated trail. Owner: project owner.
-- **Decision:** Separate customer and admin pools on the Lite tier, set explicitly because the default tier is Essentials. SRP only; admin pool admin-create-only with TOTP required. Browsers send access tokens, and the authorizers require the `aws.cognito.signin.user.admin` scope. → [Cognito authentication](cognito-authentication.md)
+- **Status:** Proposed, 2026-09-28. The owner accepted two parts: HTTP APIs answering an ID token with 403, and 90-day CloudTrail Event history instead of a dedicated trail. Managing Cognito admin users with the account owner's own administrator access is accepted, 2026-09-30 (resolves the former OPEN-06). Owner: project owner.
+- **Decision:** Separate customer and admin pools on the Lite tier, set explicitly because the default tier is Essentials. SRP only; admin pool admin-create-only with TOTP required. Browsers send access tokens, and the authorizers require the `aws.cognito.signin.user.admin` scope. The account owner creates, disables, and re-groups admin users with their own administrator access. No Identity Center permission set carries the `cognito-idp:Admin*` user-management actions. → [Cognito authentication](cognito-authentication.md), [Admin onboarding](cognito-authentication.md#admin-onboarding-audit-revocation-and-recovery)
 - **Rejected:** One shared pool, the Hosted UI, and sending ID tokens.
-- **Consequences:** Customer tokens can stay valid for up to 30 minutes after revocation.
+- **Consequences:** Customer tokens can stay valid for up to 30 minutes after revocation. Admin-user management is not least-privilege: it rides on full administrator access. A dedicated permission set, or a second person managing admin users, needs a new decision.
 
 ### ADR-010: Admin authorization
 - **Status:** Proposed, 2026-09-28. Owner: project owner.
@@ -99,15 +102,28 @@ Everything below is **design**. As of 2026-09-28 the repository holds only docum
 - **Consequences:** Two Cognito calls per admin request, which is acceptable at single-user volume.
 
 ### ADR-011: Inventory data contract
-- **Status:** Proposed, 2026-09-28. The owner accepted the hold durations. Owner decisions remain open: see [OPEN-01](#open-questions). Owner: project owner.
+- **Status:** Accepted, 2026-09-30. Proposed 2026-09-28, when the owner accepted the hold durations. Treating SHIP stock as fungible within the committed location is accepted, 2026-09-30 (resolves the former OPEN-07). Selling no trackable, serialized, batch-traced, or expiring parts is accepted, 2026-09-30 (resolves OPEN-01 item 8). Kits being `COMPONENTS` by default, with `STOCKED_PART` as a deliberate per-kit exception, is accepted, 2026-09-30 (resolves OPEN-01 item 1). Selling only `OK`-status stock from individually allowlisted locations is accepted, 2026-09-30 (resolves OPEN-01 item 2). The two-step movement (COMMIT at payment, SHIP at shipping) and the location names `Web orders – committed` and `Returns – inspection` are accepted, 2026-09-30 (resolves OPEN-01 item 3). Leaving a late payment that cannot be re-reserved to the operator is accepted, 2026-09-30 (resolves OPEN-01 item 5). Automatic UNCOMMIT after a full refund of a committed, unshipped order, and manual inspection and restocking of returns, are accepted, 2026-09-30 (resolves OPEN-01 item 6). Reserving optional BOM lines like any other line, and leaving consumable lines unreserved, are accepted, 2026-09-30 (resolves OPEN-01 item 7). Cart limits of 10 lines and 75 distinct parts are accepted, 2026-09-30 (resolves OPEN-01 item 9). The InvenTree `IPN` equalling the catalog SKU for `STOCKED_PART` mappings, with `vp-dev-` SKUs and IPNs in dev and plain ones in prod, is accepted, 2026-09-30 (resolves OPEN-01 item 10). A 5-minute sync interval and 20-minute freshness limit in prod, a 30-minute interval and 60-minute limit in dev, and blocking checkout when a projection is stale, are accepted, 2026-09-30 (resolves OPEN-01 item 11). Subtracting InvenTree build, sales, and transfer-order allocations from sellable stock is accepted, 2026-09-30 (resolves OPEN-01 item 12). Partial refunds being money-only, an open dispute blocking shipping, and a lost dispute or PayPal reversal being handled as a full refund, are accepted, 2026-09-30 (resolves OPEN-01 item 13). Discarding any existing `inventory_count` values, with opening stock entered in InvenTree from a physical count, is accepted, 2026-09-30 (resolves OPEN-01 item 14). Showing only in stock, low, or out on the storefront, with low at 10 or fewer sellable units, is accepted, 2026-09-30 (resolves OPEN-01 item 15). No owner decisions remain open. Owner: project owner.
 - **Decision:**
   - InvenTree is the sole physical-stock authority.
+  - Opening stock is entered in InvenTree from a physical count. Any old `inventory_count` values are recorded for audit and discarded, never imported.
   - DynamoDB holds a per-part derived projection (`observed_qty`, `reserved_qty`, `available_qty`) and a reservation ledger. Products carry no quantity.
-  - Movements run as idempotent COMMIT, UNCOMMIT, SHIP, and ADJUST jobs.
+  - Movements run as idempotent COMMIT, UNCOMMIT, and SHIP jobs. The movement is two-step: COMMIT transfers stock to `Web orders – committed` at verified payment, and SHIP removes it from there at shipping. Returns go to `Returns – inspection`.
+  - SHIP stock is fungible: SHIP removes any stock of the part in the committed location. It does not target the stock items that the order's COMMIT moved there.
+  - No sold part is trackable, serialized, batch-traced, or expiring. A trackable part is a mapping error.
+  - Kits are fulfilled from component stock (`COMPONENTS`) by default. A kit is `STOCKED_PART` only by a deliberate per-kit mapping.
+  - Only `OK`-status stock in individually allowlisted locations is sellable. Structural, external, committed, and returns locations are never sellable.
+  - Stock allocated in InvenTree to a build, sales, or transfer order is not sellable: `observed_qty` sums `quantity - allocated`, and COMMIT takes only unallocated units.
+  - A late payment after an expired hold re-reserves. If that fails, the order is `paid` / `needs_attention` with `payment_exception = late_unreserved`, and the operator refunds it or holds it until stock arrives.
+  - A full refund of a committed, unshipped order runs UNCOMMIT automatically. Returns are restocked only by staff, after inspection, in InvenTree. A refund after shipping never restocks.
+  - A partial refund is money-only and never moves stock. An open dispute blocks shipping. A lost dispute or a PayPal capture reversal is handled as a full refund.
+  - For a `COMPONENTS` kit, an optional BOM line is reserved like any other line. A consumable line is never reserved.
+  - For a `STOCKED_PART` mapping, the InvenTree `IPN` equals the catalog SKU. In dev, every SKU starts with `vp-dev-`, so those IPNs do too. In prod, SKUs and IPNs have no environment marker. A SKU that breaks either rule is a mapping error.
+  - Prod syncs every 5 minutes, and checkout rejects a part whose projection is more than 20 minutes old. Dev syncs every 30 minutes with a 60-minute limit, and its schedule is enabled only while dev runs.
+  - The storefront shows only in stock, low, or out, and never a count. Low is 10 or fewer sellable units, with one threshold for every product. When availability can't be determined, the storefront shows "Currently unavailable". Public catalog responses carry the state and no quantity.
   
-  → [Inventory data contract](inventree-integration.md#inventory-data-contract), [Inventory projection and reservations](dynamodb-data-model.md#inventory-projection-and-reservations)
-- **Rejected:** A product `inventory_count` with a decrement, synchronous InvenTree calls at checkout, and TTL-based hold expiry.
-- **Consequences:** Checkout fails closed when a projection is stale (20 minutes). Fulfillment is blocked until COMMIT completes.
+  → [Inventory data contract](inventree-integration.md#inventory-data-contract), [Storefront availability](inventree-integration.md#storefront-availability), [Physical movements](inventree-integration.md#physical-movements), [Inventory projection and reservations](dynamodb-data-model.md#inventory-projection-and-reservations)
+- **Rejected:** A product `inventory_count` with a decrement, synchronous InvenTree calls at checkout, TTL-based hold expiry, and removing stock at payment.
+- **Consequences:** Checkout fails closed when a projection is stale (20 minutes in prod, 60 in dev). A dev projection can be up to 60 minutes old, so a dev test that depends on a stock change runs the sync manually first. Fulfillment is blocked until COMMIT completes. InvenTree records how many units shipped for an order, not which batch or serial went to which order. Per-order batch or serial traceability needs a new decision. So does selling a trackable, serialized, batch-traced, or expiring part: it would need serial selection in COMMIT and SHIP, and it conflicts with fungible SHIP stock. A `late_unreserved` order waits on the operator; refunding it automatically or adding a backorder state needs a new decision. Stock from a refunded committed order is sellable again after the next sync without staff review; holding it for a manual check, or restocking returns automatically, needs a new decision. A kit is blocked when an optional part is out of stock; shipping a kit without an optional part needs a new decision. A kit still sells when a consumable part is at zero, and web orders never reserve or move consumable stock, so staff track it in InvenTree. Dev and prod SKUs differ, so catalog items are never copied between environments, like the part mappings. Cross-checking the IPN of a `COMPONENTS` kit's assembly part, or adding an environment marker to prod SKUs, needs a new decision. A forgotten or abandoned allocation in InvenTree hides that stock from the web until staff remove it. A partial refund leaves the order's stock where it is, so returning stock for an item that will not ship is a manual InvenTree change by staff; moving stock on a partial refund needs a new decision. Every sellable part must be counted and entered in InvenTree before it can sell; importing old `inventory_count` values needs a new decision. Customers cannot see how many units remain; showing exact counts, or a per-product low-stock threshold, needs a new decision.
 
 ### ADR-012: Payment lifecycle
 - **Status:** Proposed, 2026-09-28. Owner: project owner.
@@ -133,7 +149,7 @@ Everything below is **design**. As of 2026-09-28 the repository holds only docum
 - **Consequences:** The tag and CloudTrail record are the approval evidence.
 
 ### ADR-014: No admin override for stock decreases
-- **Status:** Accepted, 2026-09-28. Owner: project owner.
+- **Status:** Superseded by [ADR-027](#adr-027-stock-adjustments-in-inventree-only), 2026-09-30. Accepted, 2026-09-28. Owner: project owner.
 - **Decision:** An ADJUST decrease larger than `available_qty` is rejected with 409, with no override. → [Async job contracts](backend-api.md#async-job-contracts)
 - **Consequences:** Larger corrections are made in the InvenTree UI and picked up by the next sync.
 
@@ -151,14 +167,15 @@ Everything below is **design**. As of 2026-09-28 the repository holds only docum
 - **Consequences:** Less IAM surface. Browsers never hold AWS credentials.
 
 ### ADR-017: Terraform project value
-- **Status:** Accepted, 2026-09-28. Owner: project owner.
+- **Status:** Accepted, 2026-09-28. Keeping the `vitamin-packs-<env>-*` bucket names with no fallback chosen in advance is accepted, 2026-09-30 (resolves the former OPEN-09). Owner: project owner.
 - **Context:** Examples mixed `<project>`, `vp-`, and `diyhobbies`.
 - **Decision:** `project = "vitamin-packs"`, so resources are named `vitamin-packs-<env>-<purpose>` (for example `vitamin-packs-prod-jumpbox`). The short `vp-` prefix is **not** the project value, and it stays where it is used today:
   - identifiers sent to providers and InvenTree, which have length limits: `vp-<env>-<orderId>-…` idempotency keys, PayPal `invoice_id`, and InvenTree `job_key`;
-  - Identity Center permission-set and CLI profile names such as `vp-dev-deployer` and `vp-prod-operator`.
+  - Identity Center permission-set and CLI profile names such as `vp-dev-deployer` and `vp-prod-operator`;
+  - dev catalog SKUs and the InvenTree IPNs cross-checked against them (`vp-dev-<sku>`). Prod SKUs and IPNs carry no prefix ([ADR-011](#adr-011-inventory-data-contract)).
   
   → [Terraform conventions](terraform-conventions.md)
-- **Consequences:** S3 bucket names are global. The first plan review must confirm that `vitamin-packs-<env>-*` bucket names are available ([OPEN-09](#open-questions)).
+- **Consequences:** S3 bucket names are global, so a `vitamin-packs-<env>-*` bucket name may already be taken. No fallback name is chosen in advance. If a deployment fails on a bucket name, the owner makes a new naming decision then.
 
 ### ADR-018: Timestamp format
 - **Status:** Accepted, 2026-09-28. Owner: project owner.
@@ -171,12 +188,13 @@ Everything below is **design**. As of 2026-09-28 the repository holds only docum
 - **Consequences:** Writers must use the shared `iso()` helper. A second-precision, fixed-width format is mandatory, or sort order breaks.
 
 ### ADR-019: Cart schema and lifecycle
-- **Status:** Schema accepted. Lifecycle proposed. 2026-09-28. Owner: project owner.
+- **Status:** Schema accepted. Lifecycle proposed. 2026-09-28. The abandoned-cart TTL of 15 days is accepted, 2026-09-30 (resolves the former OPEN-05). Owner: project owner.
 - **Context:** The checkout pseudocode used cart fields that were never defined.
 - **Decision:**
   - `lines`, `version`, `checkout_order_id`, `updated_at`, and `ttl`.
   - The cart is locked while a checkout is open.
   - The verified-payment transaction deletes the cart. A release from `HELD` unlocks it.
+  - `ttl` is the last write + 15 days. Every write resets it, so an abandoned cart expires 15 days after its last change. DynamoDB deletes it within a few days after that.
   
   → [Cart attributes](dynamodb-data-model.md#cart-attributes)
 - **Rejected:** Clearing the cart at checkout time, which loses the lines if payment fails.
@@ -213,16 +231,18 @@ Everything below is **design**. As of 2026-09-28 the repository holds only docum
 
   → [Payment processing: state table](payment-processing.md#order-payment-and-inventory-states)
 - **Rejected:** An admin refund or cancel route. It would need `admin` access to the provider secrets, IAM changes, and a refund idempotency key.
-- **Consequences:** No admin code touches the provider secrets. The Stripe restricted key needs only read access to Refunds. Every operator refund, including rows 6d and 7 and `unexpected_payment`, goes through the dashboard. Automatic refunds of late payments (OPEN-01 item 5) would need a new decision.
+- **Consequences:** No admin code touches the provider secrets. The Stripe restricted key needs only read access to Refunds. Every operator refund, including rows 6d and 7 and `unexpected_payment`, goes through the dashboard. Automatic refunds of late payments would need a new decision ([ADR-011](#adr-011-inventory-data-contract)).
 
 ### ADR-024: Customer profile and account self-service
-- **Status:** Proposed, 2026-09-29. The owner chose the scope (contact details and an address book), the ship-to snapshot, and self-service deletion. The contract details await confirmation. Owner: project owner.
+- **Status:** Proposed, 2026-09-29. The owner chose the scope (contact details and an address book), the ship-to snapshot, and self-service deletion. The contract details await confirmation. Shipping to US states only is accepted, 2026-09-30 (resolves the former OPEN-10). Keeping an order's `ship_to` and `contact_email` indefinitely is accepted, 2026-09-30 (resolves the former OPEN-11). Owner: project owner.
 - **Context:** `USER#<sub>` / `PROFILE` had no attributes or writer. Access tokens carry no email, and no document said how an order gets a shipping address.
 - **Decision:**
   - One profile item holds display name, phone, marketing opt-in, a mirror of the Cognito email, and up to 5 embedded addresses with a default. Every write is version-guarded.
   - Cognito is the email authority. Only the new `account` function writes the mirror, from `AdminGetUser`. The customer pool keeps the old email until a new one is verified.
   - Checkout takes a saved `addressId` and copies the address and email onto the order (`ship_to`, `contact_email`). Stripe and PayPal do not collect shipping. PayPal gets `SET_PROVIDED_ADDRESS`.
+  - Orders ship only to the 50 US states and DC: `SHIP_COUNTRIES = ["US"]` and `SHIP_REGIONS` is their 51 two-letter USPS codes, in both dev and prod. Territories (PR, GU, VI, AS, MP) and military addresses (AA, AE, AP) are not served. Address writes and checkout reject anything else with 400.
   - `POST /account/delete` requires a sign-in within 10 minutes and no open checkout. It tombstones the profile, deletes the cart, then deletes the Cognito user. Orders are kept.
+  - An order's `ship_to` and `contact_email` are kept with the order indefinitely, including after the customer deletes their account. Nothing scrubs or expires them.
 
   → [Profile attributes](dynamodb-data-model.md#profile-attributes), [Account routes](backend-api.md#account-routes), [Account deletion](backend-api.md#account-deletion)
 - **Rejected:**
@@ -230,23 +250,75 @@ Everything below is **design**. As of 2026-09-28 the repository holds only docum
   - Provider-collected shipping, which leaves the address outside our order record until the webhook.
   - A Cognito post-confirmation trigger to create profiles; the profile is created lazily on the first write.
   - Amplify `deleteUser` from the browser, which could skip the checkout and cleanup checks.
-- **Consequences:** ADR-007 grows to eleven functions. The `account` role gets customer-pool `AdminGetUser`, `AdminUserGlobalSignOut`, and `AdminDeleteUser`. The checkout transaction budget is unchanged. Orders keep personal data after an account is deleted until OPEN-11 is answered.
+- **Consequences:** ADR-007 grows to eleven functions. The `account` role gets customer-pool `AdminGetUser`, `AdminUserGlobalSignOut`, and `AdminDeleteUser`. The checkout transaction budget is unchanged. Orders keep personal data indefinitely after an account is deleted, so the privacy notice must say so. A scrub job or a retention limit needs a new decision. Widening `SHIP_COUNTRIES` or `SHIP_REGIONS` needs a new decision, because address validation covers only US state formats.
+
+### ADR-025: DynamoDB remains the application database
+- **Status:** Proposed, 2026-09-29. Owner: project owner.
+- **Context:** A review asked whether SQL, or a mix of SQL and DynamoDB, would perform better or make storefront and admin features easier. The review excluded the InvenTree database. It found that `GET /admin/orders`, `GET /admin/products`, and `GET /products` had no defined access pattern.
+- **Decision:**
+  - The single DynamoDB table stays the only store for catalog, cart, profile, order, payment, reservation, and job data.
+  - The missing access patterns are added on GSI1: `ORDERS#<status>` on order headers and `CATEGORIES` on category items. The admin product list is a filtered Scan. Reports aggregate over the order partitions in Lambda.
+  
+  → [Admin listing and reporting](dynamodb-data-model.md#admin-listing-and-reporting), [GSI1](dynamodb-data-model.md#gsi1--catalog-browsing-and-admin-order-queues)
+- **Rejected:**
+  - RDS PostgreSQL for the application: about $14/month (the prod total goes over $50), and every DB-using function would need the VPC, so checkout, webhooks, and `account` would depend on the NAT instance (contradicts ADR-003 and ADR-007).
+  - Aurora Serverless v2 with the Data API: about $44/month at the 0.5 ACU minimum. The 5-minute sync keeps it from pausing.
+  - Splitting the data across SQL and DynamoDB: checkout, payment, release, and commit completion each rely on one atomic transaction across cart, order, reservation, projection, and ledger.
+  - A read-only SQL copy (Streams to SQL) for the admin app: the SQL cost plus a pipeline, for needs that GSI1 and Lambda aggregation meet.
+  - A database on the InvenTree RDS instance: it breaks the rule that no Lambda has a network path to PostgreSQL.
+- **Consequences:**
+  - SQL gave no performance gain at this volume. The table stays at a few dollars a month, and the main cost is the inventory sync ([Cost drivers](dynamodb-data-model.md#cost-drivers)).
+  - Every `status` write also sets `GSI1PK`. There is no new transaction action.
+  - `admin` gets `Query` on GSI1 and `Scan` on the table.
+  - Revisit if ad-hoc admin reporting becomes a core need, or if order volume makes Lambda aggregation slow. Evaluate DynamoDB export to S3 with Athena first, then Aurora DSQL (serverless, no VPC). Measure DSQL's cost and check its limits before choosing it.
+
+### ADR-026: InvenTree first, location IDs by second apply
+- **Status:** Accepted, 2026-09-30. Owner: project owner.
+- **Context:** The inventory Lambdas need InvenTree location IDs: the sellable locations and the committed and returns locations. Those IDs only exist once InvenTree is installed and staff have created the locations, and they differ between dev and prod.
+- **Decision:** Each environment is released in three steps, all in its existing Terraform root:
+  1. **InvenTree foundation release.**
+     - It contains bootstrap and network, the NAT instance, and all InvenTree security groups. That includes `inv-lambda`, which is created now and used later.
+     - It also contains the private zone, ECR, S3 media and artifacts, the InvenTree secret containers, the EC2 host, RDS, the jumpbox, SES, monitoring, and the dev scheduler.
+     - There are no application resources.
+  2. **InvenTree setup.** Staff work in the InvenTree UI through the jumpbox:
+     - users and MFA, and the integration user and its token;
+     - the location tree, including the committed and returns locations;
+     - parts and BOMs.
+     
+     The operator records the location IDs and the part map.
+  3. **Application release.** It contains Cognito, DynamoDB, the sites, the API and Lambdas, queues and schedules, and the committed locals file `infra/<env>/inventree-locations.tf`, which holds `eligible_ids`, `committed_id`, and `returns_id`.
+
+  Prod follows the same order: prod InvenTree is live and configured before the first prod application release.
+
+  → [Delivery plan](development-and-deployment-plan.md#phase-2-inventree-foundation), [Eligible stock](inventree-integration.md#eligible-stock), [InvenTree client](backend-api.md#inventree-client)
+- **Rejected:**
+  - An SSM parameter set out of band: location changes would skip git and plan review.
+  - Resolving locations by name at sync time: renaming a location in InvenTree would silently change what is sellable.
+  - An admin-app setting: it would need a new route and UI.
+  - A `*.tfvars` file: those are gitignored and never committed, and the IDs are not secret.
+- **Consequences:**
+  - An empty list or a null ID disables inventory. Sync writes no projections, records `LOCATIONS_UNCONFIGURED`, and alarms. Checkout returns 503 for every part.
+  - Every sync run checks the IDs against InvenTree first. If a check fails, the run writes nothing. Projections then go stale, and checkout fails closed after the freshness limit.
+  - Changing a location ID changes `eligibility_version` and therefore `mapping_version`. Carts priced against the old mapping are asked to review.
+  - The location IDs are configuration, not an owner decision. The location *policy* is accepted in [ADR-011](#adr-011-inventory-data-contract).
+
+### ADR-027: Stock adjustments in InvenTree only
+- **Status:** Accepted, 2026-09-30 (resolves the former OPEN-02; supersedes [ADR-014](#adr-014-no-admin-override-for-stock-decreases)). Owner: project owner.
+- **Decision:**
+  - The admin app has no stock-adjustment route, and there is no ADJUST job.
+  - Staff add, remove, count, and transfer stock in the InvenTree UI through the jumpbox. The next sync picks the change up.
+  - The admin sync request (`POST /admin/inventory/sync`) refreshes the projection without waiting for the schedule.
+
+  → [InvenTree integration: Admin stock changes](inventree-integration.md#admin-stock-changes)
+- **Rejected:** Add, remove, and count from the admin app (the former default), and count only. With one staff user who already works in InvenTree, neither justifies a fourth job kind.
+- **Consequences:**
+  - InvenTree does not know about checkout reservations, so a removal there can take units that an open checkout holds. Nothing rejects it. Reconciliation alerts when `available_qty` goes negative.
+  - `inventory-jobs` no longer invokes `inventory-sync`, so it loses that permission.
+  - Adding admin stock adjustments later needs a new decision, and the job kind is deployed readers-first ([Async job contracts](backend-api.md#async-job-contracts)).
 
 ## Open questions
 
-Each question has a default that applies in dev. Prod needs an answer.
-
-| ID | Question | Default until decided | Blocks |
-|---|---|---|---|
-| OPEN-01 | Inventory owner decisions 1–3 and 5–15 ([list](inventree-integration.md#inventory-owner-decisions)): kit modes, eligible locations and statuses, the two-step movement and location IDs, late-payment handling, automatic UNCOMMIT and returns, optional and consumable BOM lines, trackable parts, cart limits, the SKU-to-part rule, sync and freshness intervals, allocation subtraction, partial refunds and disputes, legacy `inventory_count`, storefront availability display | As listed there | Prod go-live; the dev mapping data |
-| OPEN-02 | Which ADJUST operations the admin app offers | Add, remove, and count at one eligible location; transfers stay in InvenTree | The admin inventory UI and ADJUST worker |
-| OPEN-05 | Abandoned-cart TTL duration | 30 days after the last write | Cart implementation (the value only) |
-| OPEN-06 | Which Identity Center permission set may create, disable, and re-group Cognito admin users? | The account owner's own administrator access | Admin onboarding runbook, least privilege |
-| OPEN-07 | Is SHIP stock fungible within the committed location, or must it follow batch or serial traceability? | Fungible (see [Physical movements](inventree-integration.md#physical-movements)) | The SHIP job plan |
-| OPEN-08 | InvenTree sender addresses (`inventree@`, `inventree-dev@`) | As documented | SES setup |
-| OPEN-09 | If a `vitamin-packs-<env>-*` S3 bucket name is taken globally, what naming fallback applies? | None chosen. Confirm availability at the first dev plan | The first dev apply |
-| OPEN-10 | Which countries can orders ship to (`SHIP_COUNTRIES`)? | US only | Prod go-live; address validation beyond US formats |
-| OPEN-11 | How long are an order's `ship_to` and `contact_email` kept after the customer deletes their account, and are they then scrubbed? | Kept with the order indefinitely | Prod go-live; the privacy notice |
+No owner questions are open. OPEN-01, the inventory owner decisions, was the last, and its final item was resolved on 2026-09-30 ([list](inventree-integration.md#inventory-owner-decisions)).
 
 ## Owner actions
 
@@ -257,19 +329,18 @@ These are not design decisions. They must be done before prod go-live ([Open Own
 
 ## Implementation-blocker checklist
 
-**Before the first dev Terraform apply:**
+**Before the first dev Terraform apply (the InvenTree foundation release, [ADR-026](#adr-026-inventree-first-location-ids-by-second-apply)):**
 - [ ] Remote-state bootstrap exists and the permission sets are created.
-- [ ] S3 bucket names are confirmed available (OPEN-09).
 - [ ] CI runs the credential-free checks ([Approval gates](infrastructure-development.md#approval-gates)).
 
 **Before backend code that depends on a contract:**
 - [ ] `backend/shared` provides `iso()` and `now_iso()` helpers, with tests for the fixed format (ADR-018).
 - [x] The customer profile (`USER#<sub>` / `PROFILE`) contract is defined ([ADR-024](#adr-024-customer-profile-and-account-self-service)). Implement the `account` function before checkout, which needs a saved address.
-- [ ] Record the dev defaults for OPEN-01, OPEN-02, and OPEN-07 in the dev part-map and location configuration.
+- [ ] Before the application release: InvenTree setup is complete, and the location IDs are committed in `infra/<env>/inventree-locations.tf` along with the part map. The accepted ADR-011 decisions are applied in that configuration ([ADR-026](#adr-026-inventree-first-location-ids-by-second-apply)).
 
 **To verify in dev (evidence required before prod):**
 - [ ] Capture a real admin-route event and commit it as the `cognito:groups` test fixture ([Cognito](cognito-authentication.md#cognitogroups-in-the-lambda-event)).
-- [ ] Check InvenTree 1.5.6 `/api-doc/` shapes for the ADJUST endpoint, transfer and remove, and tracking search ([InvenTree client](backend-api.md#inventree-client)).
+- [ ] Check InvenTree 1.5.6 `/api-doc/` shapes for transfer and remove, and for tracking search ([InvenTree client](backend-api.md#inventree-client)).
 - [ ] Confirm the host health timer works. It calls `https://localhost/api/system/health/`, but Caddy's certificate is issued for the InvenTree FQDN, so the timer must either call the FQDN (resolved to the host) or send the right Host/SNI. Record the working form in the [Health](inventree-integration.md#health-deployment-and-persistence) section.
 - [ ] Confirm the GSI2 projection includes the attributes the sweepers read ([GSI2 overloads](dynamodb-data-model.md#gsi2-overloads-for-inventory-operations)).
 - [ ] Confirm the Lite-tier customer pool honors `attributes_require_verification_before_update = ["email"]` ([Email change](cognito-authentication.md#email-change)).
@@ -279,6 +350,7 @@ These are not design decisions. They must be done before prod go-live ([Open Own
 - [ ] Run every acceptance-test list: [InvenTree](inventree-integration.md#acceptance-tests), [inventory](payment-processing.md#inventory-acceptance-tests), [payment](payment-processing.md#payment-acceptance-tests), [Cognito](cognito-authentication.md#acceptance-tests), and [release workflow](infrastructure-development.md#acceptance-tests).
 
 **Before prod go-live:**
-- [ ] OPEN-01 answered, and OPEN-08, OPEN-10, and OPEN-11 answered or their defaults explicitly accepted.
+- [x] OPEN-01 answered (2026-09-30).
+- [ ] The privacy notice states that order shipping addresses and contact emails are kept indefinitely, including after account deletion ([ADR-024](#adr-024-customer-profile-and-account-self-service)).
 - [ ] Owner actions complete.
 - [ ] Prod run rate under $50/month after one week.

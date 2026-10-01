@@ -2,12 +2,13 @@
 
 - Keep reusable modules split into `main.tf`, `variables.tf`, and `outputs.tf`. Add explicit variable types and descriptions, and add output descriptions.
 - Preserve the `project`, `environment`, and `tags` module inputs. Environment values are restricted to `dev` or `prod` where exposed.
-- Merge caller-provided tags with resource-specific `Name` and `Environment` tags. Resource names follow `${project}-${environment}-<purpose>`. The `project` value is `vitamin-packs` ([ADR-017](architecture-decisions.md#adr-017-terraform-project-value)), so names look like `vitamin-packs-dev-data`. S3 bucket names are global, so confirm they are available when reviewing the first plan.
+- Merge caller-provided tags with resource-specific `Name` and `Environment` tags. Resource names follow `${project}-${environment}-<purpose>`. The `project` value is `vitamin-packs` ([ADR-017](architecture-decisions.md#adr-017-terraform-project-value)), so names look like `vitamin-packs-dev-data`. S3 bucket names are global. If an apply fails because a bucket name is taken, stop and ask the owner for a new name; do not pick a fallback yourself.
 - Create modules in `infra/modules`. Use one module for each AWS resource family. Orchestrator modules (for example `inventree`) compose family modules rather than owning a second implementation of their resources.
 - Connect modules through outputs rather than duplicating resource IDs or other derived values.
 - Keep provider constraints and `.terraform.lock.hcl` files consistent across root configurations. Every root sets `required_version = "~> 1.16.0"` and pins the provider major version. Commit lock files with hashes for every operator and CI platform (`terraform providers lock -platform=linux_amd64 …`).
 - Every root except `bootstrap` uses the S3 backend with `use_lockfile = true` and its own key (`dev/`, `prod/`). See [State, plans and artifacts](infrastructure-development.md#state-plans-and-artifacts).
 - Never hardcode AWS account IDs. Take them as per-environment inputs so prod can move to another account.
+- Put non-secret, environment-specific configuration that needs review, such as InvenTree location IDs, in a committed `locals` file in the root (`infra/<env>/inventree-locations.tf`), never in `*.tfvars` ([ADR-026](architecture-decisions.md#adr-026-inventree-first-location-ids-by-second-apply)).
 - Application data stores timestamps as fixed-format UTC ISO 8601 strings, except the DynamoDB `ttl` attribute ([ADR-018](architecture-decisions.md#adr-018-timestamp-format)). Keep Terraform-produced configuration, such as schedule expressions, consistent with that.
 
 ## Safety
