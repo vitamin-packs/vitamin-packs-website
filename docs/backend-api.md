@@ -94,6 +94,8 @@ Every protected route sets `authorizationScopes = ["aws.cognito.signin.user.admi
 
 Routes are explicit. There is no `ANY` or `{proxy+}` route. A new admin capability means a new row here, a closed request schema, and route-table tests (see [Async job contracts](#async-job-contracts)).
 
+The public catalog routes return each sellable product's `availability` as `in_stock`, `low`, `out`, or `unknown`, taken from `availability_hint.state`. `catalog` returns `unknown` when the hint's `as_of` is older than the freshness limit. These routes never return a stock quantity ([Storefront availability](inventree-integration.md#storefront-availability)).
+
 Webhook routes must skip the Cognito authorizer entirely (the caller is Stripe/PayPal, not a logged-in user) and instead verify the provider's own signature inside the handler, per [Payment processing](payment-processing.md).
 
 ## Account routes

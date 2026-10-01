@@ -165,6 +165,11 @@ Checkout cancel ([Customer Cancel](payment-processing.md#customer-cancel)):
 - While `GET /cart` returns a `checkout_order_id`, the cart page shows the open checkout with "Resume checkout" (the stored provider URL) and "Cancel checkout" (the same route).
 - Responses: 200 → show the cart. 409 `processing` → poll `GET /orders/{orderId}` as the success page does. 409 `checkout_starting` → wait briefly and retry. 409 with a paid status → show the order. 503 → offer a retry.
 
+Availability ([Storefront availability](inventree-integration.md#storefront-availability)):
+- Show the API's `availability` state as "In stock", "Low stock", "Out of stock", or "Currently unavailable" (`unknown`). Never show a count.
+- Disable add-to-cart for `out` and `unknown`.
+- The state is advisory. Checkout is the authority, so show its rejection even when the product page said in stock.
+
 Kit-only components must not be presented as standalone products. The API is authoritative and omits them from catalog results; the UI should also treat `sellable_individually: false` items as BOM components rather than purchasable catalog products.
 
 ### Admin panel

@@ -479,7 +479,7 @@ Run these in dev before promoting, and again in prod before go-live.
 
 ## Open Owner Actions
 
-All hosting design decisions are resolved. The inventory-contract questions are still open: see [Inventory Owner Decisions](#inventory-owner-decisions) and the [decision register](architecture-decisions.md#open-questions). Remaining owner actions:
+All hosting design decisions and all [inventory owner decisions](#inventory-owner-decisions) are resolved. Remaining owner actions:
 1. Buy the one-year t4g EC2 Instance Savings Plan before prod go-live.
 2. Confirm the SNS email subscription.
 
@@ -507,7 +507,7 @@ Treat missing mappings, disabled parts, unexpected units, and insufficient stock
 
 ## Inventory Data Contract
 
-Proposed on 2026-09-28. InvenTree facts below were verified against the 1.5.6 source (tag `1.5.6`, API version 530). Keys, attributes, and transaction pseudocode are in [DynamoDB data model](dynamodb-data-model.md#inventory-projection-and-reservations). The order, payment, and inventory state table is in [Payment processing](payment-processing.md#order-payment-and-inventory-states). Owner questions are listed [below](#inventory-owner-decisions); defaults marked *(default)* apply until the owner decides.
+Proposed on 2026-09-28 and accepted on 2026-09-30 ([ADR-011](architecture-decisions.md#adr-011-inventory-data-contract)). InvenTree facts below were verified against the 1.5.6 source (tag `1.5.6`, API version 530). Keys, attributes, and transaction pseudocode are in [DynamoDB data model](dynamodb-data-model.md#inventory-projection-and-reservations). The order, payment, and inventory state table is in [Payment processing](payment-processing.md#order-payment-and-inventory-states). The owner decisions are resolved and listed [below](#inventory-owner-decisions).
 
 ### Ownership
 
@@ -581,6 +581,23 @@ The intervals and limits below are accepted ([ADR-011](architecture-decisions.md
 - **Algorithm:** the pseudocode is in [DynamoDB data model](dynamodb-data-model.md#inventory-sync-pseudocode). Physical observations are applied as a delta. A sync never overwrites `reserved_qty`; it only retires `pending_retire` entries whose movements finished before the snapshot began, with `CLOCK_MARGIN_S` = 10 s.
 - **Outages:** InvenTree upgrades (a few minutes) and short NAT or host outages stay inside the freshness limit. After it, checkout fails closed for the affected parts.
 
+### Storefront availability
+
+The storefront shows a stock band for each sellable product and never a count ([ADR-011](architecture-decisions.md#adr-011-inventory-data-contract)). `inventory-sync` writes the band to the product's `availability_hint` at the end of each run:
+
+| State | Condition | Storefront label | Add to cart |
+|---|---|---|---|
+| `in_stock` | 11 or more sellable units | In stock | enabled |
+| `low` | 1 to 10 sellable units | Low stock | enabled |
+| `out` | 0 or fewer sellable units | Out of stock | disabled |
+| `unknown` | availability can't be determined | Currently unavailable | disabled |
+
+- **Sellable units:** for a `STOCKED_PART` product, the part's `available_qty`. For a `COMPONENTS` kit, the smallest `floor(available_qty / required)` across the kit's `stock_requirements`, which is the number of whole kits that can be built.
+- **Threshold:** `LOW_STOCK_THRESHOLD` is 10 for every product, in dev and prod. A per-product threshold needs a new decision.
+- **Unknown:** sync writes `unknown` when `mapping_status` is not `OK` or a required part has no projection. The hint's `as_of` is the oldest `source_snapshot_at` among the product's parts, and `catalog` returns `unknown` when `as_of` is older than the freshness limit. These are the cases where checkout would reject the product, so it is not reported as sold out.
+- **No quantities in public responses:** the public catalog routes return only the state. They never return `observed_qty`, `reserved_qty`, `available_qty`, or sellable units ([Backend API](backend-api.md#api-gateway)).
+- **Advisory:** the hint changes only when sync runs, so it can lag a new reservation by one sync interval. Checkout never reads it and remains the authority.
+
 ### Physical movements
 
 Three job kinds, each a DynamoDB job item and an SQS message (standard queue with DLQ), processed by the `inventory-jobs` function ([Async job contracts](backend-api.md#async-job-contracts)):
@@ -641,7 +658,7 @@ Only projection arithmetic (the first two rows) is auto-repaired. Physical stock
 
 ### Inventory Owner Decisions
 
-The defaults above let implementation proceed in dev. These need owner confirmation before prod:
+All 15 owner decisions are resolved:
 
 1. Fulfillment mode per kit. **Resolved 2026-09-30:** kits are `COMPONENTS` by default. A kit is `STOCKED_PART` only when the owner deliberately maps that kit as a pre-bagged finished kit ([ADR-011](architecture-decisions.md#adr-011-inventory-data-contract)).
 2. Location policy and sellable statuses. **Resolved 2026-09-30:** only `OK` stock is sellable. Every sellable location is allowlisted individually; structural, external, committed, and returns locations are never sellable ([ADR-011](architecture-decisions.md#adr-011-inventory-data-contract)). The location IDs themselves are post-install configuration, not an owner decision ([ADR-026](architecture-decisions.md#adr-026-inventree-first-location-ids-by-second-apply)).
@@ -660,7 +677,7 @@ The defaults above let implementation proceed in dev. These need owner confirmat
 12. Whether InvenTree build, sales, or transfer allocations are subtracted from sellable stock. **Resolved 2026-09-30:** they are. `observed_qty` sums `quantity - allocated`, so stock the owner allocates to a build, sales, or transfer order in InvenTree is not sold on the web, and the COMMIT worker never takes allocated units. An allocation hides that stock from the web until the order completes or the allocation is removed ([ADR-011](architecture-decisions.md#adr-011-inventory-data-contract), [Eligible stock](#eligible-stock)).
 13. Partial refunds, chargebacks, and disputes. **Resolved 2026-09-30:** a partial refund is money-only: it changes `refunded_minor` and never moves stock. An open dispute blocks shipping. A lost dispute or a PayPal capture reversal is handled as a full refund, so stock follows the full-refund rule for the order's inventory state: automatic UNCOMMIT if committed and unshipped, no restock after shipping ([ADR-011](architecture-decisions.md#adr-011-inventory-data-contract), [state table](payment-processing.md#order-payment-and-inventory-states) rows 15a, 15b, and 15c).
 14. Any existing `inventory_count` values. **Resolved 2026-09-30:** they are discarded. The migration records them for audit and removes the attribute; they are never loaded into InvenTree or the projection. Opening stock is entered in InvenTree by staff from a physical count ([ADR-011](architecture-decisions.md#adr-011-inventory-data-contract), [migration steps](dynamodb-data-model.md#dev-seed-data)).
-15. Whether the storefront shows exact counts or only in-stock/low/out, and the low-stock threshold.
+15. Storefront availability display. **Resolved 2026-09-30:** the storefront shows only in stock, low, or out, and never a count. A product is low at 10 or fewer sellable units, with one threshold for every product and both environments. When availability can't be determined, the storefront shows "Currently unavailable" rather than out of stock ([ADR-011](architecture-decisions.md#adr-011-inventory-data-contract), [Storefront availability](#storefront-availability)).
 
 Stage InvenTree upgrades in dev, pin the image/release, take and verify backups, run the supported database migration, and check API compatibility and worker processing before production promotion. Roll back the application only when schema compatibility is confirmed; otherwise use the tested database/media restore plan. Document health checks, credential rotation, alert response, and on-call recovery before production use.
 

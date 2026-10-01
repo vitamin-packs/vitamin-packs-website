@@ -62,7 +62,7 @@ updated_at              string  (ISO 8601)
 
 `sellable_individually` and the GSI1 attributes work together (see below) to hide kit-only components from catalog browsing while keeping them directly retrievable for a kit's bill of materials.
 
-Products carry **no stock quantity**. The former `inventory_count` attribute is removed: physical stock belongs to InvenTree, and sellable availability lives on the part-keyed stock projection. Admin product forms must not accept or write quantities. `availability_hint` is a display convenience written by sync and is never read by checkout.
+Products carry **no stock quantity**. The former `inventory_count` attribute is removed: physical stock belongs to InvenTree, and sellable availability lives on the part-keyed stock projection. Admin product forms must not accept or write quantities. `availability_hint` is a display convenience written by sync and is never read by checkout. Its `state` is `out` at 0 or fewer sellable units, `low` at 1 to 10, `in_stock` at 11 or more, and `unknown` when the mapping is not `OK` or a required part has no projection. `as_of` is the oldest `source_snapshot_at` among the product's parts. The rules, including sellable units for a kit, are in [Storefront availability](inventree-integration.md#storefront-availability).
 
 ### Cart attributes
 
@@ -529,6 +529,8 @@ def sync():
     write_sync_state(run_at, success_counts)
     write_availability_hints()
 ```
+
+`write_availability_hints()` sets each mapped product's `availability_hint` from the projections of its parts, using `LOW_STOCK_THRESHOLD` = 10 ([Storefront availability](inventree-integration.md#storefront-availability)).
 
 No transient oversell window:
 
