@@ -102,13 +102,14 @@ Everything below is **design**. As of 2026-09-28 the repository holds only docum
 - **Consequences:** Two Cognito calls per admin request, which is acceptable at single-user volume.
 
 ### ADR-011: Inventory data contract
-- **Status:** Proposed, 2026-09-28. The owner accepted the hold durations. Treating SHIP stock as fungible within the committed location is accepted, 2026-09-30 (resolves the former OPEN-07). Selling no trackable, serialized, batch-traced, or expiring parts is accepted, 2026-09-30 (resolves OPEN-01 item 8). Owner decisions remain open: see [OPEN-01](#open-questions). Owner: project owner.
+- **Status:** Proposed, 2026-09-28. The owner accepted the hold durations. Treating SHIP stock as fungible within the committed location is accepted, 2026-09-30 (resolves the former OPEN-07). Selling no trackable, serialized, batch-traced, or expiring parts is accepted, 2026-09-30 (resolves OPEN-01 item 8). Kits being `COMPONENTS` by default, with `STOCKED_PART` as a deliberate per-kit exception, is accepted, 2026-09-30 (resolves OPEN-01 item 1). Owner decisions remain open: see [OPEN-01](#open-questions). Owner: project owner.
 - **Decision:**
   - InvenTree is the sole physical-stock authority.
   - DynamoDB holds a per-part derived projection (`observed_qty`, `reserved_qty`, `available_qty`) and a reservation ledger. Products carry no quantity.
   - Movements run as idempotent COMMIT, UNCOMMIT, and SHIP jobs.
   - SHIP stock is fungible: SHIP removes any stock of the part in the committed location. It does not target the stock items that the order's COMMIT moved there.
   - No sold part is trackable, serialized, batch-traced, or expiring. A trackable part is a mapping error.
+  - Kits are fulfilled from component stock (`COMPONENTS`) by default. A kit is `STOCKED_PART` only by a deliberate per-kit mapping.
   
   → [Inventory data contract](inventree-integration.md#inventory-data-contract), [Physical movements](inventree-integration.md#physical-movements), [Inventory projection and reservations](dynamodb-data-model.md#inventory-projection-and-reservations)
 - **Rejected:** A product `inventory_count` with a decrement, synchronous InvenTree calls at checkout, and TTL-based hold expiry.
@@ -310,7 +311,7 @@ Each question has a default that applies in dev. Prod needs an answer.
 
 | ID | Question | Default until decided | Blocks |
 |---|---|---|---|
-| OPEN-01 | Inventory owner decisions 1–3, 5–7, and 9–15 ([list](inventree-integration.md#inventory-owner-decisions)): kit modes, the location policy and sellable statuses (the IDs are post-install configuration, [ADR-026](#adr-026-inventree-first-location-ids-by-second-apply)), the two-step movement and location names, late-payment handling, automatic UNCOMMIT and returns, optional and consumable BOM lines, cart limits, the SKU-to-part rule, sync and freshness intervals, allocation subtraction, partial refunds and disputes, legacy `inventory_count`, storefront availability display | As listed there | Prod go-live; the dev mapping data |
+| OPEN-01 | Inventory owner decisions 2–3, 5–7, and 9–15 ([list](inventree-integration.md#inventory-owner-decisions)): the location policy and sellable statuses (the IDs are post-install configuration, [ADR-026](#adr-026-inventree-first-location-ids-by-second-apply)), the two-step movement and location names, late-payment handling, automatic UNCOMMIT and returns, optional and consumable BOM lines, cart limits, the SKU-to-part rule, sync and freshness intervals, allocation subtraction, partial refunds and disputes, legacy `inventory_count`, storefront availability display | As listed there | Prod go-live; the dev mapping data |
 
 ## Owner actions
 

@@ -537,6 +537,8 @@ Every sellable SKU has exactly one `fulfillment_mode`:
 - **`STOCKED_PART`:** reserve `inventree_part_id`. This is a single component, or a *finished kit* built in InvenTree through a Build Order. Building a kit consumes its components in InvenTree, so finished-kit stock and component stock never overlap.
 - **`COMPONENTS`:** `inventree_part_id` is the kit's assembly part. Its BOM (`GET /api/bom/?part=<id>`, which includes inherited lines) becomes `stock_requirements`, and checkout reserves every component in one transaction. Finished stock of that assembly part is ignored. Sync warns if some exists, because it would be invisible to web sales.
 
+Kits are mapped `COMPONENTS` by default. A kit is `STOCKED_PART` only when the owner deliberately maps that kit as a pre-bagged finished kit ([ADR-011](architecture-decisions.md#adr-011-inventory-data-contract)). A single component sold individually is always `STOCKED_PART`. The default is a mapping policy, not a schema default: every mapping still states its mode explicitly.
+
 A SKU never falls back from one mode to the other at checkout. A DynamoDB transaction can't express "finished kit OR components". A fallback would need two attempts and two sets of physical-movement rules, so it is rejected for now.
 
 BOM validation happens in sync. The kit maps as `ERROR` (fail closed) unless all of these hold:
@@ -627,7 +629,7 @@ Only projection arithmetic (the first two rows) is auto-repaired. Physical stock
 
 The defaults above let implementation proceed in dev. These need owner confirmation before prod:
 
-1. Fulfillment mode per kit: finished kits (`STOCKED_PART`) or component-derived (`COMPONENTS`).
+1. Fulfillment mode per kit. **Resolved 2026-09-30:** kits are `COMPONENTS` by default. A kit is `STOCKED_PART` only when the owner deliberately maps that kit as a pre-bagged finished kit ([ADR-011](architecture-decisions.md#adr-011-inventory-data-contract)).
 2. Location policy: which kinds of locations hold sellable stock, and whether any non-OK status (for example ATTENTION) is sellable. Default: OK only. The location IDs themselves are post-install configuration, not an owner decision ([ADR-026](architecture-decisions.md#adr-026-inventree-first-location-ids-by-second-apply)).
 3. Two-step movement (commit at payment, remove at shipping) versus removal at payment. Also the names of the committed and returns locations; their IDs are recorded after install, as in item 2.
 4. Checkout hold duration. **Resolved 2026-09-28** ([Payment processing](payment-processing.md#inventory)):
