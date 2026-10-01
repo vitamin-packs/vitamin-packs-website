@@ -44,7 +44,7 @@ Each function folder holds a `handler.py`, a hash-locked `requirements.txt`, and
 | `inventory-sync` | Scheduler `{"kind":"full_sync"}` every 5 minutes in prod and every 30 minutes in dev (the dev schedule is enabled only while dev runs) and `{"kind":"reconcile"}` daily; async invoke `{"kind":"targeted_sync","part_ids":[…]}` from `admin` | none | yes | 300 s, reserved concurrency 1 |
 | `inventory-jobs` | SQS event source mapping on the `inventory-jobs` queue | none | yes | 60 s |
 
-- **`sweeper`:** runs three independent tasks, each with its own error handling and metric: expire `INVHOLD` reservations, re-drive `PAYEVT#OPEN` events, and re-enqueue and age-alert `INVJOB#OPEN` jobs. They share one function because their permissions already overlap.
+- **`sweeper`:** runs four independent tasks, each with its own error handling and metric: expire `INVHOLD` reservations, re-drive `PAYEVT#OPEN` events, re-enqueue and age-alert `INVJOB#OPEN` jobs, and run `FOLLOWUP#OPEN` items (Stripe tax records and customer emails). They share one function because their permissions already overlap.
 - **`inventory-sync`:** reconciliation is one of its modes. Reserved concurrency 1 serializes full syncs, targeted syncs, and reconciliation. Throttled async invokes are retried by Lambda.
 - **`inventory-jobs` queue:**
   - standard queue with a DLQ and `maxReceiveCount` 5;
@@ -86,7 +86,7 @@ Every protected route sets `authorizationScopes = ["aws.cognito.signin.user.admi
 | PUT | `/admin/products/{sku}/mapping` | `admin` | admin. Sets `mapping_status = PENDING` and requests a targeted sync, which validates the mapping |
 | GET | `/admin/orders` | `admin` | admin. `?status=` (one order status, required), `?queue=ready_to_ship\|needs_attention` (optional, only with `status=paid`), `?cursor=`. Queries GSI1 `ORDERS#<status>`, newest first ([Admin order queues](dynamodb-data-model.md#admin-order-queues)) |
 | GET | `/admin/orders/{orderId}` | `admin` | admin |
-| POST | `/admin/orders/{orderId}/ship` | `admin` | admin. Writes a SHIP job and returns 202 |
+| POST | `/admin/orders/{orderId}/ship` | `admin` | admin. Body `{carrier?, tracking_number?}`, both optional strings of at most 40 and 64 characters, stored on the order. Writes a SHIP job and returns 202. Staff copy the tracking number from Pirate Ship by hand ([OPEN-12](architecture-decisions.md#open-12-shipping-charge-and-the-pirate-ship-role)) |
 | GET | `/admin/inventory/jobs` | `admin` | admin. Lists open jobs (`INVJOB#OPEN`) |
 | POST | `/admin/inventory/sync` | `admin` | admin. Async-invokes `inventory-sync` and returns 202 |
 | POST | `/webhooks/stripe` | `webhooks-stripe` | Stripe signature (no Cognito authorizer) |
@@ -134,6 +134,17 @@ The `account` function owns the customer profile (`USER#<sub>` / `PROFILE`; attr
 The tombstone blocks the 30-minute window in which API Gateway still accepts the deleted user's access tokens: profile writes and checkout both reject it. A cart written in that window cannot be checked out and expires by its TTL.
 
 Orders are **kept**. Their `user_sub`, `ship_to`, and `contact_email` stay for accounting and provider disputes and refunds. That personal data is kept indefinitely: nothing scrubs or expires it after the account is deleted ([ADR-024](architecture-decisions.md#adr-024-customer-profile-and-account-self-service)).
+
+## Customer emails
+
+[ADR-029](architecture-decisions.md#adr-029-customer-order-emails-through-ses) defines two transactional emails. The `sweeper` sends them from the `CONFIRM` and `SHIPPED` follow-ups ([Order follow-up](dynamodb-data-model.md#order-follow-up-orderorderid--followupkind)).
+
+- **Confirmation:** sent after the order is `paid`. It lists the lines, the subtotal, the tax, the total, and the `ship_to` address.
+- **Shipped:** sent after the SHIP job completes. It adds `carrier` and `tracking_number` when they are set, and omits them otherwise.
+- **Send path:** the sweeper claims the item, re-reads the order consistently, renders a plain-text and an HTML body from the stored order (never from the live catalog), calls SES `SendEmail` from `contact@vitamin-packs.com` to `contact_email`, and marks the item `DONE`.
+- **Failures:** an SES error or throttle keeps the item `OPEN` with backoff. A hard bounce or an unverified recipient (dev sandbox) is recorded as `last_error` and alarms once the item is 24 hours old. It never blocks an order.
+- **Privacy:** logs hold the order ID and the outcome only, never the address or the body.
+- **Tests:** a duplicate sweeper run sends at most one extra email, an order without a tracking number renders, and a dev recipient outside the sandbox allowlist fails without blocking the order.
 
 ## Private InvenTree Connectivity
 
@@ -272,7 +283,7 @@ DynamoDB transactions have no IAM action of their own. `TransactWriteItems` is a
 | `admin` | read + Tx; `Query` on `index/GSI1` (order queues) and `index/GSI2`; `Scan` on the table ARN only (product list) | `SendMessage` | – | `cognito-idp:AdminGetUser` and `cognito-idp:AdminListGroupsForUser` on the **admin** pool ARN only (no Cognito writes); `lambda:InvokeFunction` on the `inventory-sync` ARN |
 | `webhooks-stripe` | read + Tx (orders, refunds, reservations, projections, jobs, `PAYEVT#` ledger) | `SendMessage` | Stripe only | – |
 | `webhooks-paypal` | as `webhooks-stripe` | `SendMessage` | PayPal only | – |
-| `sweeper` | read + Tx; `Query` on `index/GSI2` (`INVHOLD`, `PAYEVT#OPEN`, `INVJOB#OPEN`) | `SendMessage` | Stripe, PayPal | – |
+| `sweeper` | read + Tx; `Query` on `index/GSI2` (`INVHOLD`, `PAYEVT#OPEN`, `INVJOB#OPEN`, `FOLLOWUP#OPEN`) | `SendMessage` | Stripe, PayPal | `ses:SendEmail` on the `vitamin-packs.com` identity, with a `ses:FromAddress` condition for `contact@vitamin-packs.com` |
 | `inventory-sync` | read + Tx; `Query` on `index/GSI2` | – | integration token only | VPC network-interface actions (below) |
 | `inventory-jobs` | `GetItem`, `Query`, Tx | `ReceiveMessage`, `DeleteMessage`, `GetQueueAttributes`, `ChangeMessageVisibility` | integration token only | VPC network-interface actions (below) |
 

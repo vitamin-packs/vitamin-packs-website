@@ -213,7 +213,7 @@ Rules:
 - **DynamoDB backfills** are separate operator steps. They run dev first, after their reader is deployed, and must be idempotent.
 - **Site rollout:**
   1. Build with configuration from `terraform output`, then scan the bundle for secrets.
-  2. Upload hashed `assets/*` with immutable cache headers.
+  2. Upload hashed `assets/*` and the content-hash-named `product-images/*` with immutable cache headers ([ADR-030](architecture-decisions.md#adr-030-product-images-shipped-with-the-storefront-build)). Reject an image over 500 KB or a name that breaks the pattern before uploading.
   3. Upload `index.html` last with `no-cache`.
   4. Invalidate only `/index.html` and `/`. Versioned file names are preferred over invalidation ([CloudFront](https://docs.aws.amazon.com/AmazonCloudFront/latest/DeveloperGuide/Invalidation.html)).
   5. Never sync with `--delete`. Prune assets more than three releases old.

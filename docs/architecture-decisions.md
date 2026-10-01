@@ -36,6 +36,10 @@ Everything below is **design**. As of 2026-09-28 the repository holds only docum
 | Terraform structure, naming, safety | [Terraform conventions](terraform-conventions.md) |
 | Implementation order and release checklist | [Delivery plan](development-and-deployment-plan.md) |
 | First-release order per environment, InvenTree location configuration | [ADR-026](#adr-026-inventree-first-location-ids-by-second-apply), [Eligible stock](inventree-integration.md#eligible-stock) |
+| Sales tax and order totals | [Payment processing: Sales tax](payment-processing.md#sales-tax), [ADR-028](#adr-028-sales-tax-through-the-stripe-tax-calculation-api) |
+| Customer order emails | [Backend API: Customer emails](backend-api.md#customer-emails), [ADR-029](#adr-029-customer-order-emails-through-ses) |
+| Product images | [DynamoDB data model: Product attributes](dynamodb-data-model.md#product-attributes), [ADR-030](#adr-030-product-images-shipped-with-the-storefront-build) |
+| Shipping charge, Pirate Ship role | [OPEN-12](#open-12-shipping-charge-and-the-pirate-ship-role) |
 
 ## Decisions
 
@@ -316,15 +320,71 @@ Everything below is **design**. As of 2026-09-28 the repository holds only docum
   - `inventory-jobs` no longer invokes `inventory-sync`, so it loses that permission.
   - Adding admin stock adjustments later needs a new decision, and the job kind is deployed readers-first ([Async job contracts](backend-api.md#async-job-contracts)).
 
+### ADR-028: Sales tax through the Stripe Tax Calculation API
+- **Status:** Proposed, 2026-09-30. The owner chose Stripe Tax as the tax engine for both providers. The mechanism details await confirmation and dev verification. Owner: project owner.
+- **Context:** Orders ship to all 50 states and DC, and totals were the sum of line prices with no tax. PayPal cannot calculate tax. Stripe Checkout's own `automatic_tax` would leave PayPal orders untaxed or taxed by a different engine.
+- **Decision:**
+  - `checkout` calls the standalone Stripe Tax Calculation API once per order, before the reservation transaction, using the server-side prices and the order's `ship_to`. The calculation uses the tax code for general tangible goods.
+  - The order stores `subtotal_minor`, `tax_minor`, and `tax_calculation_id`. `total_minor = subtotal_minor + tax_minor`, and it stays the single amount that every payment check compares.
+  - Stripe Checkout gets the tax as one extra "Sales tax" line item, and `automatic_tax` is **off**. PayPal gets it as `amount.breakdown.tax_total`. Both providers therefore charge exactly `total_minor`.
+  - If the calculation fails, checkout returns 503 and reserves nothing.
+  - On a verified payment, a Tax Transaction is recorded from the stored calculation, with the order ID as its reference. A refund records a reversal. Both are `TAX` and `TAXREV` follow-up items written in the payment or refund transaction. The sweeper runs them with deterministic idempotency keys, and an "already recorded" answer counts as success.
+
+  → [Sales tax](payment-processing.md#sales-tax), [Order header attributes](dynamodb-data-model.md#order-header-attributes)
+- **Rejected:** `automatic_tax` on the Stripe session only (PayPal untaxed), a flat home-state rate, no tax, and dropping PayPal.
+- **Consequences:**
+  - The Stripe secret is read by `checkout` and `sweeper`, which already hold it. The restricted key needs write on Tax Calculations and Tax Transactions as well as the scopes in [ADR-023](#adr-023-refunds-through-the-provider-dashboard).
+  - Checkout now depends on a Stripe call before it reserves. A Stripe outage blocks both providers' checkout.
+  - The calculation is valid for 90 days, so the sweeper's re-drive window must stay inside that.
+  - The owner must register for tax in the states where collection is required, and set up Stripe Tax, before the first prod order. Stripe Tax is priced per transaction, so confirm the cost against the prod run rate.
+  - A shipping charge changes the calculation input: see OPEN-12.
+
+### ADR-029: Customer order emails through SES
+- **Status:** Proposed, 2026-09-30. The owner chose an order-confirmation email and a shipped email. The mechanism awaits confirmation. Owner: project owner.
+- **Decision:**
+  - Two transactional emails: order confirmation when the order becomes `paid`, and shipped when it becomes `fulfilled`. The shipped email carries the carrier and tracking number when staff entered them.
+  - The `sweeper` sends them, so there is no twelfth function. A transition writes a `CONFIRM` or `SHIPPED` follow-up item in its own transaction, and the sweeper reads them from the sparse `FOLLOWUP#OPEN` key on GSI2. It claims an item with a conditional update, sends through SES, and marks it done. A crash after the send can duplicate one email. The design accepts that over a lost email.
+  - Sender: `contact@vitamin-packs.com`, the same SES domain identity as InvenTree. Recipient: the order's `contact_email` snapshot.
+  - `sweeper` gets `ses:SendEmail` on that identity only, with a `ses:FromAddress` condition.
+
+  → [Customer emails](backend-api.md#customer-emails)
+- **Rejected:** A separate notifier function, email from the webhook processors (it would couple payment handling to SES), and provider receipts alone.
+- **Consequences:**
+  - Emails arrive within one sweeper interval, 5 minutes.
+  - The SES account must leave the sandbox before prod, because customers are not at the verified domain. Dev stays in the sandbox, so dev recipients must be verified addresses.
+  - Marketing opt-in is unrelated: both emails are transactional.
+  - Logs never contain the recipient address or the body.
+
+### ADR-030: Product images shipped with the storefront build
+- **Status:** Proposed, 2026-09-30. The owner chose operator-script uploads with no admin upload route. Owner: project owner.
+- **Decision:**
+  - Image files live in `frontend/public/product-images/`, named by content hash (`<16 hex>.<jpg|webp|png>`), and ship through the existing `rollout-sites` stage, behind the same approval gates. There is no new stage.
+  - A product's `images` list holds those file names. The storefront builds the URL as `/product-images/<name>`. Admin product writes reject any name that does not match the pattern. The same image files serve dev and prod, because the names carry no SKU.
+  - Limits: at most 5 images per product, and each file at most 500 KB.
+  - No admin upload route, no presigned URL, and no Cognito identity pool ([ADR-016](#adr-016-no-cognito-identity-pool) is unchanged).
+
+  → [Product attributes](dynamodb-data-model.md#product-attributes), [Sequencing](infrastructure-development.md#sequencing)
+- **Rejected:** An admin upload route (new IAM surface), a separate image bucket, and no images.
+- **Consequences:** Adding an image is a commit and a site rollout. The admin app can reference an image only after that rollout, and a missing file shows a placeholder. Image files stay in git, which is acceptable at hobby-catalog size.
+
 ## Open questions
 
-No owner questions are open. OPEN-01, the inventory owner decisions, was the last, and its final item was resolved on 2026-09-30 ([list](inventree-integration.md#inventory-owner-decisions)).
+One owner question is open.
+
+### OPEN-12: Shipping charge and the Pirate Ship role
+- **Status:** Open. The owner deferred it on 2026-09-30 and will come back to it.
+- **Context:** Order totals carry no shipping amount. The owner plans to use Pirate Ship. It is a label-buying tool, and a public live-rate API for checkout is unverified. The tax calculation ([ADR-028](#adr-028-sales-tax-through-the-stripe-tax-calculation-api)) and every payment amount check depend on whether a shipping amount exists.
+- **Options:** Free shipping, a flat fee per order, weight-based rates, or an automated Pirate Ship integration if an API is confirmed.
+- **Default until answered:** Totals are `subtotal_minor + tax_minor` with no shipping line. Do not implement a shipping fee, a rate lookup, or a Pirate Ship client. The admin ship route accepts optional `carrier` and `tracking_number`, which staff copy by hand from Pirate Ship ([ADR-029](#adr-029-customer-order-emails-through-ses)).
+- **Blocks:** The checkout function and anything that prices an order. It does not block the repository, bootstrap, or InvenTree foundation phases.
 
 ## Owner actions
 
 These are not design decisions. They must be done before prod go-live ([Open Owner Actions](inventree-integration.md#open-owner-actions)):
 - Buy the one-year t4g EC2 Instance Savings Plan.
 - Confirm the SNS alert email subscription.
+- Set up Stripe Tax: head-office address, tax registrations for the states where collection is required, and the restricted-key scopes in [ADR-028](#adr-028-sales-tax-through-the-stripe-tax-calculation-api).
+- Request SES production access for prod ([ADR-029](#adr-029-customer-order-emails-through-ses)).
 - Bootstrap remote state (`infra/bootstrap`) and create the Identity Center permission sets ([Credentials and permissions](infrastructure-development.md#credentials-and-permissions)).
 
 ## Implementation-blocker checklist
@@ -334,6 +394,7 @@ These are not design decisions. They must be done before prod go-live ([Open Own
 - [ ] CI runs the credential-free checks ([Approval gates](infrastructure-development.md#approval-gates)).
 
 **Before backend code that depends on a contract:**
+- [ ] Before the `checkout` function: OPEN-12 is answered ([OPEN-12](#open-12-shipping-charge-and-the-pirate-ship-role)). Everything else here can start without it.
 - [ ] `backend/shared` provides `iso()` and `now_iso()` helpers, with tests for the fixed format (ADR-018).
 - [x] The customer profile (`USER#<sub>` / `PROFILE`) contract is defined ([ADR-024](#adr-024-customer-profile-and-account-self-service)). Implement the `account` function before checkout, which needs a saved address.
 - [ ] Before the application release: InvenTree setup is complete, and the location IDs are committed in `infra/<env>/inventree-locations.tf` along with the part map. The accepted ADR-011 decisions are applied in that configuration ([ADR-026](#adr-026-inventree-first-location-ids-by-second-apply)).
@@ -347,10 +408,14 @@ These are not design decisions. They must be done before prod go-live ([Open Own
 - [ ] Confirm the PayPal sandbox accepts `shipping_preference=SET_PROVIDED_ADDRESS` with `purchase_units[0].shipping`, and that the buyer cannot change it ([PayPal](payment-processing.md#paypal)).
 - [ ] Confirm package installs and ECR layer pulls succeed with 443-only S3 egress (ADR-021).
 - [ ] Confirm the exact SES action set, and that `subst` drives appear in `mstsc`.
+- [ ] Confirm the Stripe Tax Calculation works for a US ship-to with the general-tangible-goods tax code, that Stripe Checkout accepts the "Sales tax" line with `automatic_tax` off, and that PayPal accepts `breakdown.tax_total` ([Sales tax](payment-processing.md#sales-tax)).
+- [ ] Confirm the partial tax-reversal amount form in the Stripe sandbox.
+- [ ] Confirm the `sweeper` sends the confirmation and shipped emails from the dev SES sandbox to a verified address ([Customer emails](backend-api.md#customer-emails)).
 - [ ] Run every acceptance-test list: [InvenTree](inventree-integration.md#acceptance-tests), [inventory](payment-processing.md#inventory-acceptance-tests), [payment](payment-processing.md#payment-acceptance-tests), [Cognito](cognito-authentication.md#acceptance-tests), and [release workflow](infrastructure-development.md#acceptance-tests).
 
 **Before prod go-live:**
 - [x] OPEN-01 answered (2026-09-30).
 - [ ] The privacy notice states that order shipping addresses and contact emails are kept indefinitely, including after account deletion ([ADR-024](#adr-024-customer-profile-and-account-self-service)).
-- [ ] Owner actions complete.
+- [ ] OPEN-12 (shipping charge) answered and the checkout contract updated for it.
+- [ ] Owner actions complete, including Stripe Tax registrations and SES production access.
 - [ ] Prod run rate under $50/month after one week.

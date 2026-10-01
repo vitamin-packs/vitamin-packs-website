@@ -51,7 +51,7 @@ Stripe secret `${project}-${environment}-stripe`:
 {"api_key":"rk_test_...","webhook_secret":"whsec_...","webhook_secret_previous":null}
 ```
 
-- Prefer a restricted key (`rk_`) with write access to Checkout Sessions, and read access to Refunds, PaymentIntents, Charges, and Disputes. Refunds are issued only in the dashboard ([ADR-023](architecture-decisions.md#adr-023-refunds-through-the-provider-dashboard)).
+- Prefer a restricted key (`rk_`) with write access to Checkout Sessions, Tax Calculations, and Tax Transactions, and read access to Refunds, PaymentIntents, Charges, and Disputes. Refunds are issued only in the dashboard ([ADR-023](architecture-decisions.md#adr-023-refunds-through-the-provider-dashboard)).
 - `webhook_secret_previous` holds the old secret during a Stripe secret roll (up to 24 hours). Verification tries the current secret, then the previous one.
 
 PayPal secret `${project}-${environment}-paypal`:
@@ -100,7 +100,7 @@ In the table:
 | # | Event | Guard | Order `status` / `inventory_state` | Reservation | Job / InvenTree | Projection |
 |---|---|---|---|---|---|---|
 | 1 | Checkout succeeds | the transaction's conditions (fresh, `avail ≥ q`, price, mapping, cart version) | — → `pending` / `reserved` | — → `HELD` | none | `res += q`, `avail -= q` |
-| 2 | Checkout rejected (insufficient, stale, missing, `ERROR`, changed cart) | transaction cancelled | no order written | none | none | none |
+| 2 | Checkout rejected (insufficient, stale, missing, `ERROR`, changed cart), or the tax calculation fails (503 `tax_unavailable`) | transaction cancelled, or no transaction attempted | no order written | none | none | none |
 | 3 | Provider session/order creation fails permanently | reservation `HELD` | `pending` → `cancelled` / `released` | `HELD` → `RELEASED` (`session_failed`) | none | `res -= q`, `avail += q` |
 | 4 | Verified payment failure (Stripe `checkout.session.async_payment_failed`, PayPal capture `DECLINED`/`FAILED`) | `HELD`, order `pending` or `payment_pending` | → `cancelled` / `released` | → `RELEASED` (`payment_failed`) | none | release |
 | 4a | Customer cancels (`POST /checkout/cancel`, see [Customer Cancel](#customer-cancel)) | order `pending`, `HELD`, no live `capture_claim_until`, provider object confirmed unpayable first | → `cancelled` / `released` | → `RELEASED` (`customer_cancelled`) | none | release |
@@ -125,13 +125,14 @@ In the table:
 | 16 | Return received | staff record it in InvenTree | unchanged; the admin notes the return | unchanged | staff put it in `Returns – inspection`, status RETURNED | none until staff move it to an eligible location with status OK |
 
 Transaction rules:
+- Rows 6 and 7 also create the `TAX` and `CONFIRM` follow-ups, and a refund row creates a `TAXREV` follow-up, in the same transaction ([Order follow-up](dynamodb-data-model.md#order-follow-up-orderorderid--followupkind)).
 - Every row is one conditional DynamoDB transaction that also moves the event ledger item to `SUCCEEDED` (see [Payment-event ledger](#payment-event-ledger)), or a sequence of such transactions in which each step is independently retryable and guarded by the prior state.
 - There is no cross-system atomicity.
 - InvenTree effects happen only inside jobs, and a payment event never proves that stock changed.
 
 Transaction sizes stay within the 100-action limit:
-- row 6 uses 5 items (ledger, order, reservation, job, cart);
-- a release uses at most 5 + P (the cart action applies only to a release from `HELD`), and a late payment (row 7) at most 4 + P, with P ≤ 75 distinct parts.
+- row 6 uses 7 items (ledger, order, reservation, job, cart, and the `TAX` and `CONFIRM` follow-ups);
+- a release uses at most 5 + P (the cart action applies only to a release from `HELD`), and a late payment (row 7) at most 6 + P, with P ≤ 75 distinct parts.
 
 Cancel routes:
 - Row 4a's customer cancel of an unpaid checkout is `POST /checkout/cancel` ([ADR-022](architecture-decisions.md#adr-022-customer-checkout-cancel), [Customer Cancel](#customer-cancel)).
@@ -147,7 +148,8 @@ The processor applies rows 6–7 only when every check passes on the object it f
 - `mode == "payment"`
 - `livemode` matches the environment
 - `currency == order.currency.lower()`
-- `amount_total == order.total_minor`
+- `amount_total == order.total_minor` (subtotal lines plus the one "Sales tax" line)
+- `total_details.amount_tax == 0` (`automatic_tax` is off, so Stripe adds no tax of its own)
 - `status == "complete"` and `payment_status == "paid"`
 
 **PayPal order** (`GET /v2/checkout/orders/{id}`):
@@ -156,6 +158,7 @@ The processor applies rows 6–7 only when every check passes on the object it f
 - `payee.merchant_id == secret.merchant_id`
 - exactly one capture, with `status == "COMPLETED"` and `amount.currency_code == order.currency`
 - `Decimal(amount.value)` converts exactly to `order.total_minor`, with no rounding
+- `amount.breakdown.tax_total` converts exactly to `order.tax_minor`, and `item_total` to `order.subtotal_minor`
 
 **Order state:** `status` is `pending` or `payment_pending` (row 6), or `cancelled` with `release_reason = expired` (row 7). Any other status with a verified payment, for example a second payment for a `paid` order, is recorded as `payment_exception = unexpected_payment` and alerted. It is never silently absorbed.
 
@@ -269,13 +272,29 @@ The PayPal request ID is a 36-character UUID. That satisfies both the spec's 108
 
 Stripe caches the outcome of a request that began executing, including a 500. Treat a 500 or timeout as **indeterminate**: retry with the same key, and if that still fails, leave the order `pending`. The hold expiry sweeper resolves it by retrieving the session. Never retry with a new key.
 
+## Sales tax
+
+[ADR-028](architecture-decisions.md#adr-028-sales-tax-through-the-stripe-tax-calculation-api) makes the Stripe Tax Calculation API the one tax engine for both providers.
+
+1. **Calculate (checkout, before the reservation transaction).** `stripe.tax.Calculation.create` with `currency`, one line item per cart line (amount in minor units times quantity, `reference` = SKU, the tax code for general tangible goods, `tax_behavior = exclusive`), and `customer_details.address` from the order's `ship_to` with `address_source = shipping`. The idempotency key is `vp-<env>-<cartId>-<cartVersion>-tax`. Any error or timeout is 503 `tax_unavailable`. Nothing is reserved, and the customer retries.
+2. **Store.** The order records `subtotal_minor`, `tax_minor` (the calculation's `tax_amount_exclusive`), `tax_calculation_id`, and `total_minor = subtotal_minor + tax_minor`. The calculation's own `amount_total` must equal `total_minor`, or checkout fails closed.
+3. **Charge.** Stripe gets the tax as a "Sales tax" line item with `automatic_tax` off. PayPal gets it as `breakdown.tax_total`. The [validation checks](#payment-validation) compare the provider's totals with the stored order, never with a fresh calculation.
+4. **Record (the `TAX` follow-up).** After a verified payment, `stripe.tax.Transaction.create_from_calculation(calculation=<tax_calculation_id>, reference="vp-<env>-<orderId>")` with the idempotency key `vp-<env>-<orderId>-taxtx`. The result's ID is stored as `tax_transaction_id`. This runs from the sweeper's follow-up queue, not inside the payment transaction, so a Stripe outage never blocks marking an order paid.
+5. **Reverse (the `TAXREV#<providerRefundId>` follow-up).** A full refund reverses the transaction in full. A partial refund reverses the refunded share. The idempotency key is `vp-<env>-<orderId>-<providerRefundId>-taxrev`. Confirm the partial-reversal amount form in dev.
+
+Rules:
+- A free-of-tax answer is valid: `tax_minor = 0` omits the tax line and still records the transaction.
+- An expired calculation (90 days) is a `NEEDS_ATTENTION` follow-up, and the operator records the tax manually in Stripe.
+- The tax call is made by `checkout`. The follow-ups run in `sweeper`. Both hold the Stripe secret, and neither calls Stripe from a VPC function.
+- A shipping amount, if one is decided, becomes a `shipping_cost` input to the calculation ([OPEN-12](architecture-decisions.md#open-12-shipping-charge-and-the-pirate-ship-role)).
+
 ## Stripe
 
 Numbered flow:
 
 1. `POST /checkout/stripe` (body `{cartVersion, addressId}`) runs the [checkout reservation](dynamodb-data-model.md#checkout-reservation-pseudocode) (row 1), which copies the chosen profile address onto the order as `ship_to`. It then creates the Checkout Session with:
    - `mode=payment`, `ui_mode=hosted_page`, `payment_method_types=["card"]` (cards plus card-based wallets; no delayed-notification methods);
-   - `line_items` built from server-side prices;
+   - `line_items` built from server-side prices, plus one "Sales tax" line for `order.tax_minor` (omitted when it is 0). `automatic_tax` is off ([Sales tax](#sales-tax));
    - `payment_intent_data.shipping` from the order's `ship_to` (for fraud signals). There is no `shipping_address_collection`: the address comes from the profile ([ADR-024](architecture-decisions.md#adr-024-customer-profile-and-account-self-service));
    - `client_reference_id=orderId`, and `metadata.order_id=orderId` on both the session and `payment_intent_data`;
    - `expires_at` = the order's ISO `session_expires_at` converted to epoch seconds (checkout time + 31 minutes, so it stays at least 30 minutes after the session is created);
@@ -319,7 +338,7 @@ Numbered flow:
 
 1. `POST /checkout/paypal` (body `{cartVersion, addressId}`) runs the checkout reservation (row 1), which copies the chosen profile address onto the order as `ship_to`. It gets an OAuth token (`POST /v1/oauth2/token`, `client_credentials`, cached until shortly before `expires_in`), then calls `POST /v2/checkout/orders` with:
    - `intent=CAPTURE`;
-   - one purchase unit (`reference_id`, `custom_id`, `invoice_id`, amount from server-side prices);
+   - one purchase unit (`reference_id`, `custom_id`, `invoice_id`, `amount.value` = `order.total_minor` with `breakdown.item_total` = `subtotal_minor` and `breakdown.tax_total` = `tax_minor`, all from the stored order);
    - `payment_source.paypal.experience_context` with `return_url`, `cancel_url`, `user_action=PAY_NOW`, and `shipping_preference=SET_PROVIDED_ADDRESS`;
    - `purchase_units[0].shipping` (name and address) from the order's `ship_to`, so the buyer cannot change it at PayPal and Seller Protection covers the shipped-to address. Verify the field shapes in the sandbox;
    - `PayPal-Request-Id` and `Prefer: return=representation`.
@@ -506,6 +525,7 @@ Run in dev with sandbox credentials only. Never use live credentials or real pay
 
 - **Signatures:** an invalid signature, a Stripe timestamp older than 300 s, a body re-serialized before verification, and a `livemode` mismatch are all rejected with 400 and no ledger write. A request signed with `webhook_secret_previous` verifies during a roll.
 - **Duplicates and concurrency:** the same event delivered twice, and two deliveries processed concurrently, apply the transition once. One invocation gets 409 and the ledger ends `SUCCEEDED`. `checkout.session.completed` plus a second Event object for the same session also applies once.
+- **Tax:** a checkout where the Stripe Tax call fails returns 503 and writes nothing. A taxed order charges exactly `total_minor` on Stripe and PayPal, and each provider's totals pass the validation checks. The `TAX` follow-up records one Tax Transaction even when the sweeper runs it twice. A full and a partial refund each record one reversal.
 - **Crash recovery:**
   - kill the processor after the ledger claim, before the transaction: the event stays claimable, and a provider retry or the sweeper completes it;
   - kill it after the transaction, before the SQS send: the open-job sweeper enqueues COMMIT.
@@ -543,6 +563,7 @@ Run in dev with sandbox credentials only. Never use live credentials or real pay
 Checked 2026-09-28.
 
 - Stripe:
+  - [Tax API](https://docs.stripe.com/tax/custom) and [Tax Calculations](https://docs.stripe.com/api/tax/calculations/create);
   - [API versioning](https://docs.stripe.com/api/versioning) (current version `2026-08-26.dahlia`);
   - `stripe` 15.6.1 on PyPI and its source at tag `v15.6.1` (`stripe/_api_version.py`, `_http_client.py`, `_webhook.py`, `_stripe_client.py`);
   - [Idempotent requests](https://docs.stripe.com/api/idempotent_requests);

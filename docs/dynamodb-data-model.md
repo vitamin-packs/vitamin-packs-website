@@ -30,6 +30,7 @@ Exceptions:
 | Stock projection | `STOCK#<partId>` | `PROJECTION` | One per InvenTree part that any SKU consumes. Derived from InvenTree; written only by inventory sync, checkout, release, and job completion. See [Inventory projection and reservations](#inventory-projection-and-reservations). |
 | Order reservation | `ORDER#<orderId>` | `RESERVATION` | One per order: every part quantity the order holds against the projection. |
 | Inventory job | `ORDER#<orderId>` | `INVJOB#<kind>` | One per order per movement kind (`COMMIT`, `UNCOMMIT`, `SHIP`). Durable, idempotent InvenTree stock movement. |
+| Order follow-up | `ORDER#<orderId>` | `FOLLOWUP#<kind>` | One per post-commit side effect: `TAX`, `CONFIRM`, `SHIPPED`, or `TAXREV#<providerRefundId>`. Written in the same transaction as the transition that needs it, so the effect cannot be lost. See [Order follow-up](#order-follow-up-orderorderid--followupkind). |
 | Inventory sync state | `SYNC#inventory` | `STATE` | Last start, last success, error counts, and `status` (`OK`, `ERROR`, or `LOCATIONS_UNCONFIGURED`; see [Eligible stock](inventree-integration.md#eligible-stock)). |
 
 `<partId>` is the InvenTree part primary key in that environment. Dev and prod InvenTree have different keys, so part mappings are environment data and are never promoted from dev to prod.
@@ -42,7 +43,7 @@ name                    string
 description             string
 price                   number  (integer cents)
 currency                string  (e.g. "USD")
-images                  list<string>
+images                  list<string>   # up to 5 content-hash file names `<16 hex>.<jpg|webp|png>`; the storefront serves `/product-images/<name>` ([ADR-030](architecture-decisions.md#adr-030-product-images-shipped-with-the-storefront-build)). Admin writes reject any other shape
 bom                     list<{ sku: string, quantity: number }>   # kit display only; written by inventory sync from the InvenTree BOM
 external_links          list<{ name: string, url: string, vendor: string, price: number }>  # non-stocked parts; never reserved
 sellable_individually   bool
@@ -132,7 +133,10 @@ Lifecycle:
 user_sub            string  (owning customer's Cognito sub)
 status              string  ("pending" | "payment_pending" | "paid" | "fulfilled" | "cancelled" | "refunded")
 inventory_state     string  (see Payment processing)
-total_minor         number  (integer cents, computed from server-side prices at checkout)
+subtotal_minor      number  (integer cents, sum of the server-side line prices at checkout)
+tax_minor           number  (integer cents from the Stripe Tax calculation; 0 when the calculation says no tax)
+tax_calculation_id  string  (Stripe Tax Calculation ID; valid for 90 days)
+total_minor         number  (subtotal_minor + tax_minor; the one amount every payment check compares)
 currency            string  (e.g. "USD")
 created_at          string  (ISO)
 provider            string  ("stripe" | "paypal"; set when the provider session/order is created)
@@ -144,6 +148,9 @@ paid_at             string  (ISO)
 refunded_minor      number  (sum of REFUND# items; created as 0)
 refund_requested    bool    (refund arrived while COMMIT was IN_PROGRESS or FAILED)
 dispute_state       string  ("open" | "won" | "lost"; absent when there is no dispute)
+tax_transaction_id  string  (Stripe Tax Transaction ID; set by the TAX follow-up; absent until then)
+carrier             string  (optional; set by the admin ship request)
+tracking_number     string  (optional; set by the admin ship request)
 payment_exception   string  ("amount_mismatch" | "currency_mismatch" | "reference_mismatch" | "payee_mismatch" | "late_unreserved" | "unexpected_payment")
 ship_to             map     (copy of the chosen profile Address without label, created_at, and updated_at; written once at checkout)
 ship_to_address_id  string  (the profile addressId it was copied from; display only, never re-read)
@@ -257,6 +264,24 @@ GSI2PK / GSI2SK    "INVJOB#OPEN" / "<created_at>#<orderId>#<kind>"  (only while 
 
 The job item is the durable record. The SQS message only wakes a worker. If the queue loses or delays a message, the job is still listed under `INVJOB#OPEN`, and a sweeper re-enqueues it.
 
+### Order follow-up (`ORDER#<orderId>` / `FOLLOWUP#<kind>`)
+
+A follow-up is the durable outbox for a side effect outside DynamoDB that must not be lost or run twice: the Stripe Tax Transaction ([ADR-028](architecture-decisions.md#adr-028-sales-tax-through-the-stripe-tax-calculation-api)) and the customer emails ([ADR-029](architecture-decisions.md#adr-029-customer-order-emails-through-ses)).
+
+```
+kind               string  ("TAX" | "CONFIRM" | "SHIPPED" | "TAXREV#<providerRefundId>")
+state              string  ("OPEN" | "DONE")
+attempts           number, next_attempt_at string (ISO), last_error string (sanitized)
+lease_until        string  (ISO; the sweeper's claim)
+created_at, done_at  string  (ISO)
+GSI2PK / GSI2SK    "FOLLOWUP#OPEN" / "<next_attempt_at>#<orderId>#<kind>"  (only while OPEN)
+```
+
+- Created by the transaction that needs it: row 6 and row 7 create `TAX` and `CONFIRM`, the SHIP completion creates `SHIPPED`, and a provider refund event creates `TAXREV#<providerRefundId>`.
+- The sweeper claims an open item with a conditional update on `lease_until`, runs the effect, and then conditionally sets `state = DONE` and removes the GSI keys. A failure sets `next_attempt_at` with backoff and keeps the item open.
+- Each effect is idempotent or tolerates a repeat: Stripe calls carry a deterministic idempotency key, and an email may duplicate once if the sweeper crashes after the send.
+- An item open for more than 24 hours raises an alarm. A `TAX` item must finish within 80 days, which keeps it inside the 90-day calculation validity.
+
 ### TTL
 
 Do not use TTL to expire reservations. TTL deletes expired items "typically within a few days", and expired items still appear in reads until then ([TTL](https://docs.aws.amazon.com/amazondynamodb/latest/developerguide/howitworks-ttl.html)). A deletion would also leave `reserved_qty` unreleased. A scheduled sweeper releases expired holds instead. Enable TTL (attribute `ttl`) only for disposable records: carts, profile tombstones (2 days after an account deletion), terminal payment events (35 days after processing, beyond the providers' retry and resend windows), and optional sync-run logs. Never set it on orders, refunds, reservations, jobs, or projections.
@@ -305,7 +330,7 @@ Set only on order header items (not on line items), so a `Query` on `GSI2` retur
 
 ### GSI2 overloads for inventory operations
 
-GSI2 also carries five sparse, fixed-partition keys. None of them collides with `USER#<sub>`, and none needs a new index or Terraform change. The GSI2 projection must include the attributes the sweepers read, or `ALL`. Verify this when the `dynamodb` module is written.
+GSI2 also carries six sparse, fixed-partition keys. None of them collides with `USER#<sub>`, and none needs a new index or Terraform change. The GSI2 projection must include the attributes the sweepers read, or `ALL`. Verify this when the `dynamodb` module is written.
 
 | GSI2PK | GSI2SK | On | Used by |
 |---|---|---|---|
@@ -314,6 +339,7 @@ GSI2 also carries five sparse, fixed-partition keys. None of them collides with 
 | `INVHOLD` | `EXP#<expires_at>#<orderId>` | reservations while `HELD` | expiry sweeper |
 | `INVJOB#OPEN` | `<created_at>#<orderId>#<kind>` | non-terminal jobs | re-enqueue sweeper and reconciliation |
 | `PAYEVT#OPEN` | `<next_attempt_at>#<provider>#<eventId>` | payment events while `RECEIVED`, `PROCESSING`, or `FAILED` | payment sweeper re-drive and alarms |
+| `FOLLOWUP#OPEN` | `<next_attempt_at>#<orderId>#<kind>` | follow-ups while `OPEN` | follow-up sweeper (tax records and customer emails) |
 
 GSI reads are eventually consistent. Sweepers treat index results only as candidates. They re-read the base item with `ConsistentRead=True`, and their conditional writes enforce the state.
 
@@ -443,13 +469,15 @@ def checkout(sub, cart_version, address_id, provider):
         for part_id, per_unit in products[line.sku].stock_requirements.items():
             need[part_id] += per_unit * line.quantity
     require(len(cart.lines) <= 10 and len(need) <= 75)           # transaction budget
+    tax = stripe_tax_calculation(cart.lines, products, address)  # 503 "tax_unavailable" on failure; nothing is reserved. See Payment processing: Sales tax
 
     order_id, now = new_uuid(), utc_now()                        # iso() formats YYYY-MM-DDTHH:MM:SSZ
     expires_at = iso(now + HOLD)                                 # 35 min; see Payment processing
     fresh_after = iso(now - FRESHNESS)                           # 20 min in prod, 60 min in dev
     actions = [
         Put(order_header(order_id, sub, status="pending", inventory_state="reserved",
-                         total_minor=sum_of_lines, currency=currency, refunded_minor=0,
+                         subtotal_minor=sum_of_lines, tax_minor=tax.amount, tax_calculation_id=tax.id,
+                         total_minor=sum_of_lines + tax.amount, currency=currency, refunded_minor=0,
                          created_at=iso(now),
                          GSI1PK="ORDERS#pending", GSI1SK=f"ORDER#{iso(now)}#{order_id}",
                          ship_to=snapshot(address), ship_to_address_id=address_id,   # copy; later edits never change it
