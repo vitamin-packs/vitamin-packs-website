@@ -6,7 +6,7 @@ Use this document as the implementation sequence and release checklist for deliv
 
 ## Verified Starting Point
 
-As of 2026-09-28 the repository contains only `AGENTS.md`, `README.md` (the planned InvenTree staff-access runbook), `LICENSE`, `.gitignore`, and design documents under `docs/`. Those documents include the [DynamoDB data model](dynamodb-data-model.md) and the [Architecture decision register](architecture-decisions.md).
+As of 2026-09-28 the repository contains only `AGENTS.md`, `README.md` (project summary), `LICENSE`, `.gitignore`, design documents under `docs/`, and operator runbooks under `runbooks/` (the planned InvenTree staff-access runbook). Those documents include the [DynamoDB data model](dynamodb-data-model.md) and the [Architecture decision register](architecture-decisions.md).
 
 There is no `infra/`, `backend/`, `frontend/`, `admin/`, `scripts/`, or CI workflow. No AWS resource described in these guides has been verified as deployed. Treat every path, module, route, and resource here as proposed design, and confirm the live repository and AWS state before making implementation or deployment assumptions.
 
@@ -77,6 +77,7 @@ Rules:
    admin/
    scripts/
    docs/
+   runbooks/
    ```
 
    Each `backend/` folder except `shared/` is exactly one Lambda function, with the trigger, VPC placement and role listed in [Backend API](backend-api.md#functions-and-triggers). Change function boundaries only through that document. Keep the two frontends independently buildable and deployable. Keep shared Python code in `backend/shared`; it is bundled into each function's zip, with no Lambda layer ([Packaging](backend-api.md#packaging)).
@@ -133,7 +134,7 @@ Use outputs to connect modules rather than duplicating identifiers. Review every
    - Set the IPN of each part sold as `STOCKED_PART` to its catalog SKU, which in dev starts with `vp-dev-` ([Eligible stock](inventree-integration.md#eligible-stock)).
    - Record the part IDs in the dev part map used by the seed script ([Dev seed data](dynamodb-data-model.md#dev-seed-data)).
 7. Validate version-specific InvenTree APIs/schema against pinned documentation. Build explicit SKU-to-part/BOM mappings with unit tests and fail closed on missing or invalid mappings.
-8. Pass the [InvenTree acceptance tests](inventree-integration.md#acceptance-tests) before connecting checkout, following the README steps for staff access. The Lambda-to-host checks run after the application release in Phase 4, because the inventory Lambdas don't exist before then. They cover private DNS/TLS, Lambda-to-host connectivity, jumpbox access and file transfer, worker processing, S3 persistence, email, RDS backup/restore, health checks, and restricted staff/API access.
+8. Pass the [InvenTree acceptance tests](inventree-integration.md#acceptance-tests) before connecting checkout, following the staff access runbook. The Lambda-to-host checks run after the application release in Phase 4, because the inventory Lambdas don't exist before then. They cover private DNS/TLS, Lambda-to-host connectivity, jumpbox access and file transfer, worker processing, S3 persistence, email, RDS backup/restore, health checks, and restricted staff/API access.
 
 ## Phase 4: Application Infrastructure
 

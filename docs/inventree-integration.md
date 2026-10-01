@@ -91,7 +91,7 @@ InvenTree 1.5.6 makes only two outbound internet calls by default: daily exchang
 
 ## Staff Access
 
-Staff reach the InvenTree UI through a Windows Server jumpbox inside the VPC. The laptop connects with native Remote Desktop over an AWS Systems Manager port-forwarding session, so there are no inbound ports, no VPN, and no public InvenTree endpoint. Step-by-step operator instructions are in the [README](../README.md#staff-access-to-inventree-windows-jumpbox).
+Staff reach the InvenTree UI through a Windows Server jumpbox inside the VPC. The laptop connects with native Remote Desktop over an AWS Systems Manager port-forwarding session, so there are no inbound ports, no VPN, and no public InvenTree endpoint. Step-by-step operator instructions are in the [staff access runbook](../runbooks/inventree_staff_access.md).
 
 Jumpbox instance:
 - Latest AWS-provided Windows Server 2025 AMI, from the SSM public parameter. t3.small.
@@ -451,7 +451,7 @@ Run these in dev before promoting, and again in prod before go-live.
   - Lambda and Edge validate the Let's Encrypt certificate with default trust.
   - After an instance refresh, the private record points to the new host within 60 seconds and the certificate is restored from S3 without a new issuance.
 - **Jumpbox:**
-  - Following the README exactly, connect as the non-admin user, upload a laptop file as a part image through the redirected drive, and copy a CSV export back.
+  - Following the staff access runbook exactly, connect as the non-admin user, upload a laptop file as a part image through the redirected drive, and copy a CSV export back.
   - The Fleet Manager fallback works with User credentials, and no Identity Center-created admin account exists.
   - A user without the permission set cannot start a session.
   - The 8-hour reminder alarm fires.

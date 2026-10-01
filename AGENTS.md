@@ -16,4 +16,5 @@ Never run deployment stages that change AWS (`publish`, `promote`, `apply`, `rol
 - For the backend API, Lambda functions, and their deployment scripts, follow [Backend API](docs/backend-api.md).
 - For DynamoDB keys, indexes, reservations, jobs, and timestamps, follow [DynamoDB data model](docs/dynamodb-data-model.md).
 - For implementation sequencing and release gates, follow [Delivery plan](docs/development-and-deployment-plan.md).
+- For operator procedures, such as staff access to InvenTree, see the runbooks in the '/runbooks' directory.
 - For decision status, open owner questions, and which document is authoritative for each topic, see [Architecture decision register](docs/architecture-decisions.md).

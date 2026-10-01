@@ -31,7 +31,7 @@ Everything below is **design**. As of 2026-09-28 the repository holds only docum
 | Refunds and cancelling paid orders | [Payment processing: state table](payment-processing.md#order-payment-and-inventory-states), [ADR-023](#adr-023-refunds-through-the-provider-dashboard) |
 | Provider libraries, ledger, idempotency, webhooks | [Payment processing](payment-processing.md) |
 | InvenTree hosting, VPC, staff access, DNS/TLS, RDS, cost | [InvenTree integration](inventree-integration.md) |
-| Staff access procedure | [README](../README.md#staff-access-to-inventree-windows-jumpbox) |
+| Staff access procedure | [Staff access runbook](../runbooks/inventree_staff_access.md) |
 | Release workflow, approval gates, credentials, secrets, InvenTree rollout | [Infrastructure development workflow](infrastructure-development.md) |
 | Terraform structure, naming, safety | [Terraform conventions](terraform-conventions.md) |
 | Implementation order and release checklist | [Delivery plan](development-and-deployment-plan.md) |
@@ -46,7 +46,7 @@ Everything below is **design**. As of 2026-09-28 the repository holds only docum
 ### ADR-001: Repository state
 - **Status:** Accepted (verified fact), 2026-09-28. Owner: project owner.
 - **Context:** Earlier docs claimed that modules, a SPA fallback, and wiring already existed, and said the data-model doc was missing.
-- **Decision:** The repository contains `AGENTS.md`, `README.md`, `LICENSE`, `.gitignore`, and `docs/` only. Every module, path, route, and resource in the docs is proposed until it is implemented and verified.
+- **Decision:** The repository contains `AGENTS.md`, `README.md`, `LICENSE`, `.gitignore`, `docs/`, and `runbooks/` only. Every module, path, route, and resource in the docs is proposed until it is implemented and verified.
 - **Rejected:** Describing planned modules as existing.
 - **Consequences:** Docs say "planned" for modules. Implementers confirm repository and AWS state before relying on anything.
 
