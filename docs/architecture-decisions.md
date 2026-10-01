@@ -102,7 +102,7 @@ Everything below is **design**. As of 2026-09-28 the repository holds only docum
 - **Consequences:** Two Cognito calls per admin request, which is acceptable at single-user volume.
 
 ### ADR-011: Inventory data contract
-- **Status:** Proposed, 2026-09-28. The owner accepted the hold durations. Treating SHIP stock as fungible within the committed location is accepted, 2026-09-30 (resolves the former OPEN-07). Selling no trackable, serialized, batch-traced, or expiring parts is accepted, 2026-09-30 (resolves OPEN-01 item 8). Kits being `COMPONENTS` by default, with `STOCKED_PART` as a deliberate per-kit exception, is accepted, 2026-09-30 (resolves OPEN-01 item 1). Selling only `OK`-status stock from individually allowlisted locations is accepted, 2026-09-30 (resolves OPEN-01 item 2). The two-step movement (COMMIT at payment, SHIP at shipping) and the location names `Web orders – committed` and `Returns – inspection` are accepted, 2026-09-30 (resolves OPEN-01 item 3). Owner decisions remain open: see [OPEN-01](#open-questions). Owner: project owner.
+- **Status:** Proposed, 2026-09-28. The owner accepted the hold durations. Treating SHIP stock as fungible within the committed location is accepted, 2026-09-30 (resolves the former OPEN-07). Selling no trackable, serialized, batch-traced, or expiring parts is accepted, 2026-09-30 (resolves OPEN-01 item 8). Kits being `COMPONENTS` by default, with `STOCKED_PART` as a deliberate per-kit exception, is accepted, 2026-09-30 (resolves OPEN-01 item 1). Selling only `OK`-status stock from individually allowlisted locations is accepted, 2026-09-30 (resolves OPEN-01 item 2). The two-step movement (COMMIT at payment, SHIP at shipping) and the location names `Web orders – committed` and `Returns – inspection` are accepted, 2026-09-30 (resolves OPEN-01 item 3). Leaving a late payment that cannot be re-reserved to the operator is accepted, 2026-09-30 (resolves OPEN-01 item 5). Owner decisions remain open: see [OPEN-01](#open-questions). Owner: project owner.
 - **Decision:**
   - InvenTree is the sole physical-stock authority.
   - DynamoDB holds a per-part derived projection (`observed_qty`, `reserved_qty`, `available_qty`) and a reservation ledger. Products carry no quantity.
@@ -111,10 +111,11 @@ Everything below is **design**. As of 2026-09-28 the repository holds only docum
   - No sold part is trackable, serialized, batch-traced, or expiring. A trackable part is a mapping error.
   - Kits are fulfilled from component stock (`COMPONENTS`) by default. A kit is `STOCKED_PART` only by a deliberate per-kit mapping.
   - Only `OK`-status stock in individually allowlisted locations is sellable. Structural, external, committed, and returns locations are never sellable.
+  - A late payment after an expired hold re-reserves. If that fails, the order is `paid` / `needs_attention` with `payment_exception = late_unreserved`, and the operator refunds it or holds it until stock arrives.
   
   → [Inventory data contract](inventree-integration.md#inventory-data-contract), [Physical movements](inventree-integration.md#physical-movements), [Inventory projection and reservations](dynamodb-data-model.md#inventory-projection-and-reservations)
 - **Rejected:** A product `inventory_count` with a decrement, synchronous InvenTree calls at checkout, TTL-based hold expiry, and removing stock at payment.
-- **Consequences:** Checkout fails closed when a projection is stale (20 minutes). Fulfillment is blocked until COMMIT completes. InvenTree records how many units shipped for an order, not which batch or serial went to which order. Per-order batch or serial traceability needs a new decision. So does selling a trackable, serialized, batch-traced, or expiring part: it would need serial selection in COMMIT and SHIP, and it conflicts with fungible SHIP stock.
+- **Consequences:** Checkout fails closed when a projection is stale (20 minutes). Fulfillment is blocked until COMMIT completes. InvenTree records how many units shipped for an order, not which batch or serial went to which order. Per-order batch or serial traceability needs a new decision. So does selling a trackable, serialized, batch-traced, or expiring part: it would need serial selection in COMMIT and SHIP, and it conflicts with fungible SHIP stock. A `late_unreserved` order waits on the operator; refunding it automatically or adding a backorder state needs a new decision.
 
 ### ADR-012: Payment lifecycle
 - **Status:** Proposed, 2026-09-28. Owner: project owner.
@@ -221,7 +222,7 @@ Everything below is **design**. As of 2026-09-28 the repository holds only docum
 
   → [Payment processing: state table](payment-processing.md#order-payment-and-inventory-states)
 - **Rejected:** An admin refund or cancel route. It would need `admin` access to the provider secrets, IAM changes, and a refund idempotency key.
-- **Consequences:** No admin code touches the provider secrets. The Stripe restricted key needs only read access to Refunds. Every operator refund, including rows 6d and 7 and `unexpected_payment`, goes through the dashboard. Automatic refunds of late payments (OPEN-01 item 5) would need a new decision.
+- **Consequences:** No admin code touches the provider secrets. The Stripe restricted key needs only read access to Refunds. Every operator refund, including rows 6d and 7 and `unexpected_payment`, goes through the dashboard. Automatic refunds of late payments would need a new decision ([ADR-011](#adr-011-inventory-data-contract)).
 
 ### ADR-024: Customer profile and account self-service
 - **Status:** Proposed, 2026-09-29. The owner chose the scope (contact details and an address book), the ship-to snapshot, and self-service deletion. The contract details await confirmation. Shipping to US states only is accepted, 2026-09-30 (resolves the former OPEN-10). Keeping an order's `ship_to` and `contact_email` indefinitely is accepted, 2026-09-30 (resolves the former OPEN-11). Owner: project owner.
@@ -312,7 +313,7 @@ Each question has a default that applies in dev. Prod needs an answer.
 
 | ID | Question | Default until decided | Blocks |
 |---|---|---|---|
-| OPEN-01 | Inventory owner decisions 5–7 and 9–15 ([list](inventree-integration.md#inventory-owner-decisions)): late-payment handling, automatic UNCOMMIT and returns, optional and consumable BOM lines, cart limits, the SKU-to-part rule, sync and freshness intervals, allocation subtraction, partial refunds and disputes, legacy `inventory_count`, storefront availability display | As listed there | Prod go-live; the dev mapping data |
+| OPEN-01 | Inventory owner decisions 6–7 and 9–15 ([list](inventree-integration.md#inventory-owner-decisions)): automatic UNCOMMIT and returns, optional and consumable BOM lines, cart limits, the SKU-to-part rule, sync and freshness intervals, allocation subtraction, partial refunds and disputes, legacy `inventory_count`, storefront availability display | As listed there | Prod go-live; the dev mapping data |
 
 ## Owner actions
 

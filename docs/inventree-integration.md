@@ -636,7 +636,7 @@ The defaults above let implementation proceed in dev. These need owner confirmat
    - a 31-minute Stripe session and a 35-minute reservation for both providers;
    - Stripe offers card and wallet methods only;
    - a PayPal `PENDING` capture holds stock for up to 72 hours.
-5. Late payment after a hold was released: re-reserve, and if that fails, refund automatically, backorder, or leave it to the operator. Default: operator.
+5. Late payment after a hold was released. **Resolved 2026-09-30:** the processor re-reserves, and if that fails, the order is left to the operator, who refunds it in the provider dashboard or holds it until stock arrives. There is no automatic refund and no backorder state ([ADR-011](architecture-decisions.md#adr-011-inventory-data-contract), [state table](payment-processing.md#order-payment-and-inventory-states) row 7).
 6. Full refund after commit: whether UNCOMMIT is automatic. Also the policy for inspecting and restocking returns.
 7. Policy for optional and consumable BOM lines. Defaults: optional lines are a mapping error; consumable lines are not reserved.
 8. Whether trackable, serialized, batch-traced, or expiring parts are sold. **Resolved 2026-09-30:** none are. The parts are assembly hardware such as screws, nuts, and washers. Trackable parts are rejected at mapping ([ADR-011](architecture-decisions.md#adr-011-inventory-data-contract)).
