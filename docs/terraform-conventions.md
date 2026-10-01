@@ -2,7 +2,7 @@
 
 - Keep reusable modules split into `main.tf`, `variables.tf`, and `outputs.tf`. Add explicit variable types and descriptions, and add output descriptions.
 - Preserve the `project`, `environment`, and `tags` module inputs. Environment values are restricted to `dev` or `prod` where exposed.
-- Merge caller-provided tags with resource-specific `Name` and `Environment` tags. Resource names follow `${project}-${environment}-<purpose>`. The `project` value is `vitamin-packs` ([ADR-017](architecture-decisions.md#adr-017-terraform-project-value)), so names look like `vitamin-packs-dev-data`. S3 bucket names are global, so confirm they are available when reviewing the first plan.
+- Merge caller-provided tags with resource-specific `Name` and `Environment` tags. Resource names follow `${project}-${environment}-<purpose>`. The `project` value is `vitamin-packs` ([ADR-017](architecture-decisions.md#adr-017-terraform-project-value)), so names look like `vitamin-packs-dev-data`. S3 bucket names are global. If an apply fails because a bucket name is taken, stop and ask the owner for a new name; do not pick a fallback yourself.
 - Create modules in `infra/modules`. Use one module for each AWS resource family. Orchestrator modules (for example `inventree`) compose family modules rather than owning a second implementation of their resources.
 - Connect modules through outputs rather than duplicating resource IDs or other derived values.
 - Keep provider constraints and `.terraform.lock.hcl` files consistent across root configurations. Every root sets `required_version = "~> 1.16.0"` and pins the provider major version. Commit lock files with hashes for every operator and CI platform (`terraform providers lock -platform=linux_amd64 …`).

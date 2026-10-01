@@ -30,7 +30,6 @@ Exceptions:
 | Stock projection | `STOCK#<partId>` | `PROJECTION` | One per InvenTree part that any SKU consumes. Derived from InvenTree; written only by inventory sync, checkout, release, and job completion. See [Inventory projection and reservations](#inventory-projection-and-reservations). |
 | Order reservation | `ORDER#<orderId>` | `RESERVATION` | One per order: every part quantity the order holds against the projection. |
 | Inventory job | `ORDER#<orderId>` | `INVJOB#<kind>` | One per order per movement kind (`COMMIT`, `UNCOMMIT`, `SHIP`). Durable, idempotent InvenTree stock movement. |
-| Admin stock adjustment job | `ADJ#<adjustmentId>` | `INVJOB#ADJUST` | One per admin stock adjustment. Same job lifecycle; see [Inventory job](#inventory-job-orderorderid--invjobkind). |
 | Inventory sync state | `SYNC#inventory` | `STATE` | Last start, last success, error counts, and `status` (`OK`, `ERROR`, or `LOCATIONS_UNCONFIGURED`; see [Eligible stock](inventree-integration.md#eligible-stock)). |
 
 `<partId>` is the InvenTree part primary key in that environment. Dev and prod InvenTree have different keys, so part mappings are environment data and are never promoted from dev to prod.
@@ -72,7 +71,7 @@ lines              list<{ sku: string, quantity: number }>   # at most 10 lines;
 version            number  (starts at 1; every cart write increments it, conditioned on the version the client read)
 checkout_order_id  string  (set by the checkout transaction; absent otherwise)
 updated_at         string  (ISO)
-ttl                number  (epoch s: last write + 30 days; abandoned-cart expiry, duration is an open owner question)
+ttl                number  (epoch s: last write + 15 days; abandoned-cart expiry, ADR-019)
 ```
 
 Lifecycle (proposed, [ADR-019](architecture-decisions.md#adr-019-cart-schema-and-lifecycle)):
@@ -111,15 +110,15 @@ recipient_name  string  (1–100)
 line1           string  (1–100)
 line2           string  (optional; ≤ 100)
 city            string  (1–60)
-region          string  (≤ 60; state or province code; required when country = "US")
-postal_code     string  (≤ 20; US: ^\d{5}(-\d{4})?$)
-country         string  (ISO 3166-1 alpha-2; must be in SHIP_COUNTRIES, default ["US"], OPEN-10)
+region          string  (required; two-letter USPS code in SHIP_REGIONS: the 50 states and DC; no territories or APO/FPO; ADR-024)
+postal_code     string  (^\d{5}(-\d{4})?$)
+country         string  (ISO 3166-1 alpha-2; must be in SHIP_COUNTRIES = ["US"], ADR-024)
 phone           string  (optional; E.164, for the courier)
 created_at      string  (ISO)
 updated_at      string  (ISO)
 ```
 
-Request schemas are closed: unknown fields are rejected with 400. Strings are NFC-normalized and trimmed, and control characters are rejected. The item stays near 5 KB, well under the 400 KB item limit.
+Request schemas are closed: unknown fields are rejected with 400. Strings are NFC-normalized and trimmed, and control characters are rejected. `region` is uppercased before the `SHIP_REGIONS` check. The item stays near 5 KB, well under the 400 KB item limit.
 
 Lifecycle:
 - `GET /account/profile` never creates the item. When it is missing, the handler returns an empty profile with `version: 0`. The first mutation creates it with `attribute_not_exists(PK)`, so no Cognito post-confirmation trigger is needed.
@@ -256,19 +255,6 @@ created_at, completed_at  string  (ISO)
 GSI2PK / GSI2SK    "INVJOB#OPEN" / "<created_at>#<orderId>#<kind>"  (only while not terminal)
 ```
 
-An admin stock adjustment uses the same attributes with `PK = ADJ#<adjustmentId>`, `SK = INVJOB#ADJUST`, and these differences:
-
-```
-kind               "ADJUST"
-job_key            "vp-<env>-adj-<adjustmentId>"
-op                 string  (default "ADD" | "REMOVE" | "COUNT"; the offered set is an open owner decision)
-part_id, location_id, quantity   (location in the environment's eligible allowlist)
-actor_sub, reason  string  (audit: the admin's Cognito sub and the stated reason)
-GSI2SK             "<created_at>#ADJ#<adjustmentId>#ADJUST"
-```
-
-A decrease larger than the part's `available_qty` is rejected with 409 before the item is written, and the worker checks it again when it plans. There is no admin override. See [Async job contracts](backend-api.md#async-job-contracts).
-
 The job item is the durable record. The SQS message only wakes a worker. If the queue loses or delays a message, the job is still listed under `INVJOB#OPEN`, and a sweeper re-enqueues it.
 
 ### TTL
@@ -326,7 +312,7 @@ GSI2 also carries five sparse, fixed-partition keys. None of them collides with 
 | `INVMAP` | `SKU#<sku>` | sellable products | sync enumerates mapped SKUs |
 | `INVSTOCK` | `PART#<partId>` | projections | sync and reconciliation enumerate parts |
 | `INVHOLD` | `EXP#<expires_at>#<orderId>` | reservations while `HELD` | expiry sweeper |
-| `INVJOB#OPEN` | `<created_at>#<orderId>#<kind>`, or `<created_at>#ADJ#<adjustmentId>#ADJUST` | non-terminal jobs | re-enqueue sweeper and reconciliation |
+| `INVJOB#OPEN` | `<created_at>#<orderId>#<kind>` | non-terminal jobs | re-enqueue sweeper and reconciliation |
 | `PAYEVT#OPEN` | `<next_attempt_at>#<provider>#<eventId>` | payment events while `RECEIVED`, `PROCESSING`, or `FAILED` | payment sweeper re-drive and alarms |
 
 GSI reads are eventually consistent. Sweepers treat index results only as candidates. They re-read the base item with `ConsistentRead=True`, and their conditional writes enforce the state.
@@ -446,7 +432,8 @@ def checkout(sub, cart_version, address_id, provider):
         return existing_checkout(cart.checkout_order_id)
     profile = get_profile(sub, consistent=True)                  # 409 "address_required" if missing or tombstoned
     address = profile.addresses.get(address_id)                  # 409 "address_required" if absent
-    require(address.country in SHIP_COUNTRIES)                   # else 400
+    require(address.country in SHIP_COUNTRIES                    # else 400
+            and address.region in SHIP_REGIONS)
     products = batch_get_products(cart.skus, consistent=True)
     for p in products:
         require(p.sellable_individually and p.mapping_status == "OK")   # else 409 "unavailable"
@@ -474,7 +461,7 @@ def checkout(sub, cart_version, address_id, provider):
         Put(reservation(order_id, state="HELD", parts=need, expires_at=expires_at,
                         GSI2PK="INVHOLD", GSI2SK=f"EXP#{expires_at}#{order_id}"),
             cond="attribute_not_exists(PK)"),
-        Update(cart_key(sub), "SET checkout_order_id = :oid, #ttl = :cart_ttl",
+        Update(cart_key(sub), "SET checkout_order_id = :oid, #ttl = :cart_ttl",   # :cart_ttl = epoch(now + 15 days)
                cond="version = :v AND attribute_not_exists(checkout_order_id)"),
         *[Update(stock_key(part_id),
                  "SET reserved_qty = reserved_qty + :q, available_qty = available_qty - :q",

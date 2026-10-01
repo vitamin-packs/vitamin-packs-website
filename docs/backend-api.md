@@ -41,7 +41,7 @@ Each function folder holds a `handler.py`, a hash-locked `requirements.txt`, and
 | `webhooks-stripe` | HTTP API | `/webhooks/stripe` | no | 20 s |
 | `webhooks-paypal` | HTTP API | `/webhooks/paypal` | no | 20 s |
 | `sweeper` | EventBridge Scheduler, every 5 minutes | none | no | 240 s, reserved concurrency 1 |
-| `inventory-sync` | Scheduler `{"kind":"full_sync"}` every 5 minutes (prod only; dev runs it manually) and `{"kind":"reconcile"}` daily; async invoke `{"kind":"targeted_sync","part_ids":[…]}` from `admin` and `inventory-jobs` | none | yes | 300 s, reserved concurrency 1 |
+| `inventory-sync` | Scheduler `{"kind":"full_sync"}` every 5 minutes (prod only; dev runs it manually) and `{"kind":"reconcile"}` daily; async invoke `{"kind":"targeted_sync","part_ids":[…]}` from `admin` | none | yes | 300 s, reserved concurrency 1 |
 | `inventory-jobs` | SQS event source mapping on the `inventory-jobs` queue | none | yes | 60 s |
 
 - **`sweeper`:** runs three independent tasks, each with its own error handling and metric: expire `INVHOLD` reservations, re-drive `PAYEVT#OPEN` events, and re-enqueue and age-alert `INVJOB#OPEN` jobs. They share one function because their permissions already overlap.
@@ -87,8 +87,6 @@ Every protected route sets `authorizationScopes = ["aws.cognito.signin.user.admi
 | GET | `/admin/orders` | `admin` | admin. `?status=` (one order status, required), `?queue=ready_to_ship\|needs_attention` (optional, only with `status=paid`), `?cursor=`. Queries GSI1 `ORDERS#<status>`, newest first ([Admin order queues](dynamodb-data-model.md#admin-order-queues)) |
 | GET | `/admin/orders/{orderId}` | `admin` | admin |
 | POST | `/admin/orders/{orderId}/ship` | `admin` | admin. Writes a SHIP job and returns 202 |
-| POST | `/admin/inventory/adjustments` | `admin` | admin. Writes an ADJUST job and returns 202 `{adjustmentId}` |
-| GET | `/admin/inventory/adjustments/{adjustmentId}` | `admin` | admin |
 | GET | `/admin/inventory/jobs` | `admin` | admin. Lists open jobs (`INVJOB#OPEN`) |
 | POST | `/admin/inventory/sync` | `admin` | admin. Async-invokes `inventory-sync` and returns 202 |
 | POST | `/webhooks/stripe` | `webhooks-stripe` | Stripe signature (no Cognito authorizer) |
@@ -114,6 +112,7 @@ The `account` function owns the customer profile (`USER#<sub>` / `PROFILE`; attr
 - Every mutation is conditioned on `version = :v AND attribute_not_exists(deleted_at)`. A version mismatch returns 409 `version_conflict`. A tombstoned profile returns 404.
 - The first mutation creates the item with `attribute_not_exists(PK)` from `version: 0`.
 - `addressId` in the path is looked up only inside the caller's own profile, so another customer's ID is simply 404.
+- Address writes validate against the [Address](dynamodb-data-model.md#profile-attributes) schema. A `country` outside `SHIP_COUNTRIES` or a `region` outside `SHIP_REGIONS` returns 400.
 - **Email mirror:** `GET /account/profile` calls `AdminGetUser` on the **customer** pool with the token's `username` claim. If `email` or `email_verified` differs from the stored mirror, one conditional update refreshes them and `email_synced_at`. No request body can set the email. The storefront calls this route after a Cognito email change (see [Cognito authentication](cognito-authentication.md#email-change)). If Cognito is unreachable, the route returns the stored profile with the old mirror.
 - Never log profile fields. Log `sub`, route, and outcome only.
 
@@ -132,7 +131,7 @@ The `account` function owns the customer profile (`USER#<sub>` / `PROFILE`; attr
 
 The tombstone blocks the 30-minute window in which API Gateway still accepts the deleted user's access tokens: profile writes and checkout both reject it. A cart written in that window cannot be checked out and expires by its TTL.
 
-Orders are **kept**. Their `user_sub`, `ship_to`, and `contact_email` stay for accounting and provider disputes and refunds. How long that personal data is retained is OPEN-11 (default: retained).
+Orders are **kept**. Their `user_sub`, `ship_to`, and `contact_email` stay for accounting and provider disputes and refunds. That personal data is kept indefinitely: nothing scrubs or expires it after the account is deleted ([ADR-024](architecture-decisions.md#adr-024-customer-profile-and-account-self-service)).
 
 ## Private InvenTree Connectivity
 
@@ -140,7 +139,7 @@ Only `inventory-sync` and `inventory-jobs` attach to the environment VPC. Place 
 - **Target:** the name resolves to the single InvenTree EC2 host, where Caddy terminates TLS with a publicly trusted certificate, so default certificate verification works.
 - **Egress:**
   - The Lambda security group may egress on HTTPS to the InvenTree host security group.
-  - It may also egress on TCP 443 through the NAT instance to reach Secrets Manager (the integration token) and the Lambda Invoke API (`inventory-jobs` requesting a targeted sync).
+  - It may also egress on TCP 443 through the NAT instance to reach Secrets Manager (the integration token).
   - DynamoDB traffic uses its gateway endpoint. The endpoint policy must allow the table and `table/<name>/index/*`, because sync queries GSI2.
   - No SQS or CloudWatch Logs path is needed: the Lambda service polls and deletes SQS messages and ships logs.
 - **No interface endpoints:** the owner confirmed on 2026-09-28 that Secrets Manager and Lambda interface endpoints are rejected for cost (about $7.30 per endpoint per AZ per month). The 5-minute secret cache and the 20-minute freshness limit absorb short NAT outages.
@@ -170,7 +169,7 @@ Do not place RDS in Lambda subnets or allow Lambda security groups direct databa
   - The client raises typed errors (`InvenTreeUnavailable`, `InvenTreeAuthError`, `InvenTreeRejected`, `InvenTreeOutcomeUnknown`).
   - Each carries the method, path template, status, latency, and a sanitized reason: field names only, at most 200 characters.
   - Never log the token, the `Authorization` header, raw request or response bodies, or customer data. Job `last_error` uses the sanitized reason.
-- **Operations:** the public surface is a closed set of named methods, for example `list_stock`, `get_bom`, `transfer`, `remove`, `adjust`, `search_tracking`. There is no generic `request(path)`. Verify request and response shapes against the pinned 1.5.6 schema (`/api-doc/`) in dev. Run the client contract tests against dev InvenTree before promoting any InvenTree upgrade.
+- **Operations:** the public surface is a closed set of named methods, for example `list_stock`, `get_bom`, `transfer`, `remove`, `search_tracking`. There is no generic `request(path)`. Verify request and response shapes against the pinned 1.5.6 schema (`/api-doc/`) in dev. Run the client contract tests against dev InvenTree before promoting any InvenTree upgrade.
 
 ## Async job contracts
 
@@ -178,11 +177,8 @@ Anything that touches InvenTree runs asynchronously. HTTP handlers write a Dynam
 
 - **Job kinds:**
   - `COMMIT`, `UNCOMMIT`, `SHIP`: order-scoped, `ORDER#<orderId>` / `INVJOB#<kind>`.
-  - `ADJUST`: an admin stock adjustment, `ADJ#<adjustmentId>` / `INVJOB#ADJUST`.
   - Every kind uses the same claim → probe → plan → single POST → complete algorithm.
-- **ADJUST guard:** a decrease larger than the part's projected `available_qty` is rejected with 409 when it is enqueued, and checked again in the worker's plan, where a shortfall becomes `NEEDS_ATTENTION`. Admins cannot override this (owner decision, 2026-09-28).
-  - When an ADJUST completes, the worker async-invokes a targeted sync of that part.
-  - Which ADJUST operations the admin app offers is an open owner question. The default is add, remove, and count at one eligible location; transfers stay in the InvenTree UI.
+  - There is no admin stock-adjustment kind. Staff adjust stock in the InvenTree UI ([ADR-027](architecture-decisions.md#adr-027-stock-adjustments-in-inventree-only)).
 - **SQS message:** the body is only `{"schema": 1, "pk": "...", "sk": "..."}`. The worker always re-reads the job item.
 - **Unknown kinds:** an unknown kind or a newer `schema` moves the job to `NEEDS_ATTENTION`. It is never dropped or crash-looped.
 - **Evolution:**
@@ -276,7 +272,7 @@ DynamoDB transactions have no IAM action of their own. `TransactWriteItems` is a
 | `webhooks-paypal` | as `webhooks-stripe` | `SendMessage` | PayPal only | – |
 | `sweeper` | read + Tx; `Query` on `index/GSI2` (`INVHOLD`, `PAYEVT#OPEN`, `INVJOB#OPEN`) | `SendMessage` | Stripe, PayPal | – |
 | `inventory-sync` | read + Tx; `Query` on `index/GSI2` | – | integration token only | VPC network-interface actions (below) |
-| `inventory-jobs` | `GetItem`, `Query`, Tx | `ReceiveMessage`, `DeleteMessage`, `GetQueueAttributes`, `ChangeMessageVisibility` | integration token only | VPC network-interface actions; `lambda:InvokeFunction` on the `inventory-sync` ARN |
+| `inventory-jobs` | `GetItem`, `Query`, Tx | `ReceiveMessage`, `DeleteMessage`, `GetQueueAttributes`, `ChangeMessageVisibility` | integration token only | VPC network-interface actions (below) |
 
 **VPC functions.** `inventory-sync` and `inventory-jobs` get the network-interface actions that Lambda needs to attach to the VPC, on `Resource: "*"` as Lambda requires ([Lambda VPC permissions](https://docs.aws.amazon.com/lambda/latest/dg/configuration-vpc.html#configuration-vpc-permissions)):
 - `ec2:CreateNetworkInterface`, `ec2:DescribeNetworkInterfaces`, `ec2:DescribeSubnets`, `ec2:DeleteNetworkInterface`;

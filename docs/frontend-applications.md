@@ -153,7 +153,7 @@ The storefront owns public catalog browsing, product details, kit bills of mater
   - **Contact:** display name, phone, and marketing opt-in (`PUT /account/profile`).
   - **Email:** change and verify through Cognito ([Email change](cognito-authentication.md#email-change)), then re-read the profile.
   - **Password:** change through Amplify `updatePassword`.
-  - **Addresses:** list, add, edit, delete, and set the default, up to 5. Show a 409 `address_limit` as a clear message.
+  - **Addresses:** list, add, edit, delete, and set the default, up to 5. Show a 409 `address_limit` as a clear message. The address form offers a state `<select>` of the 50 states and DC and no country field; the client sends `country: "US"`. The server remains the authority.
   - **Delete account:** a typed "DELETE" confirmation, a statement that past orders are kept, and the re-authentication step on 403 `reauth_required`. A 409 `checkout_open` points the customer to cancel or finish the open checkout.
   - Every edit sends the `version` it read. On 409 `version_conflict`, re-read the profile and show the fresh data before the customer retries.
 - Checkout shows an address picker that defaults to the profile's default address, with an inline "add address" form (`POST /account/addresses`, then use the returned `addressId`). Checkout sends that `addressId`. On 409 `address_required`, return to the picker.

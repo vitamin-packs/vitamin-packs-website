@@ -529,7 +529,7 @@ Run in dev with sandbox credentials only. Never use live credentials or real pay
   - a `checkout.session.expired` event after a cancel is a no-op.
 - **Ship-to address:**
   - checkout with a missing, unknown, or another customer's `addressId` returns 409 `address_required` and writes nothing;
-  - a country outside `SHIP_COUNTRIES` returns 400;
+  - a country outside `SHIP_COUNTRIES`, or a region outside `SHIP_REGIONS` (for example `PR` or `AE`), returns 400;
   - the Stripe PaymentIntent and the PayPal order carry the order's `ship_to`, and PayPal does not let the buyer change it;
   - editing or deleting the profile address after checkout leaves the order's `ship_to` unchanged.
 - **Pending:** a PayPal sandbox `PENDING` capture holds stock as `payment_pending`. Completion follows row 6; a decline or the 72-hour expiry releases it.

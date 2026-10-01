@@ -219,9 +219,9 @@ InvenTree administration email (password resets, notifications) goes through the
 InvenTree 1.5.6 bundles `django-anymail[amazon-ses]`. Configure:
 - `INVENTREE_EMAIL_BACKEND=anymail.backends.amazon_ses.EmailBackend`
 - `INVENTREE_ANYMAIL={"AMAZON_SES_CLIENT_PARAMS":{"region_name":"us-west-2"}}`
-- `INVENTREE_EMAIL_SENDER=inventree@vitamin-packs.com` in prod, or `inventree-dev@vitamin-packs.com` in dev.
+- `INVENTREE_EMAIL_SENDER=contact@vitamin-packs.com` in both dev and prod ([ADR-002](architecture-decisions.md#adr-002-inventree-hosting)). Dev and prod mail is not distinguished by sender, so tell them apart by the site URL in the message body.
 
-IAM allows `ses:SendEmail` and `ses:SendRawEmail` on the `vitamin-packs.com` identity only, with a `ses:FromAddress` condition for the environment's sender. Confirm the exact action set in dev.
+IAM allows `ses:SendEmail` and `ses:SendRawEmail` on the `vitamin-packs.com` identity only, with a `ses:FromAddress` condition for `contact@vitamin-packs.com`. Confirm the exact action set in dev.
 
 SES identity:
 - A domain identity for `vitamin-packs.com` with Easy DKIM, in the `ses-identity` module, one per account.
@@ -321,7 +321,7 @@ The backup and restore scope is RDS, S3 media versions, and the Secrets Manager 
 | `jumpbox` | none | TCP 443 → `inventree`; TCP 443 → `0.0.0.0/0` via NAT (the host firewall limits this to the SSM and CloudWatch agents); TCP 443 → S3 prefix list |
 | `inventree` (EC2 host) | TCP 443 from `jumpbox` and `inv-lambda` | TCP 5432 → `rds`; TCP 443 → `0.0.0.0/0` via NAT; TCP 443 → S3 prefix list (no port 80; re-add only on demonstrated need, [ADR-021](architecture-decisions.md#adr-021-inventree-host-s3-egress-port)) |
 | `rds` | TCP 5432 from `inventree` | none |
-| `inv-lambda` | none | TCP 443 → `inventree`; TCP 443 → `0.0.0.0/0` via NAT (Secrets Manager, Lambda Invoke API); TCP 443 → DynamoDB prefix list |
+| `inv-lambda` | none | TCP 443 → `inventree`; TCP 443 → `0.0.0.0/0` via NAT (Secrets Manager); TCP 443 → DynamoDB prefix list |
 | `nat` | TCP 443 from `jumpbox`, `inventree`, and `inv-lambda` | TCP 443 → `0.0.0.0/0` |
 
 - Use security-group references wherever a peer is a security group.
@@ -339,7 +339,7 @@ The backup and restore scope is RDS, S3 media versions, and the Secrets Manager 
 | RDS | db.t4g.micro single-AZ, stopped when idle | db.t4g.micro single-AZ |
 | NAT instance | group of 0 or 1 | group of 1 |
 | Jumpbox | 0 or 1, started manually | 0 or 1, started manually, with an 8-hour reminder alarm |
-| Email sender | `inventree-dev@vitamin-packs.com` | `inventree@vitamin-packs.com` |
+| Email sender | `contact@vitamin-packs.com` | `contact@vitamin-packs.com` |
 | Inventory sync schedule | disabled; run manually | enabled |
 
 Dev runs only when needed:
@@ -478,7 +478,6 @@ Run these in dev before promoting, and again in prod before go-live.
 All hosting design decisions are resolved. The inventory-contract questions are still open: see [Inventory Owner Decisions](#inventory-owner-decisions) and the [decision register](architecture-decisions.md#open-questions). Remaining owner actions:
 1. Buy the one-year t4g EC2 Instance Savings Plan before prod go-live.
 2. Confirm the SNS email subscription.
-3. Change the sender addresses if `inventree@` and `inventree-dev@` are not wanted.
 
 ## References
 
@@ -529,7 +528,7 @@ Proposed on 2026-09-28. InvenTree facts below were verified against the 1.5.6 so
 - `expired=false`, when stock expiry is enabled.
 - Subtract `allocated`, the build, sales, and transfer-order allocations made inside InvenTree, so stock the owner earmarks there isn't sold on the web.
 
-The part must be `active`, not `virtual`, and not `trackable` *(default: serialized and trackable parts are rejected until serial selection is designed)*. `IPN` must equal the catalog SKU for STOCKED_PART mappings, as a cross-check *(default)*.
+The part must be `active`, not `virtual`, and not `trackable`. Serialized and trackable parts are rejected because none are sold ([ADR-011](architecture-decisions.md#adr-011-inventory-data-contract)); selling one needs a new decision and a serial-selection design. `IPN` must equal the catalog SKU for STOCKED_PART mappings, as a cross-check *(default)*.
 
 ### Kits, BOMs and units
 
@@ -568,14 +567,13 @@ Double counting is prevented structurally:
 
 ### Physical movements
 
-Four job kinds, each a DynamoDB job item and an SQS message (standard queue with DLQ), processed by the `inventory-jobs` function ([Async job contracts](backend-api.md#async-job-contracts)):
+Three job kinds, each a DynamoDB job item and an SQS message (standard queue with DLQ), processed by the `inventory-jobs` function ([Async job contracts](backend-api.md#async-job-contracts)):
 
 | Job | When | InvenTree call | Projection effect |
 |---|---|---|---|
 | `COMMIT` | verified payment | `POST /api/stock/transfer/` from eligible locations to `Web orders – committed` | observed drops on the next sync, and the reservation retires in the same update |
 | `UNCOMMIT` | full refund after COMMIT and before shipping. If the refund arrived while COMMIT was `IN_PROGRESS` or `FAILED`, the COMMIT completion transaction creates it | transfer back from `committed` to the part's default eligible location | observed rises on the next sync |
 | `SHIP` | admin marks the order shipped (only when the order is `paid`, COMMIT is `COMPLETED`, no dispute is open, and there is no `payment_exception`) | `POST /api/stock/remove/` from `committed` | none (the location is ineligible) |
-| `ADJUST` | an admin stock adjustment (`ADJ#<adjustmentId>`) | the single stock-adjustment request for its `op` at one eligible location. Verify the endpoint against the 1.5.6 schema in dev | observed changes on the targeted sync that the worker requests on completion |
 
 Payment events never call InvenTree and never wait for a job. A COMMIT that is `IN_PROGRESS` or `FAILED` is never cancelled, because its movement may already have happened. A refund in that window is recorded on the order and carried into UNCOMMIT by the completion transaction ([Payment processing](payment-processing.md#order-payment-and-inventory-states), row 12).
 
@@ -591,19 +589,19 @@ InvenTree 1.5.6 has no idempotency key on stock adjustments. Its adjustment endp
 
 A sweeper runs every 5 minutes. It re-enqueues `INVJOB#OPEN` jobs whose lease or `next_attempt_at` has passed, and alerts on jobs open longer than 30 minutes.
 
-**Assumption to verify in dev:** SHIP selects any stock of the part in the committed location, treating it as fungible. If the owner needs batch or serial traceability per order, SHIP must instead target the stock items created by the COMMIT split. The transfer response and tracking deltas must then be verified to return those item IDs.
+**SHIP stock is fungible** ([ADR-011](architecture-decisions.md#adr-011-inventory-data-contract)). SHIP removes any stock of the part in the committed location, not the stock items that the order's COMMIT moved there. InvenTree therefore records how many units shipped for an order, not which batch or serial. Per-order batch or serial traceability needs a new decision: SHIP would have to target the stock items created by the COMMIT split, and the transfer response and tracking deltas would have to be verified to return those item IDs.
 
 ### Admin stock changes
 
-Admin stock changes are asynchronous ADJUST jobs. The `admin` handler never calls InvenTree. After `require_admin` authorizes the caller (the `Admins` claim plus a live Cognito check, per [Cognito authentication](cognito-authentication.md#backend-authorization)), it:
-- writes an audited job item (actor, part, location, quantity, reason);
-- enqueues the job and returns 202.
+Staff make every stock change in the InvenTree UI through the jumpbox: adding received stock, removing, counting, and transferring. The admin app has no stock-change route and there is no adjustment job ([ADR-027](architecture-decisions.md#adr-027-stock-adjustments-in-inventree-only)). The `admin` handler never calls InvenTree.
 
-`inventory-jobs` then performs the movement, records the resulting tracking IDs, and requests a targeted sync of the part. A decrease larger than the part's `available_qty` is rejected with 409, and admins cannot override that. Do not expose a generic InvenTree proxy or directly edit the DynamoDB projection from an admin form. Catalog reads use DynamoDB, not synchronous InvenTree calls. Staff edits made directly in InvenTree through the jumpbox are equally valid, and the next sync picks them up.
+- The next sync picks the change up. To refresh sooner, use the admin sync request (`POST /admin/inventory/sync`), which async-invokes `inventory-sync` after `require_admin` authorizes the caller ([Cognito authentication](cognito-authentication.md#backend-authorization)).
+- InvenTree does not know about checkout reservations. A removal there can take units that an open checkout holds, and nothing rejects it. After the sync, `available_qty` goes negative and reconciliation alerts (possible oversell).
+- Do not expose a generic InvenTree proxy or directly edit the DynamoDB projection from an admin form. Catalog reads use DynamoDB, not synchronous InvenTree calls.
 
 ## Reconciliation and Operations
 
-Run reconciliation daily in prod, after every admin stock change, and after any InvenTree restore. It uses only index queries (no table scans):
+Run reconciliation daily in prod and after any InvenTree restore. It uses only index queries (no table scans):
 
 | Check | Source | Action |
 |---|---|---|
@@ -639,7 +637,7 @@ The defaults above let implementation proceed in dev. These need owner confirmat
 5. Late payment after a hold was released: re-reserve, and if that fails, refund automatically, backorder, or leave it to the operator. Default: operator.
 6. Full refund after commit: whether UNCOMMIT is automatic. Also the policy for inspecting and restocking returns.
 7. Policy for optional and consumable BOM lines. Defaults: optional lines are a mapping error; consumable lines are not reserved.
-8. Whether trackable, serialized, batch-traced, or expiring parts are sold. Default: trackable parts are rejected.
+8. Whether trackable, serialized, batch-traced, or expiring parts are sold. **Resolved 2026-09-30:** none are. The parts are assembly hardware such as screws, nuts, and washers. Trackable parts are rejected at mapping ([ADR-011](architecture-decisions.md#adr-011-inventory-data-contract)).
 9. Cart limits. Default: 10 lines and 75 distinct parts.
 10. SKU-to-part identity rule. Default: IPN equals SKU.
 11. Sync interval and freshness limit. Defaults: 5 and 20 minutes, with checkout blocked when stale.
@@ -656,7 +654,7 @@ Stage InvenTree upgrades in dev, pin the image/release, take and verify backups,
 2. Build dev networking and service resources. Review security groups, route tables, public exposure, secret flow, and Terraform plans. Run format/validation; do not apply without operator authorization.
 3. Deploy the dev application and run the [acceptance tests](#acceptance-tests): private DNS/TLS, jumpbox access through SSM, SSM management without SSH ingress, private RDS connectivity, media persistence, worker processing, email, alarms, and backup/restore.
 4. Implement the [inventory data contract](#inventory-data-contract): mappings, sync, the reservation-aware projection, idempotent stock jobs, admin writes, and reconciliation. Update [Backend API](backend-api.md), [Payment processing](payment-processing.md), and [DynamoDB data model](dynamodb-data-model.md) when contracts change.
-5. Test component and finished-kit stock without double counting, concurrent last-unit checkout, stale projection rejection, InvenTree downtime, failed/duplicate/out-of-order payment events, cancellation, retry after partial movement, and reconciliation after admin adjustment. Run the [inventory contract acceptance tests](payment-processing.md#inventory-acceptance-tests).
+5. Test component and finished-kit stock without double counting, concurrent last-unit checkout, stale projection rejection, InvenTree downtime, failed/duplicate/out-of-order payment events, cancellation, retry after partial movement, and reconciliation after a manual InvenTree adjustment. Run the [inventory contract acceptance tests](payment-processing.md#inventory-acceptance-tests).
 6. Validate the entire dev path from InvenTree stock to catalog availability, checkout reservation, verified payment, physical movement, reservation retirement, failure alerts, and restore. Promote only the reviewed equivalent to prod via [Infrastructure development workflow](infrastructure-development.md).
 
 Never use production inventory or credentials to validate dev.
