@@ -545,10 +545,9 @@ BOM validation happens in sync. The kit maps as `ERROR` (fail closed) unless all
 
 - `bom_validated` is true on the assembly part, and `bom_checksum` feeds `mapping_version`.
 - Every line has `setup_quantity = 0`, `attrition = 0`, and no `rounding_multiple`. Those are build concepts with no per-sale meaning.
-- No line is `optional` *(default)*.
 - Every sub-part passes the part rules above.
 
-`consumable` lines are excluded from reservation *(default)*, matching InvenTree, which doesn't allocate them in builds. Substitutes and `allow_variants` are never used: only the exact `sub_part` is reserved. Parts listed in `external_links` are bought by the customer and are never reserved.
+The `optional` flag is ignored: an optional line is reserved like any other line. `consumable` lines are excluded from reservation, matching InvenTree, which doesn't allocate them in builds; that also holds for a line flagged both optional and consumable ([ADR-011](architecture-decisions.md#adr-011-inventory-data-contract)). Substitutes and `allow_variants` are never used: only the exact `sub_part` is reserved. Parts listed in `external_links` are bought by the customer and are never reserved.
 
 Units: BOM `quantity` is stored in the sub-part's units, and InvenTree converts `raw_amount` on save. Stock quantities are in the part's units. The projection and `stock_requirements` keep InvenTree's decimal quantities, and checkout multiplies them by integer line quantities. If a part has no units or a count unit, its per-sale quantity must be an integer. A unit change on a part changes `mapping_version`, which invalidates carts priced against the old mapping.
 
@@ -638,7 +637,7 @@ The defaults above let implementation proceed in dev. These need owner confirmat
    - a PayPal `PENDING` capture holds stock for up to 72 hours.
 5. Late payment after a hold was released. **Resolved 2026-09-30:** the processor re-reserves, and if that fails, the order is left to the operator, who refunds it in the provider dashboard or holds it until stock arrives. There is no automatic refund and no backorder state ([ADR-011](architecture-decisions.md#adr-011-inventory-data-contract), [state table](payment-processing.md#order-payment-and-inventory-states) row 7).
 6. Full refund after commit, and returns. **Resolved 2026-09-30:** UNCOMMIT is automatic. A full refund of a committed, unshipped order queues an UNCOMMIT job that transfers the stock back to an eligible location, with no staff action. Returns are manual: staff record them in `Returns – inspection` with status RETURNED, and stock becomes sellable only when staff inspect it and move it to an eligible location with status OK. A refund after shipping never restocks ([ADR-011](architecture-decisions.md#adr-011-inventory-data-contract), [state table](payment-processing.md#order-payment-and-inventory-states) rows 13, 15, and 16).
-7. Policy for optional and consumable BOM lines. Defaults: optional lines are a mapping error; consumable lines are not reserved.
+7. Policy for optional and consumable BOM lines. **Resolved 2026-09-30:** optional lines are reserved like any other line, and the `optional` flag is ignored. Consumable lines are not reserved ([ADR-011](architecture-decisions.md#adr-011-inventory-data-contract)).
 8. Whether trackable, serialized, batch-traced, or expiring parts are sold. **Resolved 2026-09-30:** none are. The parts are assembly hardware such as screws, nuts, and washers. Trackable parts are rejected at mapping ([ADR-011](architecture-decisions.md#adr-011-inventory-data-contract)).
 9. Cart limits. Default: 10 lines and 75 distinct parts.
 10. SKU-to-part identity rule. Default: IPN equals SKU.
