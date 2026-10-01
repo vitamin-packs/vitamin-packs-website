@@ -519,7 +519,7 @@ Proposed on 2026-09-28. InvenTree facts below were verified against the 1.5.6 so
 
 `observed_qty` for a part is the sum of `quantity - allocated` over stock items that meet every condition below. Use `GET /api/stock/` with explicit filters. Never use InvenTree's `in_stock` or `available` filters alone: in 1.5.6, `StockStatusGroups.AVAILABLE_CODES` includes `ATTENTION` (50), `DAMAGED` (55), and `RETURNED` (85), as well as `OK` (10) (`stock/status_codes.py`).
 
-- `status=10` (OK) only *(default)*. Quarantined (75), damaged, returned, attention, lost, destroyed, and rejected stock is never sellable.
+- `status=10` (OK) only ([ADR-011](architecture-decisions.md#adr-011-inventory-data-contract)). Quarantined (75), damaged, returned, attention, lost, destroyed, and rejected stock is never sellable.
 - `in_stock=true`: quantity above 0 and not assigned to a customer, a sales order, a parent item, a build, or consumption (`StockItem.IN_STOCK_FILTER`).
 - Location in an explicit allowlist of InvenTree location IDs, queried with `cascade=false`, so every sellable location is listed individually. Its hash is `eligibility_version`. Never include the `Web orders – committed` or `Returns – inspection` locations, or any structural or external location.
   - The IDs exist only after InvenTree is installed and staff create the locations. They are committed per environment in `infra/<env>/inventree-locations.tf` (`eligible_ids`, `committed_id`, `returns_id`) and set by the application release that follows InvenTree setup ([ADR-026](architecture-decisions.md#adr-026-inventree-first-location-ids-by-second-apply)). A Terraform precondition requires that `committed_id` and `returns_id` are distinct and not in `eligible_ids`.
@@ -630,7 +630,7 @@ Only projection arithmetic (the first two rows) is auto-repaired. Physical stock
 The defaults above let implementation proceed in dev. These need owner confirmation before prod:
 
 1. Fulfillment mode per kit. **Resolved 2026-09-30:** kits are `COMPONENTS` by default. A kit is `STOCKED_PART` only when the owner deliberately maps that kit as a pre-bagged finished kit ([ADR-011](architecture-decisions.md#adr-011-inventory-data-contract)).
-2. Location policy: which kinds of locations hold sellable stock, and whether any non-OK status (for example ATTENTION) is sellable. Default: OK only. The location IDs themselves are post-install configuration, not an owner decision ([ADR-026](architecture-decisions.md#adr-026-inventree-first-location-ids-by-second-apply)).
+2. Location policy and sellable statuses. **Resolved 2026-09-30:** only `OK` stock is sellable. Every sellable location is allowlisted individually; structural, external, committed, and returns locations are never sellable ([ADR-011](architecture-decisions.md#adr-011-inventory-data-contract)). The location IDs themselves are post-install configuration, not an owner decision ([ADR-026](architecture-decisions.md#adr-026-inventree-first-location-ids-by-second-apply)).
 3. Two-step movement (commit at payment, remove at shipping) versus removal at payment. Also the names of the committed and returns locations; their IDs are recorded after install, as in item 2.
 4. Checkout hold duration. **Resolved 2026-09-28** ([Payment processing](payment-processing.md#inventory)):
    - a 31-minute Stripe session and a 35-minute reservation for both providers;
