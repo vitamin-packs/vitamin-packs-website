@@ -528,7 +528,7 @@ Proposed on 2026-09-28. InvenTree facts below were verified against the 1.5.6 so
 - `expired=false`, when stock expiry is enabled.
 - Subtract `allocated`, the build, sales, and transfer-order allocations made inside InvenTree, so stock the owner earmarks there isn't sold on the web.
 
-The part must be `active`, not `virtual`, and not `trackable`. Serialized and trackable parts are rejected because none are sold ([ADR-011](architecture-decisions.md#adr-011-inventory-data-contract)); selling one needs a new decision and a serial-selection design. `IPN` must equal the catalog SKU for STOCKED_PART mappings, as a cross-check *(default)*.
+The part must be `active`, not `virtual`, and not `trackable`. Serialized and trackable parts are rejected because none are sold ([ADR-011](architecture-decisions.md#adr-011-inventory-data-contract)); selling one needs a new decision and a serial-selection design. `IPN` must equal the catalog SKU for `STOCKED_PART` mappings, as a cross-check; the assembly part of a `COMPONENTS` kit may have any IPN ([ADR-011](architecture-decisions.md#adr-011-inventory-data-contract)). SKUs are environment-specific: in dev, every SKU starts with `vp-dev-` (for example `vp-dev-m3-screw-10`), so a cross-checked IPN does too. In prod, a SKU has no environment marker (`m3-screw-10`) and must not start with `vp-dev-`. Sync maps a SKU that breaks either rule as `ERROR` (fail closed).
 
 ### Kits, BOMs and units
 
@@ -640,7 +640,7 @@ The defaults above let implementation proceed in dev. These need owner confirmat
 7. Policy for optional and consumable BOM lines. **Resolved 2026-09-30:** optional lines are reserved like any other line, and the `optional` flag is ignored. Consumable lines are not reserved ([ADR-011](architecture-decisions.md#adr-011-inventory-data-contract)).
 8. Whether trackable, serialized, batch-traced, or expiring parts are sold. **Resolved 2026-09-30:** none are. The parts are assembly hardware such as screws, nuts, and washers. Trackable parts are rejected at mapping ([ADR-011](architecture-decisions.md#adr-011-inventory-data-contract)).
 9. Cart limits. **Resolved 2026-09-30:** a cart holds at most 10 lines and 75 distinct parts. The limits can be traded against each other later while `3 + 2L + P` stays at 100 or less; raising both past that needs a new decision ([ADR-011](architecture-decisions.md#adr-011-inventory-data-contract), [Checkout transaction budget](dynamodb-data-model.md#checkout-transaction-budget)).
-10. SKU-to-part identity rule. Default: IPN equals SKU.
+10. SKU-to-part identity rule. **Resolved 2026-09-30:** the InvenTree `IPN` equals the catalog SKU for `STOCKED_PART` mappings. The assembly part of a `COMPONENTS` kit is not cross-checked. In dev, every SKU and every cross-checked IPN starts with `vp-dev-`; in prod, they are plain, with no environment marker ([ADR-011](architecture-decisions.md#adr-011-inventory-data-contract)).
 11. Sync interval and freshness limit. Defaults: 5 and 20 minutes, with checkout blocked when stale.
 12. Whether InvenTree build, sales, or transfer allocations are subtracted from sellable stock. Default: yes.
 13. Partial refunds and chargebacks: whether they are money-only (default) or also affect stock. Default for disputes: an open dispute blocks shipping, and a lost dispute or a PayPal reversal is handled as a full refund.

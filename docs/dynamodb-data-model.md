@@ -37,7 +37,7 @@ Exceptions:
 ### Product attributes
 
 ```
-sku                     string  (also embedded in PK/SK)
+sku                     string  (also embedded in PK/SK; starts with "vp-dev-" in dev, no environment marker in prod)
 name                    string
 description             string
 price                   number  (integer cents)
@@ -187,7 +187,7 @@ The projection is keyed by InvenTree part, not by SKU. A component sold individu
 
 ```
 part_id              number
-part_ipn             string   (cross-check only)
+part_ipn             string   (cross-check only: equals the SKU for STOCKED_PART mappings)
 units                string   (InvenTree part units; quantities below are in these units)
 observed_qty         number   # eligible physical quantity InvenTree reported in the snapshot
 reserved_qty         number   # sum of this part across reservations that are HELD, COMMITTING, or COMMITTED and not yet retired
@@ -377,6 +377,7 @@ On-demand billing charges per request. Storage stays inside the free 25 GB. At t
 `scripts/seed-dev.py` is planned; it does not exist in the repository yet. When written, it loads the development catalog only after the dev table exists. It creates a small catalog, categories (with their `CATEGORIES` GSI1 keys), kit display BOMs, and kit-only components, and deliberately omits `GSI1PK`/`GSI1SK` for the kit-only records so they cannot appear in the public catalog.
 
 - It must not write `inventory_count`, `STOCK#` projections, reservations, or jobs. Projections come only from an inventory sync against dev InvenTree.
+- Every SKU it writes starts with `vp-dev-`, including kit-only components and display-BOM entries ([Eligible stock](inventree-integration.md#eligible-stock)).
 - It writes `fulfillment_mode` and `inventree_part_id` for dev InvenTree parts that the operator created. Those IDs are dev-specific and passed in as a mapping file, never guessed from names.
 - It leaves `stock_requirements`, `mapping_version`, and `mapping_status` to the sync. The first sync validates them.
 
