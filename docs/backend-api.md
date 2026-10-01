@@ -41,7 +41,7 @@ Each function folder holds a `handler.py`, a hash-locked `requirements.txt`, and
 | `webhooks-stripe` | HTTP API | `/webhooks/stripe` | no | 20 s |
 | `webhooks-paypal` | HTTP API | `/webhooks/paypal` | no | 20 s |
 | `sweeper` | EventBridge Scheduler, every 5 minutes | none | no | 240 s, reserved concurrency 1 |
-| `inventory-sync` | Scheduler `{"kind":"full_sync"}` every 5 minutes (prod only; dev runs it manually) and `{"kind":"reconcile"}` daily; async invoke `{"kind":"targeted_sync","part_ids":[…]}` from `admin` | none | yes | 300 s, reserved concurrency 1 |
+| `inventory-sync` | Scheduler `{"kind":"full_sync"}` every 5 minutes in prod and every 30 minutes in dev (the dev schedule is enabled only while dev runs) and `{"kind":"reconcile"}` daily; async invoke `{"kind":"targeted_sync","part_ids":[…]}` from `admin` | none | yes | 300 s, reserved concurrency 1 |
 | `inventory-jobs` | SQS event source mapping on the `inventory-jobs` queue | none | yes | 60 s |
 
 - **`sweeper`:** runs three independent tasks, each with its own error handling and metric: expire `INVHOLD` reservations, re-drive `PAYEVT#OPEN` events, and re-enqueue and age-alert `INVJOB#OPEN` jobs. They share one function because their permissions already overlap.
@@ -142,7 +142,7 @@ Only `inventory-sync` and `inventory-jobs` attach to the environment VPC. Place 
   - It may also egress on TCP 443 through the NAT instance to reach Secrets Manager (the integration token).
   - DynamoDB traffic uses its gateway endpoint. The endpoint policy must allow the table and `table/<name>/index/*`, because sync queries GSI2.
   - No SQS or CloudWatch Logs path is needed: the Lambda service polls and deletes SQS messages and ships logs.
-- **No interface endpoints:** the owner confirmed on 2026-09-28 that Secrets Manager and Lambda interface endpoints are rejected for cost (about $7.30 per endpoint per AZ per month). The 5-minute secret cache and the 20-minute freshness limit absorb short NAT outages.
+- **No interface endpoints:** the owner confirmed on 2026-09-28 that Secrets Manager and Lambda interface endpoints are rejected for cost (about $7.30 per endpoint per AZ per month). The 5-minute secret cache and the freshness limit (20 minutes in prod, 60 in dev) absorb short NAT outages.
 - **Ingress:** the InvenTree host security group accepts HTTPS only from this Lambda security group and the staff jumpbox.
 - **Retries:** the host's private IP changes when it is replaced (60-second DNS TTL), so the shared InvenTree client retries connection errors with bounded backoff (see [InvenTree client](#inventree-client)).
 - **Idle functions:** Lambda reclaims the network interfaces of a VPC function idle for 14 days and marks it `Inactive`. The next invoke fails while the function returns to `Pending`, which matters for the manually run dev sync. Retry after a few minutes.
@@ -287,6 +287,7 @@ Each role also carries a Deny on those actions conditioned on `lambda:SourceFunc
 
 **Other principals:**
 - **EventBridge Scheduler role:** trusts `scheduler.amazonaws.com` with `aws:SourceAccount`. It may call `lambda:InvokeFunction` on the `sweeper` and `inventory-sync` ARNs only.
+- **Dev nightly-stop role:** besides stopping dev capacity, it may call `scheduler:UpdateSchedule` on the dev full-sync schedule only, to disable it, and `iam:PassRole` on the Scheduler role above ([Dev vs Prod and Cost](inventree-integration.md#dev-vs-prod-and-cost)).
 - **API Gateway:** each route gets a Lambda permission whose `source_arn` is that route's execution ARN.
 - **Deploying principal:** restrict it with `lambda:SubnetIds` and `lambda:SecurityGroupIds` so that only these two functions can be given the inventory subnets and security group.
 

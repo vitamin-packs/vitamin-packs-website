@@ -73,7 +73,7 @@ NAT instance:
   - Calls `ec2:ReplaceRoute` to point `0.0.0.0/0` in the app a/b route tables at its own ENI.
   - Its IAM role is scoped to those route tables and to the instance itself.
 - Patched by monthly instance refresh.
-- If it fails, only egress stops: inventory sync and jobs, SSM access, ECR pulls, email, and certificate renewal. Checkout keeps working from the DynamoDB projection until parts exceed the [freshness limit](#sync-and-freshness) (20 minutes), then fails closed for those parts. An alarm fires when the NAT group is unhealthy.
+- If it fails, only egress stops: inventory sync and jobs, SSM access, ECR pulls, email, and certificate renewal. Checkout keeps working from the DynamoDB projection until parts exceed the [freshness limit](#sync-and-freshness) (20 minutes in prod, 60 in dev), then fails closed for those parts. An alarm fires when the NAT group is unhealthy.
 
 Egress controls:
 - Private security groups allow outbound traffic only on TCP 443, plus PostgreSQL to RDS from the host and the gateway-endpoint prefix lists.
@@ -252,7 +252,7 @@ Upgrade procedure (stage every upgrade in dev first; the Terraform gates are in 
 6. Smoke-test the UI, the API, the worker heartbeat, and an inventory-sync run.
 7. Check API compatibility for the inventory Lambdas before promoting to prod.
 
-The site is down for a few minutes during a refresh. That is acceptable because checkout reads the DynamoDB projection and never calls InvenTree synchronously. The outage must stay inside the 20-minute [freshness limit](#sync-and-freshness).
+The site is down for a few minutes during a refresh. That is acceptable because checkout reads the DynamoDB projection and never calls InvenTree synchronously. The outage must stay inside the [freshness limit](#sync-and-freshness): 20 minutes in prod, 60 in dev.
 
 Roll back the application image only when the schema is still compatible. Otherwise use the [restore procedure](#rds-postgresql).
 
@@ -340,11 +340,15 @@ The backup and restore scope is RDS, S3 media versions, and the Secrets Manager 
 | NAT instance | group of 0 or 1 | group of 1 |
 | Jumpbox | 0 or 1, started manually | 0 or 1, started manually, with an 8-hour reminder alarm |
 | Email sender | `contact@vitamin-packs.com` | `contact@vitamin-packs.com` |
-| Inventory sync schedule | disabled; run manually | enabled |
+| Inventory sync schedule | every 30 minutes, enabled only while dev runs | every 5 minutes, always enabled |
+| Freshness limit | 60 minutes | 20 minutes |
 
 Dev runs only when needed:
 - A nightly EventBridge Scheduler job, using universal targets, sets the dev Auto Scaling groups to 0 and stops the DB instance. It also handles the automatic restart RDS performs after seven days stopped.
-- Starting dev is a deliberate operator action, in this order: RDS, then the NAT instance, then the InvenTree host, then the jumpbox.
+- The same job disables the dev inventory sync schedule, so no sync runs against a stopped host.
+  - `UpdateSchedule` replaces the whole schedule ([API reference](https://docs.aws.amazon.com/scheduler/latest/APIReference/API_UpdateSchedule.html)). The target input therefore repeats the schedule definition with `State = DISABLED`, built from the same Terraform values as the schedule itself.
+  - That a universal target can call `scheduler:updateSchedule` is unverified. It is a release-workflow [acceptance test](infrastructure-development.md#acceptance-tests).
+- Starting dev is a deliberate operator action, in this order: RDS, then the NAT instance, then the InvenTree host, then the jumpbox. The last step, once the host is healthy, enables the sync schedule and invokes one full sync, so projections are fresh without a 30-minute wait.
 - A dev-only start script under `scripts/` is planned. It must follow the [deployment-script rules](infrastructure-development.md#deployment-scripts).
 
 **Prod estimate, per month.** Prices are us-west-2 on-demand from the AWS Pricing API (September 2026), 730 hours per month; "est." items are estimates.
@@ -469,8 +473,8 @@ Run these in dev before promoting, and again in prod before go-live.
   - The database-password runbook completes with only a restart.
   - Integration-token overlap rotation causes no Lambda failures.
 - **Dev on demand:**
-  - The nightly stop leaves only storage running.
-  - The start sequence brings dev up in order.
+  - The nightly stop leaves only storage running and the sync schedule disabled.
+  - The start sequence brings dev up in order, enables the sync schedule, and leaves fresh projections.
 - **Cost:** the prod run rate is under $50/month after one full week, with the Savings Plan covering the t4g.medium hours.
 
 ## Open Owner Actions
@@ -560,11 +564,22 @@ Double counting is prevented structurally:
 
 ### Sync and freshness
 
-- **Prod schedule:** EventBridge Scheduler runs `inventory-sync` every **5 minutes**, with reserved concurrency 1. The `sync_version` condition also discards any out-of-order run. Dev runs the sync manually, before checkout tests.
-- **Freshness limit:** checkout rejects a part whose `source_snapshot_at` is more than **20 minutes** old (four missed runs) with 503. Staleness is per part, so one failing part doesn't block unrelated SKUs.
-- **Alarms:** warn when the last full success is more than 10 minutes old, or when any mapping is `ERROR`. Page when the last success is more than 20 minutes old, or when any `available_qty` is below 0.
+The intervals and limits below are accepted ([ADR-011](architecture-decisions.md#adr-011-inventory-data-contract)):
+
+| | prod | dev |
+|---|---|---|
+| Sync interval | 5 minutes | 30 minutes |
+| Freshness limit | 20 minutes (four missed runs) | 60 minutes (two missed runs) |
+| When stale | checkout blocked | checkout blocked |
+
+- **Schedule:** EventBridge Scheduler runs `inventory-sync` at the sync interval, with reserved concurrency 1. The `sync_version` condition also discards any out-of-order run.
+  - The prod schedule is always enabled.
+  - The dev schedule is enabled only while dev runs ([Dev vs Prod and Cost](#dev-vs-prod-and-cost)). A dev test that depends on a stock change still runs the sync manually first.
+- **Freshness limit:** checkout rejects a part whose `source_snapshot_at` is older than the freshness limit with 503. Staleness is per part, so one failing part doesn't block unrelated SKUs.
+- **Alarms (prod):** warn when the last full success is more than 10 minutes old, or when any mapping is `ERROR`. Page when the last success is more than 20 minutes old, or when any `available_qty` is below 0.
+  - Dev has no sync-age alarm, because its schedule is off while dev is stopped. A stale dev projection shows as a checkout 503 and in the sync state. The other dev alarms are warnings.
 - **Algorithm:** the pseudocode is in [DynamoDB data model](dynamodb-data-model.md#inventory-sync-pseudocode). Physical observations are applied as a delta. A sync never overwrites `reserved_qty`; it only retires `pending_retire` entries whose movements finished before the snapshot began, with `CLOCK_MARGIN_S` = 10 s.
-- **Outages:** InvenTree upgrades (a few minutes) and short NAT or host outages stay inside the 20-minute window. After it, checkout fails closed for the affected parts.
+- **Outages:** InvenTree upgrades (a few minutes) and short NAT or host outages stay inside the freshness limit. After it, checkout fails closed for the affected parts.
 
 ### Physical movements
 
@@ -611,7 +626,7 @@ Run reconciliation daily in prod and after any InvenTree restore. It uses only i
 | `available_qty < 0` | `INVSTOCK` | Alert with the orders holding the part (possible oversell) |
 | `source_snapshot_at` older than the freshness limit | `INVSTOCK` | Alert |
 | `HELD` past `expires_at` + 10 min | `INVHOLD` | Alert (the expiry sweeper is failing) |
-| `pending_retire` entry older than 3 sync intervals | `INVSTOCK` | Alert (the movement is not observed: stock moved back, or the location is misconfigured) |
+| `pending_retire` entry older than 3 sync intervals (15 minutes in prod, 90 in dev) | `INVSTOCK` | Alert (the movement is not observed: stock moved back, or the location is misconfigured) |
 | Job `FAILED` or `NEEDS_ATTENTION`, or open longer than 30 min | `INVJOB#OPEN` | Alert; blocks fulfillment |
 | InvenTree tracking notes matching `vp-<env>-` with no `COMPLETED` job, or a job `COMPLETED` whose tracking IDs are gone (for example after a PITR restore) | InvenTree `/api/stock/track/?search=vp-<env>-` | Alert; never auto-move stock |
 | Committed-location quantity per part does not equal committed-but-not-shipped orders | InvenTree plus `ORDER#` queries | Alert |
@@ -641,7 +656,7 @@ The defaults above let implementation proceed in dev. These need owner confirmat
 8. Whether trackable, serialized, batch-traced, or expiring parts are sold. **Resolved 2026-09-30:** none are. The parts are assembly hardware such as screws, nuts, and washers. Trackable parts are rejected at mapping ([ADR-011](architecture-decisions.md#adr-011-inventory-data-contract)).
 9. Cart limits. **Resolved 2026-09-30:** a cart holds at most 10 lines and 75 distinct parts. The limits can be traded against each other later while `3 + 2L + P` stays at 100 or less; raising both past that needs a new decision ([ADR-011](architecture-decisions.md#adr-011-inventory-data-contract), [Checkout transaction budget](dynamodb-data-model.md#checkout-transaction-budget)).
 10. SKU-to-part identity rule. **Resolved 2026-09-30:** the InvenTree `IPN` equals the catalog SKU for `STOCKED_PART` mappings. The assembly part of a `COMPONENTS` kit is not cross-checked. In dev, every SKU and every cross-checked IPN starts with `vp-dev-`; in prod, they are plain, with no environment marker ([ADR-011](architecture-decisions.md#adr-011-inventory-data-contract)).
-11. Sync interval and freshness limit. Defaults: 5 and 20 minutes, with checkout blocked when stale.
+11. Sync interval and freshness limit. **Resolved 2026-09-30:** prod syncs every 5 minutes with a 20-minute freshness limit. Dev syncs every 30 minutes with a 60-minute freshness limit, and its schedule is enabled only while dev runs. Checkout is blocked when a projection is stale, in both environments ([ADR-011](architecture-decisions.md#adr-011-inventory-data-contract), [Sync and freshness](#sync-and-freshness)).
 12. Whether InvenTree build, sales, or transfer allocations are subtracted from sellable stock. Default: yes.
 13. Partial refunds and chargebacks: whether they are money-only (default) or also affect stock. Default for disputes: an open dispute blocks shipping, and a lost dispute or a PayPal reversal is handled as a full refund.
 14. Any existing `inventory_count` values: discard them (default), or import them once as an audited InvenTree stock count.

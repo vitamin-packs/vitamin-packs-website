@@ -490,7 +490,7 @@ Run these in dev against sandbox providers and dev InvenTree:
 
 - Two concurrent checkouts for the last unit: exactly one order is created, and the other gets 409. Repeat with a kit and a separately sold component that share the last unit of one part.
 - A kit with N components where one is short: no order is written and no projection changes.
-- A stale projection (sync stopped for more than 20 minutes) returns 503, and a missing `STOCK#` item or mapping `ERROR` returns 503 or 409, never success.
+- A stale projection (sync stopped for longer than the [freshness limit](inventree-integration.md#sync-and-freshness): 20 minutes in prod, 60 in dev) returns 503, and a missing `STOCK#` item or mapping `ERROR` returns 503 or 409, never success.
 - A sync running concurrently with checkouts, releases, and commit completion keeps `available_qty = observed_qty - reserved_qty` after every step, with no negative `available_qty` in any sampled state.
 - Kill the COMMIT worker after the InvenTree request but before completion: the retry finds the tracking entry by `job_key` and never moves stock twice.
 - Request a movement larger than the stock held: the job reaches `NEEDS_ATTENTION`, and InvenTree never clamps it into a partial transfer.

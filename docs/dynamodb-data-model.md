@@ -370,7 +370,7 @@ Never add a SQL copy of the table for reporting without a new decision: see ADR-
 
 ## Cost drivers
 
-On-demand billing charges per request. Storage stays inside the free 25 GB. At the expected volume, the table costs a few dollars a month in prod and about nothing in idle dev. The main driver is the [inventory sync](#inventory-sync-pseudocode): every run writes every projection, because each write refreshes `source_snapshot_at` for the checkout freshness check. That is one write per part per run, or about 8,640 × (number of parts) writes a month. GSI2 doubles it when its projection includes the changed attributes. Watch the per-run write count in the sync metrics. A transactional write costs two write units per item. Checkout, payment, and release volumes are too small to matter.
+On-demand billing charges per request. Storage stays inside the free 25 GB. At the expected volume, the table costs a few dollars a month in prod and about nothing in idle dev. The main driver is the [inventory sync](#inventory-sync-pseudocode): every run writes every projection, because each write refreshes `source_snapshot_at` for the checkout freshness check. That is one write per part per run, or about 8,640 × (number of parts) writes a month in prod at the 5-minute interval. Dev syncs every 30 minutes, and only while it is started. GSI2 doubles it when its projection includes the changed attributes. Watch the per-run write count in the sync metrics. A transactional write costs two write units per item. Checkout, payment, and release volumes are too small to matter.
 
 ## Dev seed data
 
@@ -446,7 +446,7 @@ def checkout(sub, cart_version, address_id, provider):
 
     order_id, now = new_uuid(), utc_now()                        # iso() formats YYYY-MM-DDTHH:MM:SSZ
     expires_at = iso(now + HOLD)                                 # 35 min; see Payment processing
-    fresh_after = iso(now - FRESHNESS)                           # 20 min in prod
+    fresh_after = iso(now - FRESHNESS)                           # 20 min in prod, 60 min in dev
     actions = [
         Put(order_header(order_id, sub, status="pending", inventory_state="reserved",
                          total_minor=sum_of_lines, currency=currency, refunded_minor=0,

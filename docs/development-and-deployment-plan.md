@@ -145,7 +145,7 @@ The second release ([ADR-026](architecture-decisions.md#adr-026-inventree-first-
 6. API Gateway HTTP API with explicit routes (no `ANY` or `{proxy+}` route), JWT authorizers, and CORS restricted to the environment's CloudFront origins. The eleven Lambda functions each get their own role from the [IAM matrix](backend-api.md#iam), with zips from the artifact bucket (no layer) and environment-scoped configuration. Attach only `inventory-sync` and `inventory-jobs` to the VPC. They take the location IDs from `infra/dev/inventree-locations.tf`.
 7. Inventory and maintenance triggers, per [Functions and triggers](backend-api.md#functions-and-triggers):
    - the `inventory-jobs` SQS queue and DLQ (`maxReceiveCount` 5, visibility timeout 360 s) and its event source mapping (batch size 1, partial batch responses, maximum concurrency 2);
-   - EventBridge Scheduler schedules for `sweeper` (every 5 minutes) and `inventory-sync` (a 5-minute full sync in prod only, and daily reconciliation);
+   - EventBridge Scheduler schedules for `sweeper` (every 5 minutes) and `inventory-sync` (a 5-minute full sync in prod, a 30-minute full sync in dev that is enabled only while dev runs, and daily reconciliation);
    - a Scheduler role limited to invoking those two functions;
    - alarms and operational dashboards.
 8. Run the Lambda-to-host [InvenTree acceptance tests](inventree-integration.md#acceptance-tests) deferred from Phase 3.
@@ -205,7 +205,7 @@ Run the following checks before production promotion:
   - The [release-workflow acceptance tests](infrastructure-development.md#acceptance-tests).
   - Point-in-time database and versioned media restore into an isolated instance.
   - The database-password and integration-token rotation procedures.
-  - The dev nightly stop and ordered start.
+  - The dev nightly stop and ordered start. The stop leaves the sync schedule disabled, and the start enables it.
   - Log and metric review, and documented incident recovery.
 
 Record test evidence and unresolved limitations. Do not use production customer, payment, inventory, or secret data in dev tests.

@@ -153,7 +153,7 @@ A flagged dev plan needs an extra confirmation. A prod plan records its flags in
 | Permission set | Allows | Denies |
 |---|---|---|
 | `inventree-<env>-operator` | Jumpbox access only ([Staff access](inventree-integration.md#staff-access)) | Everything else |
-| `vp-dev-deployer` | Read and write the dev state key and its lock; publish to dev artifact stores; plan and apply `infra/dev`; dev SSM Run Command and instance refresh for InvenTree upgrades | `prod/` state; prod-named or prod-tagged resources; prod secrets |
+| `vp-dev-deployer` | Read and write the dev state key and its lock; publish to dev artifact stores; plan and apply `infra/dev`; dev SSM Run Command and instance refresh for InvenTree upgrades; enable the dev sync schedule and invoke dev `inventory-sync`, for the dev start script | `prod/` state; prod-named or prod-tagged resources; prod secrets |
 | `vp-prod-deployer` | Assume `${project}-prod-terraform-plan` (read-only, prod state read, lock write) and `${project}-prod-terraform-apply` (prod scope). Read dev artifact stores; create-only writes to prod artifact stores | Direct changes without an assumed role |
 | `vp-secrets-operator-<env>` | `secretsmanager:PutSecretValue` on that environment's named secrets | Other environments; Terraform-managed resources |
 
@@ -237,13 +237,14 @@ An InvenTree image or configuration change is always its own release, never bund
   7. Start an instance refresh with `MinHealthyPercentage` 0.
   8. Smoke-test: health, the worker heartbeat, an inventory-sync run, and the client contract tests.
 
-  Steps 3–8 must fit inside the 20-minute [freshness limit](inventree-integration.md#sync-and-freshness).
+  Steps 3–8 must fit inside the [freshness limit](inventree-integration.md#sync-and-freshness): 20 minutes in prod, 60 in dev.
 - **Configuration-only change:** plan and apply, then an operator refresh.
 - **Rollback:**
   - If no migration ran, or the schema is still compatible, re-plan with the previous digest, then refresh.
   - Otherwise use the [restore procedure](inventree-integration.md#rds-postgresql).
 - **After a restore, reconcile Terraform.** A restore always creates a new RDS instance (or DynamoDB table). Bring it into state with an `import` block in a reviewed plan, then retire the old resource with a final snapshot.
 - **Capacity drift:** give every Auto Scaling group whose capacity the scheduler or operator manages `ignore_changes = [desired_capacity]`. That covers the jumpbox in both environments, and the InvenTree host and NAT instance in dev. An apply must never resize a running jumpbox or wake a stopped dev environment.
+- **Schedule drift:** create the dev inventory sync schedule `DISABLED`, with `ignore_changes = [state]`. The nightly stop and the dev start script change its state ([Dev vs Prod and Cost](inventree-integration.md#dev-vs-prod-and-cost)), and an apply must never start syncs against a stopped dev environment. The prod schedule is `ENABLED` and has no such exception.
 
 ## Emergency changes
 
@@ -274,7 +275,8 @@ Run these in dev once the scripts and CI exist:
   - a stale plan, after an intervening apply.
 - Re-uploading an existing artifact key fails with a 412 precondition failure. Pushing an existing ECR tag fails.
 - Applying a launch-template change starts no instance refresh (`describe-instance-refreshes` is empty).
-- After the nightly dev stop, a no-op plan shows no `desired_capacity` change.
+- After the nightly dev stop, a no-op plan shows no `desired_capacity` change and no schedule `state` change.
+- The nightly dev stop disables the dev inventory sync schedule through its universal target, and the schedule's expression and target are unchanged afterwards.
 - The risk checker flags a seeded `0.0.0.0/0` rule and a seeded replacement without printing values.
 - `rollback-sites` restores the previous `index.html`.
 - CloudTrail shows the apply session `apply-<hash12>` with the operator's `SourceIdentity`.
